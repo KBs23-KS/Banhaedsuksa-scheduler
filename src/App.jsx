@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import * as XLSX from 'xlsx';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, getDocs, getDoc, writeBatch } from 'firebase/firestore';
@@ -579,7 +580,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, healt
         <div className="absolute -top-20 -right-20 p-16 opacity-10 rotate-12 text-[#d4af37]"><Activity size={350} /></div>
         <div className="relative z-10 flex flex-col md:flex-row justify-between md:items-end">
           <div>
-            <h1 className="text-4xl font-bold mb-3 tracking-tight">ภาพรวมระบบ (Phase 4)</h1>
+            <h1 className="text-4xl font-bold mb-3 tracking-tight">ภาพรวมระบบ</h1>
             <p className="text-[#d4af37] text-xl font-medium flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-[#d4af37]"></span>
               {String(schoolSettings?.schoolName || 'โรงเรียน')} | ภาคเรียนที่ {String(schoolSettings?.semester || '1')}/{String(schoolSettings?.academicYear || '2569')}
@@ -841,10 +842,16 @@ const ClassroomsView = ({ classrooms, dbAction, showToast, handleRequestDelete, 
   );
 };
 
-const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbAction, showToast, handleRequestDelete, schoolSettings, getTeacher, getSubject, getClassroom }) => {
+const LOAD_IMPORT_HEADERS = ['รหัสครู', 'ชื่อครู', 'รหัสวิชา', 'ชื่อวิชา', 'ชื่อห้อง', 'จำนวนคาบ/สัปดาห์'];
+
+const normalizeExcelText = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+
+const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbAction, bulkUpsertTeachingLoads, showToast, handleRequestDelete, schoolSettings, getTeacher, getSubject, getClassroom }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
   const [form, setForm] = useState({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 });
+  const excelInputRef = useRef(null);
   
   const handleSave = async () => {
     const periodsValue = Number(form.periods);
@@ -857,11 +864,213 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
     if (ok) { setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 }); setIsModalOpen(false); showToast(isEditing ? "บันทึกการแก้ไขสำเร็จ" : "เพิ่มภาระสอนสำเร็จ"); }
   };
 
+  const downloadExcelTemplate = () => {
+    try {
+      const workbook = XLSX.utils.book_new();
+
+      const loadSheet = XLSX.utils.aoa_to_sheet([LOAD_IMPORT_HEADERS]);
+      loadSheet['!cols'] = [
+        { wch: 14 }, { wch: 28 }, { wch: 16 }, { wch: 30 }, { wch: 18 }, { wch: 18 }
+      ];
+      XLSX.utils.book_append_sheet(workbook, loadSheet, 'ภาระสอน');
+
+      const guideRows = [
+        ['แม่แบบนำเข้าภาระสอน BHS Scheduler'],
+        ['ภาคเรียน', String(schoolSettings.semester || '')],
+        ['ปีการศึกษา', String(schoolSettings.academicYear || '')],
+        [],
+        ['วิธีกรอก'],
+        ['1', 'กรอกข้อมูลในชีต "ภาระสอน" โดยห้ามเปลี่ยนชื่อหัวคอลัมน์'],
+        ['2', '1 แถว = ครู 1 คน + วิชา 1 วิชา + ห้องเรียน 1 ห้อง'],
+        ['3', 'รหัสครูและชื่อครูต้องตรงกับชีต "รายชื่อครู"'],
+        ['4', 'รหัสวิชาและชื่อวิชาต้องตรงกับชีต "รายวิชา" ของภาคเรียนปัจจุบัน'],
+        ['5', 'ชื่อห้องต้องตรงกับชีต "ห้องเรียน" (ชื่อห้องในระบบต้องไม่ซ้ำกัน)'],
+        ['6', 'จำนวนคาบ/สัปดาห์ต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป'],
+        ['7', 'ห้ามมีครู+วิชา+ห้องซ้ำกันมากกว่า 1 แถวในไฟล์เดียว'],
+        ['8', 'ถ้ารายการมีอยู่แล้ว ระบบจะอัปเดตจำนวนคาบจาก Excel โดยไม่สร้างรายการซ้ำ'],
+        [],
+        ['ตัวอย่าง'],
+        ['T001', 'นายตัวอย่าง ครูผู้สอน', 'ค21101', 'คณิตศาสตร์ 1', 'ม.1/1', '4']
+      ];
+      const guideSheet = XLSX.utils.aoa_to_sheet(guideRows);
+      guideSheet['!cols'] = [{ wch: 18 }, { wch: 80 }, { wch: 18 }, { wch: 28 }, { wch: 18 }, { wch: 18 }];
+      XLSX.utils.book_append_sheet(workbook, guideSheet, 'คำแนะนำ');
+
+      const teacherSheet = XLSX.utils.aoa_to_sheet([
+        ['รหัสครู', 'ชื่อครู'],
+        ...teachers.map(t => [String(t.id || ''), String(t.name || '')])
+      ]);
+      teacherSheet['!cols'] = [{ wch: 16 }, { wch: 32 }];
+      XLSX.utils.book_append_sheet(workbook, teacherSheet, 'รายชื่อครู');
+
+      const subjectSheet = XLSX.utils.aoa_to_sheet([
+        ['รหัสวิชา', 'ชื่อวิชา', 'ชื่อย่อ'],
+        ...activeSubjects.map(s => [String(s.id || ''), String(s.name || ''), String(s.abbr || '')])
+      ]);
+      subjectSheet['!cols'] = [{ wch: 18 }, { wch: 36 }, { wch: 16 }];
+      XLSX.utils.book_append_sheet(workbook, subjectSheet, 'รายวิชา');
+
+      const roomSheet = XLSX.utils.aoa_to_sheet([
+        ['ชื่อห้อง'],
+        ...classrooms.map(c => [String(c.name || '')])
+      ]);
+      roomSheet['!cols'] = [{ wch: 24 }];
+      XLSX.utils.book_append_sheet(workbook, roomSheet, 'ห้องเรียน');
+
+      const fileName = `BHS-TeachingLoads-Template-${schoolSettings.academicYear || ''}-${schoolSettings.semester || ''}.xlsx`;
+      XLSX.writeFile(workbook, fileName);
+      showToast("ดาวน์โหลดแม่แบบ Excel แล้ว");
+    } catch (error) {
+      console.error(error);
+      showToast("สร้างแม่แบบ Excel ไม่สำเร็จ", "error");
+    }
+  };
+
+  const handleExcelImport = async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (files.length === 0) return;
+
+    setIsImporting(true);
+    try {
+      const collectedRows = [];
+
+      for (const file of files) {
+        const buffer = await file.arrayBuffer();
+        const workbook = XLSX.read(buffer, { type: 'array' });
+        const worksheet = workbook.Sheets['ภาระสอน'] || workbook.Sheets[workbook.SheetNames[0]];
+        if (!worksheet) throw new Error(`${file.name}: ไม่พบชีตภาระสอน`);
+
+        const rawMatrix = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '', raw: false });
+        const actualHeaders = (rawMatrix[0] || []).map(normalizeExcelText);
+        const missingHeaders = LOAD_IMPORT_HEADERS.filter(header => !actualHeaders.includes(header));
+        if (missingHeaders.length > 0) {
+          throw new Error(`${file.name}: หัวคอลัมน์ไม่ครบ ${missingHeaders.join(', ')}`);
+        }
+
+        const headerIndexes = new Map(actualHeaders.map((header, index) => [header, index]));
+        rawMatrix.slice(1).forEach((cells, index) => {
+          const hasData = LOAD_IMPORT_HEADERS.some(header => normalizeExcelText(cells[headerIndexes.get(header)]) !== '');
+          if (hasData) collectedRows.push({ fileName: file.name, cells, rowNumber: index + 2, headerIndexes });
+        });
+      }
+
+      if (collectedRows.length === 0) {
+        showToast("ไม่พบข้อมูลภาระสอนในไฟล์ Excel", "error");
+        return;
+      }
+
+      const teacherById = new Map(teachers.map(t => [normalizeExcelText(t.id), t]));
+      const subjectById = new Map(activeSubjects.map(s => [normalizeExcelText(s.id), s]));
+      const roomsByName = new Map();
+      classrooms.forEach(c => {
+        const name = normalizeExcelText(c.name);
+        if (!roomsByName.has(name)) roomsByName.set(name, []);
+        roomsByName.get(name).push(c);
+      });
+      const existingByKey = new Map(teachingLoads.map(load => [getTeachingLoadKey(load), load]));
+      const seenKeys = new Map();
+      const errors = [];
+      const importedItems = [];
+      let createCount = 0;
+      let updateCount = 0;
+      const importToken = Date.now();
+
+      collectedRows.forEach(({ fileName, cells, rowNumber, headerIndexes }, index) => {
+        const prefix = `${fileName} แถว ${rowNumber}`;
+        const getCell = (header) => normalizeExcelText(cells[headerIndexes.get(header)]);
+        const teacherId = getCell('รหัสครู');
+        const teacherName = getCell('ชื่อครู');
+        const subjectId = getCell('รหัสวิชา');
+        const subjectName = getCell('ชื่อวิชา');
+        const classroomName = getCell('ชื่อห้อง');
+        const periodsText = getCell('จำนวนคาบ/สัปดาห์');
+        const periodsValue = Number(periodsText);
+
+        if (!teacherId || !teacherName || !subjectId || !subjectName || !classroomName || !periodsText) {
+          errors.push(`${prefix}: กรอกข้อมูลไม่ครบ`);
+          return;
+        }
+
+        const teacher = teacherById.get(teacherId);
+        if (!teacher) {
+          errors.push(`${prefix}: ไม่พบรหัสครู ${teacherId}`);
+          return;
+        }
+        if (normalizeExcelText(teacher.name) !== teacherName) {
+          errors.push(`${prefix}: ชื่อครูไม่ตรงกับรหัส ${teacherId}`);
+          return;
+        }
+
+        const subject = subjectById.get(subjectId);
+        if (!subject) {
+          errors.push(`${prefix}: ไม่พบรหัสวิชา ${subjectId} ในภาคเรียนนี้`);
+          return;
+        }
+        if (normalizeExcelText(subject.name) !== subjectName) {
+          errors.push(`${prefix}: ชื่อวิชาไม่ตรงกับรหัส ${subjectId}`);
+          return;
+        }
+
+        const matchingRooms = roomsByName.get(classroomName) || [];
+        if (matchingRooms.length === 0) {
+          errors.push(`${prefix}: ไม่พบชื่อห้อง ${classroomName}`);
+          return;
+        }
+        if (matchingRooms.length > 1) {
+          errors.push(`${prefix}: ชื่อห้อง ${classroomName} ซ้ำในข้อมูลห้องเรียน กรุณาแก้ชื่อห้องในระบบให้ไม่ซ้ำกัน`);
+          return;
+        }
+        const classroom = matchingRooms[0];
+        const classroomId = classroom.id;
+
+        if (!Number.isInteger(periodsValue) || periodsValue < 1) {
+          errors.push(`${prefix}: จำนวนคาบ/สัปดาห์ต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป`);
+          return;
+        }
+
+        const key = `${teacherId}_${subjectId}_${classroomId}`;
+        if (seenKeys.has(key)) {
+          errors.push(`${prefix}: ครู/วิชา/ห้องซ้ำกับ ${seenKeys.get(key)}`);
+          return;
+        }
+        seenKeys.set(key, prefix);
+
+        const existing = existingByKey.get(key);
+        const id = existing?.id || `L_IMPORT_${importToken}_${index + 1}`;
+        importedItems.push({ id, teacherId, subjectId, classroomId, periods: periodsValue });
+        if (existing) updateCount += 1;
+        else createCount += 1;
+      });
+
+      if (errors.length > 0) {
+        const preview = errors.slice(0, 3).join(' | ');
+        const more = errors.length > 3 ? ` และอีก ${errors.length - 3} จุด` : '';
+        showToast(`นำเข้าไม่ได้ พบ ${errors.length} จุด: ${preview}${more}`, 'error');
+        return;
+      }
+
+      const ok = await bulkUpsertTeachingLoads(importedItems);
+      if (!ok) return;
+      showToast(`นำเข้า Excel ${files.length} ไฟล์สำเร็จ ${importedItems.length} รายการ (เพิ่ม ${createCount}, อัปเดต ${updateCount})`);
+    } catch (error) {
+      console.error(error);
+      showToast(`อ่านไฟล์ Excel ไม่สำเร็จ: ${error?.message || 'ไฟล์ไม่ถูกต้อง'}`, 'error');
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
   return (
     <div className="animate-in fade-in space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
         <h2 className="text-xl font-bold text-[#081a39] flex items-center gap-2"><Briefcase className="text-[#d4af37]"/> ภาระสอน (เทอม {schoolSettings.semester}/{schoolSettings.academicYear})</h2>
-        <button onClick={() => { setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 }); setIsEditing(false); setIsModalOpen(true); }} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มภาระสอน</button>
+        <div className="flex flex-wrap gap-3">
+          <button onClick={downloadExcelTemplate} className="flex items-center gap-2 px-4 py-2 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-medium shadow-sm transition-colors"><FileSpreadsheet size={18} className="text-emerald-600" /> ดาวน์โหลดแม่แบบ Excel</button>
+          <button onClick={() => excelInputRef.current?.click()} disabled={isImporting} className="flex items-center gap-2 px-4 py-2 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-medium shadow-sm transition-colors disabled:opacity-50"><UploadCloud size={18} className="text-amber-600" /> {isImporting ? 'กำลังนำเข้า...' : 'นำเข้า Excel'}</button>
+          <input ref={excelInputRef} type="file" accept=".xlsx,.xls" multiple onChange={handleExcelImport} className="hidden" />
+          <button onClick={() => { setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 }); setIsEditing(false); setIsModalOpen(true); }} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มภาระสอน</button>
+        </div>
       </div>
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col">
          <div className="overflow-x-auto custom-scrollbar">
@@ -1526,6 +1735,35 @@ export default function App() {
     }
   };
 
+
+  const bulkUpsertTeachingLoads = async (items) => {
+    if (!user || !Array.isArray(items) || items.length === 0) return false;
+    try {
+      const termPath = `school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
+      const operations = items.map(item => {
+        const id = String(item.id || '').trim();
+        const periodsValue = Number(item.periods);
+        if (!id || !item.teacherId || !item.subjectId || !item.classroomId || !Number.isInteger(periodsValue) || periodsValue < 1) {
+          throw new Error('ข้อมูลภาระสอนไม่ถูกต้อง');
+        }
+        const cleanItem = {
+          id,
+          teacherId: String(item.teacherId),
+          subjectId: String(item.subjectId),
+          classroomId: String(item.classroomId),
+          periods: periodsValue,
+        };
+        return { type: 'set', ref: doc(db, `${termPath}/teachingLoads`, id), data: cleanItem };
+      });
+      await commitOperationsInChunks(operations);
+      return true;
+    } catch (error) {
+      console.error(error);
+      showToast("นำเข้าภาระสอนไม่สำเร็จ", "error");
+      return false;
+    }
+  };
+
   const replaceCollectionData = async (collectionPath, items) => {
     const safeItems = Array.isArray(items) ? items : [];
     const currentSnapshot = await getDocs(collection(db, collectionPath));
@@ -1946,7 +2184,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
