@@ -164,7 +164,7 @@ const SortIcon = ({ column, sortConfig }) => {
 const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, teachers, subjects, classrooms, periods) => {
   const health = {
     status: 'ready', totalRequired: 0, scheduledForLoads: 0, missing: 0, overScheduled: 0, completionPercent: 0,
-    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
+    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], teacherLimitConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
     teacherStats: {}, roomStats: {}, 
   };
 
@@ -178,6 +178,9 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   const loadTracker = {}; 
   loads.forEach(l => {
     const req = Number(l.periods) || 0;
+    if (!Number.isInteger(Number(l.periods)) || req < 1 || l.periods === '' || l.periods == null) {
+      health.orphans.push(`ภาระสอนครู ${l.teacherId || '-'} วิชา ${l.subjectId || '-'} มีจำนวนคาบไม่ถูกต้อง`);
+    }
     health.totalRequired += req;
     const lKey = `${l.teacherId}_${l.subjectId}_${l.classroomId}`;
     if (loadTracker[lKey]) {
@@ -281,25 +284,58 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
     stat.gaps = totalGaps; stat.maxConsec = globalMaxConsec;
   });
 
-  const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.blockConflicts.length > 0 || health.orphans.length > 0;
+  health.teacherLimitConflicts = findTeacherTeachingLimitConflicts([...schedules, ...fixed], periods, teachers);
+  const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.blockConflicts.length > 0 || health.teacherLimitConflicts.length > 0 || health.orphans.length > 0;
   if (hasHardConflict) health.status = 'error';
+  else if (loads.length === 0) health.status = 'empty';
   else if (health.missing > 0 || health.overScheduled > 0) health.status = 'warning';
   else health.status = 'ready';
 
   return health;
 };
 
-const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch) => {
-  const maps = { tUnavailMap: new Set(), cUnavailMap: new Set(), fixedMap: new Set(), teacherPlacements: new Set(), roomPlacements: new Set() };
+// ข้อบังคับครู: นับคาบที่ครูมีสอน/กิจกรรมล็อกจริงรวมกัน และไม่นับคาบพักเป็นคาบติดกัน
+const teacherDayKey = (teacherId, day) => JSON.stringify([teacherId, day]);
+const registerTeacherPeriod = (maps, item) => {
+  if (!item.teacherId) return;
+  const key = teacherDayKey(item.teacherId, item.day);
+  if (!maps.teacherDayPeriods.has(key)) maps.teacherDayPeriods.set(key, new Set());
+  maps.teacherDayPeriods.get(key).add(item.periodId);
+};
+
+const canPlaceTeacherEntries = (teacherId, entries, maps) => {
+  if (!teacherId) return { ok: true, reason: '' };
+  const byDay = new Map();
+  entries.forEach(item => {
+    if (!byDay.has(item.day)) byDay.set(item.day, []);
+    byDay.get(item.day).push(item.periodId);
+  });
+  for (const [day, additions] of byDay) {
+    const existing = maps.teacherDayPeriods.get(teacherDayKey(teacherId, day)) || new Set();
+    const result = new Set([...existing, ...additions]);
+    if (result.size > SCHEDULER_CONFIG.maxTeacherPeriodsPerDay) {
+      return { ok: false, reason: 'TEACHER_DAILY_LIMIT' };
+    }
+    if (calculateDayTeachingShape([...result], maps.periodContext).maxConsec > SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) {
+      return { ok: false, reason: 'TEACHER_CONSECUTIVE_LIMIT' };
+    }
+  }
+  return { ok: true, reason: '' };
+};
+
+const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = DEFAULT_PERIODS) => {
+  const maps = { tUnavailMap: new Set(), cUnavailMap: new Set(), fixedMap: new Set(), teacherPlacements: new Set(), roomPlacements: new Set(), teacherDayPeriods: new Map(), periodContext: buildPeriodContext(periods) };
   tUnavail.forEach(u => maps.tUnavailMap.add(`${u.teacherId}_${u.day}_${u.periodId}`));
   cUnavail.forEach(u => maps.cUnavailMap.add(`${u.classroomId}_${u.day}_${u.periodId}`));
   fixedSch.forEach(f => {
     maps.fixedMap.add(`${f.day}_${f.periodId}_${f.classroomId}`);
     if (f.teacherId) maps.teacherPlacements.add(`${f.teacherId}_${f.day}_${f.periodId}`);
+    registerTeacherPeriod(maps, f);
     maps.roomPlacements.add(`${f.classroomId}_${f.day}_${f.periodId}`);
   });
   schedules.forEach(s => {
     if (s.teacherId) maps.teacherPlacements.add(`${s.teacherId}_${s.day}_${s.periodId}`);
+    registerTeacherPeriod(maps, s);
     maps.roomPlacements.add(`${s.classroomId}_${s.day}_${s.periodId}`);
   });
   return maps;
@@ -312,6 +348,8 @@ const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak) 
   if (maps.fixedMap.has(`${day}_${periodId}_${classroomId}`)) return { ok: false, reason: "FIXED_SCHEDULE_CONFLICT" };
   if (maps.roomPlacements.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_CONFLICT" };
   if (teacherId && maps.teacherPlacements.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_CONFLICT" };
+  const teachingLimit = canPlaceTeacherEntries(teacherId, [{ day, periodId }], maps);
+  if (!teachingLimit.ok) return teachingLimit;
   return { ok: true, reason: "" };
 };
 
@@ -392,6 +430,7 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
       addProblem(`ครู ${load.teacherId} วิชา ${load.subjectId} ห้อง ${load.classroomId}: คาบที่จัดเอง/ล็อก ${count} คาบ มากกว่าภาระสอน ${load.periods} คาบ`);
     }
   });
+  findTeacherTeachingLimitConflicts(anchors, periods, teachers).forEach(addProblem);
   return problems;
 };
 
@@ -414,6 +453,8 @@ const cloneConstraintMaps = (maps) => ({
   fixedMap: maps.fixedMap,
   teacherPlacements: new Set(maps.teacherPlacements),
   roomPlacements: new Set(maps.roomPlacements),
+  teacherDayPeriods: new Map([...maps.teacherDayPeriods].map(([day, values]) => [day, new Set(values)])),
+  periodContext: maps.periodContext,
 });
 
 const buildPeriodContext = (periods) => {
@@ -474,6 +515,30 @@ const calculateDayTeachingShape = (dayPeriods, periodsOrContext) => {
     }
   }
   return { gaps, maxConsec };
+};
+
+const findTeacherTeachingLimitConflicts = (items, periods, teachers = []) => {
+  const byTeacherDay = new Map();
+  const names = new Map(teachers.map(t => [t.id, t.name]));
+  items.forEach(item => {
+    if (!item.teacherId || !DAYS.includes(item.day)) return;
+    const key = teacherDayKey(item.teacherId, item.day);
+    if (!byTeacherDay.has(key)) byTeacherDay.set(key, { teacherId: item.teacherId, day: item.day, periodIds: new Set() });
+    byTeacherDay.get(key).periodIds.add(item.periodId);
+  });
+  const violations = [];
+  byTeacherDay.forEach(({ teacherId, day, periodIds }) => {
+    const periodsOnDay = [...periodIds];
+    const teacherName = names.get(teacherId) || teacherId;
+    if (periodsOnDay.length > SCHEDULER_CONFIG.maxTeacherPeriodsPerDay) {
+      violations.push(`ครู ${teacherName} วัน${day} มี ${periodsOnDay.length} คาบ (สูงสุด ${SCHEDULER_CONFIG.maxTeacherPeriodsPerDay} คาบ/วัน)`);
+    }
+    const maxConsec = calculateDayTeachingShape(periodsOnDay, periods).maxConsec;
+    if (maxConsec > SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) {
+      violations.push(`ครู ${teacherName} วัน${day} สอนติดกัน ${maxConsec} คาบ (สูงสุด ${SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods} คาบติดกัน)`);
+    }
+  });
+  return violations;
 };
 
 const getTeacherDayShapeScore = (dayPeriods, periodsOrContext) => {
@@ -702,8 +767,8 @@ const ConfirmModal = ({ confirmData, setConfirmData }) => {
 
 const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, health }) => {
   const statusColor = health.status === 'ready' ? 'text-emerald-500' : health.status === 'warning' ? 'text-amber-500' : 'text-rose-500';
-  const statusBg = health.status === 'ready' ? 'bg-emerald-500' : health.status === 'warning' ? 'bg-amber-500' : 'bg-rose-500';
-  const statusText = health.status === 'ready' ? 'พร้อมใช้งาน' : health.status === 'warning' ? 'มีคำเตือน' : 'มีข้อผิดพลาด (Conflict)';
+  const statusBg = health.status === 'ready' ? 'bg-emerald-500' : health.status === 'warning' ? 'bg-amber-500' : health.status === 'empty' ? 'bg-slate-400' : 'bg-rose-500';
+  const statusText = health.status === 'ready' ? 'พร้อมใช้งาน' : health.status === 'warning' ? 'มีคำเตือน' : health.status === 'empty' ? 'ยังไม่มีข้อมูลภาระสอน' : 'มีข้อผิดพลาด (Conflict)';
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
@@ -741,7 +806,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, healt
         <div className={`bg-white p-5 rounded-2xl shadow-sm border flex flex-col justify-between ${health.status === 'error' ? 'border-rose-200 bg-rose-50/30' : 'border-slate-100'}`}>
            <div className={`font-bold mb-2 flex items-center gap-2 ${health.status === 'error' ? 'text-rose-600' : 'text-slate-500'}`}><AlertCircle size={18}/> ข้อขัดแย้ง (Conflicts)</div>
            <div className={`text-3xl font-bold ${health.status === 'error' ? 'text-rose-700' : 'text-[#081a39]'}`}>
-             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.blockConflicts.length + health.orphans.length}
+             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.blockConflicts.length + health.teacherLimitConflicts.length + health.orphans.length}
            </div>
         </div>
       </div>
@@ -1254,10 +1319,10 @@ const ConstraintsView = ({ unavailabilities, classroomUnavailabilities, fixedSch
       if (ok) showToast("บันทึกเวลาห้องไม่ว่างสำเร็จ");
     } else if (type === 'fixed') {
       if (!fForm.subjectId || !fForm.classroomId) return showToast("กรุณาเลือกวิชาและห้อง", "error");
-      const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules);
+      const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
       const valid = canPlaceSchedule(fForm.teacherId, fForm.classroomId, fForm.day, fForm.periodId, maps, false);
       if (!valid.ok) {
-        const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว" };
+        const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้" };
         return showToast(reasons[valid.reason] || "ไม่สามารถล็อกตารางในเวลานี้ได้", "error");
       }
       const id = `F_${Date.now()}`;
@@ -1381,10 +1446,10 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
     const remaining = required - assignedItems.length;
     if (remaining <= 0) return showToast("ภาระสอนรายการนี้จัดครบแล้ว", "error");
 
-    const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules);
+    const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
     const selectedValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, addForm.periodId, maps, false);
     if (!selectedValid.ok) {
-      const reasons = { "BREAK_PERIOD": "จัดลงคาบพักเที่ยงไม่ได้", "ROOM_UNAVAILABLE": "ห้องไม่สะดวก", "TEACHER_UNAVAILABLE": "ครูไม่สะดวก", "FIXED_SCHEDULE_CONFLICT": "มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีวิชาอื่นแล้ว", "TEACHER_CONFLICT": "ครูมีสอนแล้ว" };
+      const reasons = { "BREAK_PERIOD": "จัดลงคาบพักเที่ยงไม่ได้", "ROOM_UNAVAILABLE": "ห้องไม่สะดวก", "TEACHER_UNAVAILABLE": "ครูไม่สะดวก", "FIXED_SCHEDULE_CONFLICT": "มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีวิชาอื่นแล้ว", "TEACHER_CONFLICT": "ครูมีสอนแล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้" };
       return showToast(reasons[selectedValid.reason] || "ติดเงื่อนไขจัดไม่ได้", "error");
     }
 
@@ -1410,7 +1475,10 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
           const candidatePairs = [];
           neighborPeriods.forEach(neighbor => {
             const neighborValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, neighbor.id, maps, false);
-            if (neighborValid.ok) candidatePairs.push([{ day: addForm.day, periodId: addForm.periodId }, { day: addForm.day, periodId: neighbor.id }]);
+            if (neighborValid.ok) {
+              const pair = [{ day: addForm.day, periodId: addForm.periodId }, { day: addForm.day, periodId: neighbor.id }];
+              if (canPlaceTeacherEntries(addForm.teacherId, pair, maps).ok) candidatePairs.push(pair);
+            }
           });
 
           if (candidatePairs.length === 0) return showToast("วิชานี้กำหนดเป็น Block 2 แต่ไม่มีคาบข้างเคียงที่ว่างสำหรับจัดติดกัน", "error");
@@ -1429,6 +1497,10 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
         if (projectedSingles > (required % 2)) return showToast("รูปแบบคาบต่อเนื่องยังไม่สมบูรณ์ กรุณาจัดคาบให้เป็นคู่ติดกัน", "error");
       }
     }
+
+    const teacherLimit = canPlaceTeacherEntries(addForm.teacherId, plannedEntries, maps);
+    if (!teacherLimit.ok) return showToast(teacherLimit.reason === 'TEACHER_DAILY_LIMIT'
+      ? 'ครูสอนเกิน 5 คาบต่อวันไม่ได้' : 'ครูสอนเกิน 3 คาบติดต่อกันไม่ได้', 'error');
 
     try {
       if (saveScheduleVersion) await saveScheduleVersion('before_manual_add');
@@ -1583,8 +1655,10 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
               {health.cUnavailConflicts.map((c,i) => <li key={`cuc-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.breakConflicts.map((c,i) => <li key={`bc-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.blockConflicts.map((c,i) => <li key={`block-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
+              {health.teacherLimitConflicts.map((c,i) => <li key={`limit-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.orphans.map((c,i) => <li key={`oc-${i}`} className="p-2 bg-slate-100 rounded border border-slate-300">ข้อมูลสูญหาย: {c}</li>)}
-              {health.status !== 'error' && <li className="text-emerald-600 font-bold p-2 bg-emerald-50 rounded border border-emerald-100">ตรวจสอบผ่าน: ไม่พบข้อผิดพลาดร้ายแรง</li>}
+              {health.status === 'empty' && <li className="text-slate-600 p-2 bg-slate-50 rounded border border-slate-200">ยังไม่มีภาระสอน กรุณานำเข้าหรือเพิ่มข้อมูลก่อนจัดตาราง</li>}
+              {health.status === 'ready' && <li className="text-emerald-600 font-bold p-2 bg-emerald-50 rounded border border-emerald-100">ตรวจสอบผ่าน: ไม่พบข้อผิดพลาดร้ายแรง</li>}
             </ul>
           </div>
           <div className="bg-white rounded-2xl shadow-sm border border-amber-100 p-6">
@@ -1759,7 +1833,7 @@ export default function App() {
   const getTermKey = (settings) => `${settings?.academicYear || '2569'}-${settings?.semester || '1'}`;
 
   const health = useMemo(() => {
-    if (!periods || periods.length === 0) return { status: 'ready', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherStats: {} };
+    if (!periods || periods.length === 0) return { status: teachingLoads.length === 0 ? 'empty' : 'warning', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherLimitConflicts: [], teacherStats: {} };
     return calculateScheduleHealth(schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods);
   }, [schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods]);
 
@@ -1921,20 +1995,39 @@ export default function App() {
       return true;
     } catch (error) {
       console.error(error);
-      showToast(error.code === 'ATOMIC_LIMIT' ? error.message : "นำเข้าภาระสอนไม่สำเร็จ (ไม่มีการนำเข้าเป็นบางส่วน)", "error");
+      showToast(['ATOMIC_LIMIT', 'ATOMIC_SIZE'].includes(error.code) ? error.message : "นำเข้าภาระสอนไม่สำเร็จ (ไม่มีการนำเข้าเป็นบางส่วน)", "error");
       return false;
     }
   };
 
-  // STEP 03: Firestore writeBatch is atomic only within one batch.
-  // Never fall back to sequential chunks for a destructive collection replacement.
-  const ATOMIC_OPERATION_LIMIT = 400;
-  const commitAtomicOperations = async (operations) => {
+  // STEP 06: Keep each critical save atomic, including school-wide schedules.
+  // Firestore removed its 500-write Commit limit in 2023; the 10 MiB request limit
+  // and index costs still apply. Use a conservative estimated-size safety guard.
+  // Do not fall back to sequential batches: that could leave half a timetable saved.
+  const ATOMIC_OPERATION_LIMIT = 3000;
+  const ATOMIC_ESTIMATED_BYTES_LIMIT = 6 * 1024 * 1024;
+  const assertAtomicWriteCapacity = (operations) => {
     if (operations.length > ATOMIC_OPERATION_LIMIT) {
-      const error = new Error(`มีข้อมูลต้องเปลี่ยน ${operations.length} รายการ (เกินขีดจำกัด ${ATOMIC_OPERATION_LIMIT}) ระบบยังไม่แก้ข้อมูลใด ๆ กรุณาใช้ขั้นตอนบันทึกข้อมูลจำนวนมากที่รองรับความปลอดภัยก่อน`);
+      const error = new Error(`ต้องเปลี่ยน ${operations.length} รายการ เกินเพดาน ${ATOMIC_OPERATION_LIMIT} รายการต่อครั้ง ระบบยังไม่ได้แก้ข้อมูลใด ๆ`);
       error.code = 'ATOMIC_LIMIT';
       throw error;
     }
+    // Estimate payload before creating the batch, allowing headroom for protocol
+    // and Firestore index overhead. This is NOT a guarantee of server acceptance.
+    const encoder = new TextEncoder();
+    let estimatedBytes = 0;
+    for (const op of operations) {
+      estimatedBytes += encoder.encode(JSON.stringify({ type: op.type, path: op.ref.path, data: op.type === 'delete' ? null : op.data })).length + 200;
+      if (estimatedBytes > ATOMIC_ESTIMATED_BYTES_LIMIT) {
+        const error = new Error(`ข้อมูลที่จะบันทึกมีขนาดใหญ่เกินเกณฑ์ปลอดภัย (ประมาณ ${(estimatedBytes / 1048576).toFixed(1)} MiB) ยังไม่ได้แก้ข้อมูลใด ๆ กรุณาแบ่งข้อมูลนำเข้าหรือติดต่อผู้ดูแลระบบ`);
+        error.code = 'ATOMIC_SIZE';
+        throw error;
+      }
+    }
+    return estimatedBytes;
+  };
+  const commitAtomicOperations = async (operations) => {
+    assertAtomicWriteCapacity(operations);
     if (operations.length === 0) return;
     const batch = writeBatch(db);
     operations.forEach(op => {
@@ -2050,12 +2143,8 @@ export default function App() {
           if (jsonData.schoolSettings) {
             allOperations.push({ type: 'set', ref: doc(db, `${basePath}/config/settings`), data: jsonData.schoolSettings });
           }
-          // Preflight size BEFORE writing either backup or target data.
-          if (allOperations.length > ATOMIC_OPERATION_LIMIT) {
-            const error = new Error(`ไฟล์สำรองต้องเขียน ${allOperations.length} รายการ เกินขีดจำกัด ${ATOMIC_OPERATION_LIMIT} จึงยกเลิกเพื่อป้องกันข้อมูลค้างครึ่งชุด`);
-            error.code = 'ATOMIC_LIMIT';
-            throw error;
-          }
+          // Preflight count AND estimated size before writing any backup/target data.
+          assertAtomicWriteCapacity(allOperations);
           // Only the schedule and fixed schedule are stored in legacy version history.
           const restoreVersionId = await saveScheduleVersion('before_backup_restore', plans.schedules.previousItems, plans.fixedSchedules.previousItems, backupTermKey);
           if (!restoreVersionId) throw new Error('RESTORE_SNAPSHOT_FAILED');
@@ -2063,7 +2152,7 @@ export default function App() {
           showToast("นำเข้าข้อมูลสำเร็จ!"); setConfirmData(null);
         } catch (error) {
           console.error(error);
-          showToast(error.code === 'ATOMIC_LIMIT' ? error.message : "นำเข้าข้อมูลไม่สำเร็จ ระบบไม่ได้บันทึกข้อมูลเป็นบางส่วน", "error");
+          showToast(['ATOMIC_LIMIT', 'ATOMIC_SIZE'].includes(error.code) ? error.message : "นำเข้าข้อมูลไม่สำเร็จ ระบบไม่ได้บันทึกข้อมูลเป็นบางส่วน", "error");
           setConfirmData(null);
         }
       }
@@ -2126,7 +2215,7 @@ export default function App() {
         const preservedSchedules = schedules
           .filter(s => !isAutoGeneratedSchedule(s))
           .map(s => ({ ...cleanScheduleSnapshotItem(s), source: s.source || 'manual' }));
-        const baseMaps = buildConstraintMaps(preservedSchedules, unavailabilities, classroomUnavailabilities, fixedSchedules);
+        const baseMaps = buildConstraintMaps(preservedSchedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
         const loadKeys = new Set(teachingLoads.map(getTeachingLoadKey));
         const fixedByLoad = new Map();
         const preservedByLoad = new Map();
@@ -2172,7 +2261,10 @@ export default function App() {
             periodContext.doublePairs.forEach(([p1, p2]) => {
               const valid1 = canPlaceSchedule(load.teacherId, load.classroomId, day, p1.id, maps, false);
               const valid2 = canPlaceSchedule(load.teacherId, load.classroomId, day, p2.id, maps, false);
-              if (valid1.ok && valid2.ok) options.push([{ day, periodId: p1.id }, { day, periodId: p2.id }]);
+              if (valid1.ok && valid2.ok) {
+                const pair = [{ day, periodId: p1.id }, { day, periodId: p2.id }];
+                if (canPlaceTeacherEntries(load.teacherId, pair, maps).ok) options.push(pair);
+              }
             });
           });
           return options;
@@ -2224,6 +2316,7 @@ export default function App() {
               };
               generatedSchedule.push(item);
               if (load.teacherId) currentMaps.teacherPlacements.add(`${load.teacherId}_${entry.day}_${entry.periodId}`);
+              registerTeacherPeriod(currentMaps, item);
               currentMaps.roomPlacements.add(`${load.classroomId}_${entry.day}_${entry.periodId}`);
               registerPlacementState(placementState, item);
             });
@@ -2331,6 +2424,9 @@ export default function App() {
 
         const candidates = candidatePool.slice(0, SCHEDULER_CANDIDATE_KEEP);
         const bestCandidate = candidates[0] || { schedule: preservedSchedules, generatedSchedule: [], preservedCount: preservedSchedules.length, unassigned: [], score: -Infinity, missingCount: 0, generationId: String(runSeed) };
+        if (findTeacherTeachingLimitConflicts([...fixedSchedules, ...bestCandidate.schedule], periods, teachers).length) {
+          throw new Error('TEACHER_HARD_LIMIT_FAILED');
+        }
         const totalReq = teachingLoads.reduce((a, curr) => a + (Number(curr.periods) || 0), 0);
         const missing = bestCandidate.unassigned.reduce((sum, item) => sum + (Number(item.missing) || 0), 0);
         setScheduleResult({
@@ -2413,7 +2509,7 @@ export default function App() {
           // STEP 03: Failed writeBatch is atomic; do not run a second replacement
           // as "rollback" (it could overwrite another user's concurrent changes).
           if (e.code === 'STALE_PREVIEW') setScheduleResult(null);
-          const message = e.code === 'ATOMIC_LIMIT' ? e.message
+          const message = ['ATOMIC_LIMIT', 'ATOMIC_SIZE'].includes(e.code) ? e.message
             : e.code === 'STALE_PREVIEW' ? e.message
             : 'บันทึกไม่สำเร็จ ไม่ได้เขียนตารางเป็นบางส่วน: ' + e.message;
           showToast(message, 'error');
