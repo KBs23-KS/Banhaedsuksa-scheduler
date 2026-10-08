@@ -926,11 +926,34 @@ const TeachersView = ({ teachers, dbAction, showToast, handleRequestDelete }) =>
   );
 };
 
-const SubjectsView = ({ activeSubjects, subjects, dbAction, showToast, handleRequestDelete, schoolSettings }) => {
+// STEP 08: Only subjects without CURRENT-TERM teaching/schedule references are bulk-deletable.
+// The master subjects collection is shared across terms. Other-term references are not
+// available to this view and must be checked separately before a school-wide cleanup.
+const getBulkDeletableSubjectIds = (subjectItems, teachingLoads, schedules, fixedSchedules) => {
+  const usedIds = new Set([
+    ...teachingLoads.map(item => item.subjectId),
+    ...schedules.map(item => item.subjectId),
+    ...fixedSchedules.map(item => item.subjectId),
+  ]);
+  return subjectItems.filter(item => !usedIds.has(item.id)).map(item => item.id);
+};
+
+const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixedSchedules, bulkDeleteSubjects, dbAction, showToast, handleRequestDelete, schoolSettings }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [form, setForm] = useState({ id: '', name: '', abbr: '', periodsPerWeek: 1, term: '1', periodBlock: 1, preferredTime: 'any' });
   const [isEditing, setIsEditing] = useState(false);
   const { items: sortedSubjects, requestSort, sortConfig } = useSortableData(activeSubjects);
+  const [selectedSubjectIds, setSelectedSubjectIds] = useState([]);
+  const deletableIds = useMemo(() => getBulkDeletableSubjectIds(activeSubjects, teachingLoads, schedules, fixedSchedules), [activeSubjects, teachingLoads, schedules, fixedSchedules]);
+  const deletableSet = useMemo(() => new Set(deletableIds), [deletableIds]);
+  const selectedValidIds = selectedSubjectIds.filter(id => deletableSet.has(id));
+  const allSelected = deletableIds.length > 0 && deletableIds.every(id => selectedValidIds.includes(id));
+
+  // Do not carry selection into another term or keep deleted/now-in-use subjects selected.
+  useEffect(() => { setSelectedSubjectIds([]); }, [schoolSettings.academicYear, schoolSettings.semester]);
+  useEffect(() => { setSelectedSubjectIds(prev => prev.filter(id => deletableSet.has(id))); }, [deletableSet]);
+  const toggleSubject = id => setSelectedSubjectIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const toggleAllSubjects = () => setSelectedSubjectIds(allSelected ? [] : [...deletableIds]);
 
   const saveForm = async () => {
     const periodsPerWeek = Number(form.periodsPerWeek);
@@ -947,10 +970,17 @@ const SubjectsView = ({ activeSubjects, subjects, dbAction, showToast, handleReq
         <h2 className="text-xl font-bold text-[#081a39] flex items-center gap-2"><BookOpen className="text-[#d4af37]"/> รายวิชา <span className="text-sm font-normal text-slate-500 ml-2">(ภาคเรียนที่ {schoolSettings.semester})</span></h2>
         <button onClick={() => {setForm({id:'', name:'', abbr:'', periodsPerWeek: 1, term: schoolSettings.semester, periodBlock: 1, preferredTime: 'any'}); setIsEditing(false); setIsModalOpen(true);}} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มรายวิชา</button>
       </div>
+      <div className="flex flex-wrap items-center gap-3 bg-white border border-slate-100 rounded-xl px-4 py-3">
+        <button type="button" onClick={toggleAllSubjects} disabled={deletableIds.length === 0} className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold text-[#081a39] disabled:opacity-40 hover:bg-slate-50">{allSelected ? 'ยกเลิกเลือกทั้งหมด' : 'เลือกทั้งหมดที่ลบได้'}</button>
+        <span className="text-sm text-slate-600">เลือก {selectedValidIds.length} รายการ</span>
+        <button type="button" onClick={() => bulkDeleteSubjects(selectedValidIds)} disabled={selectedValidIds.length === 0} className="ml-auto flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 text-white font-bold disabled:opacity-40 hover:bg-rose-700"><Trash2 size={16}/> ลบรายการที่เลือก ({selectedValidIds.length})</button>
+        <p className="w-full text-xs text-slate-500">วิชาที่มีภาระสอน ตารางสอน หรือกิจกรรมล็อกในภาคเรียนนี้จะเลือกเพื่อลบไม่ได้ รายวิชาเป็นข้อมูลส่วนกลางที่ใช้ข้ามภาคเรียน</p>
+      </div>
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
         <table className="w-full text-left border-collapse">
           <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]">
             <tr>
+              <th className="p-4 w-14 text-center"><input type="checkbox" aria-label="เลือกทั้งหมดที่ลบได้" title="เลือกทั้งหมดที่ลบได้" checked={allSelected} disabled={deletableIds.length === 0} onChange={toggleAllSubjects} className="w-4 h-4 accent-[#081a39] cursor-pointer" /></th>
               <th className="p-4 font-bold cursor-pointer" onClick={() => requestSort('id')}>รหัส <SortIcon column="id" sortConfig={sortConfig}/></th>
               <th className="p-4 font-bold cursor-pointer" onClick={() => requestSort('name')}>ชื่อวิชา <SortIcon column="name" sortConfig={sortConfig}/></th>
               <th className="p-4 font-bold text-center">คาบ/สัปดาห์</th><th className="p-4 font-bold text-center w-28">จัดการ</th>
@@ -958,8 +988,9 @@ const SubjectsView = ({ activeSubjects, subjects, dbAction, showToast, handleReq
           </thead>
           <tbody>
             {sortedSubjects.map(d => (
-              <tr key={d.id} className="border-b border-slate-50 hover:bg-[#081a39]/5">
-                <td className="p-4 text-slate-500 font-mono text-sm">{d.id}</td><td className="p-4 font-medium text-[#081a39]">{d.name} <span className="text-xs text-slate-400">({d.abbr})</span></td><td className="p-4 text-center font-bold text-[#d4af37]">{d.periodsPerWeek}</td>
+              <tr key={d.id} className={`border-b border-slate-50 hover:bg-[#081a39]/5 ${selectedValidIds.includes(d.id) ? 'bg-amber-50/40' : ''}`}>
+                <td className="p-4 text-center"><input type="checkbox" aria-label={`เลือกรายวิชา ${d.name} (${d.id})`} title={deletableSet.has(d.id) ? 'เลือกเพื่อลบ' : 'วิชานี้ถูกใช้งานอยู่ ไม่สามารถลบได้'} checked={selectedValidIds.includes(d.id)} disabled={!deletableSet.has(d.id)} onChange={() => toggleSubject(d.id)} className="w-4 h-4 accent-[#081a39] cursor-pointer disabled:cursor-not-allowed" /></td>
+                <td className="p-4 text-slate-500 font-mono text-sm">{d.id}</td><td className="p-4 font-medium text-[#081a39]">{d.name} <span className="text-xs text-slate-400">({d.abbr})</span>{!deletableSet.has(d.id) && <span className="ml-2 text-xs text-amber-700">(ถูกใช้งานอยู่)</span>}</td><td className="p-4 text-center font-bold text-[#d4af37]">{d.periodsPerWeek}</td>
                 <td className="p-4 text-center"><button onClick={() => { setForm({periodBlock: 1, preferredTime: 'any', ...d}); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39]"><Edit size={18}/></button><button onClick={() => handleRequestDelete('subject', d)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td>
               </tr>
             ))}
@@ -1891,6 +1922,60 @@ export default function App() {
     } catch (e) { showToast("บันทึกไม่สำเร็จ", 'error'); return false; }
   };
 
+  // STEP 08: Bulk subject delete uses the same reference guard as single delete,
+  // re-checks current-term Firestore data from SERVER, then deletes in one atomic batch.
+  const bulkDeleteSubjects = (ids) => {
+    const chosenIds = [...new Set((Array.isArray(ids) ? ids : []).map(String))];
+    if (!chosenIds.length) return showToast('กรุณาเลือกรายวิชาที่ต้องการลบ', 'error');
+    const byId = new Map(subjects.map(item => [item.id, item]));
+    const deletable = new Set(getBulkDeletableSubjectIds(subjects, teachingLoads, schedules, fixedSchedules));
+    if (chosenIds.some(id => !byId.has(id) || !deletable.has(id))) {
+      return showToast('มีวิชาที่ถูกใช้งานหรือไม่มีในระบบ กรุณาเลือกใหม่', 'error');
+    }
+    const selectedSnapshot = chosenIds.map(id => byId.get(id));
+    const termKey = getTermKey(schoolSettings);
+    const names = selectedSnapshot.slice(0, 5).map(item => `• ${item.id} ${item.name}`).join('\n');
+    setConfirmData({
+      type: 'delete', title: `ยืนยันลบ ${chosenIds.length} รายวิชา`, confirmText: `ลบ ${chosenIds.length} รายการ`,
+      message: `คุณต้องการลบรายวิชาต่อไปนี้ถาวรใช่หรือไม่?\n${names}${chosenIds.length > 5 ? `\n...และอีก ${chosenIds.length - 5} รายการ` : ''}\n\nรายวิชาเป็นข้อมูลส่วนกลาง อาจถูกใช้งานในภาคเรียนอื่น กรุณาตรวจสอบก่อนลบ`,
+      action: async () => {
+        setConfirmData(prev => ({ ...prev, isLoading: true }));
+        try {
+          if (!user) throw new Error('NOT_SIGNED_IN');
+          const termPath = `school_data/${appId}/terms/${termKey}`;
+          const [masterSnapshot, loadSnapshot, scheduleSnapshot, fixedSnapshot] = await Promise.all([
+            getDocsFromServer(collection(db, `school_data/${appId}/subjects`)),
+            getDocsFromServer(collection(db, `${termPath}/teachingLoads`)),
+            getDocsFromServer(collection(db, `${termPath}/schedules`)),
+            getDocsFromServer(collection(db, `${termPath}/fixedSchedules`)),
+          ]);
+          const liveSubjects = new Map(masterSnapshot.docs.map(d => [d.id, { ...d.data(), id: d.id }]));
+          // Protect against changes made by another user since the confirmation opened.
+          if (selectedSnapshot.some(item => !liveSubjects.has(item.id) || !areFirestoreRecordsEqual(item, liveSubjects.get(item.id)))) {
+            throw new Error('SUBJECT_DATA_CHANGED');
+          }
+          const liveDeletable = new Set(getBulkDeletableSubjectIds(
+            selectedSnapshot,
+            loadSnapshot.docs.map(d => d.data()),
+            scheduleSnapshot.docs.map(d => d.data()),
+            fixedSnapshot.docs.map(d => d.data()),
+          ));
+          if (chosenIds.some(id => !liveDeletable.has(id))) throw new Error('SUBJECT_IN_USE');
+          const operations = chosenIds.map(id => ({ type: 'delete', ref: doc(db, `school_data/${appId}/subjects`, id) }));
+          await commitAtomicOperations(operations);
+          showToast(`ลบรายวิชาสำเร็จ ${chosenIds.length} รายการ`);
+          setConfirmData(null);
+        } catch (error) {
+          console.error('Bulk delete subjects failed', error);
+          if (error.message === 'SUBJECT_IN_USE') showToast('พบรายวิชาที่มีภาระสอน/ตารางสอน/กิจกรรมล็อกเพิ่มขึ้น กรุณาตรวจสอบใหม่ ยังไม่ได้ลบข้อมูล', 'error');
+          else if (error.message === 'SUBJECT_DATA_CHANGED') showToast('มีผู้แก้ไขข้อมูลรายวิชาแล้ว กรุณาตรวจสอบรายการใหม่ ยังไม่ได้ลบข้อมูล', 'error');
+          else showToast(['ATOMIC_LIMIT', 'ATOMIC_SIZE'].includes(error.code) ? error.message : 'ลบหลายรายวิชาไม่สำเร็จ ยังไม่ได้ลบเพียงบางส่วน', 'error');
+          setConfirmData(prev => ({ ...prev, isLoading: false }));
+        }
+      }
+    });
+  };
+
   const handleRequestDelete = (type, item) => {
     let errors = [];
     let scheduleDeleteItems = [item];
@@ -2558,7 +2643,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, bulkDeleteSubjects, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
