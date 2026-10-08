@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, getDocs, getDoc, writeBatch } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, getDocs, getDocsFromServer, getDocFromServer, writeBatch, runTransaction } from 'firebase/firestore';
 import { 
   FileJson, Settings, X, AlertCircle, CheckCircle2, Plus, Edit, Trash2, ChevronUp, ChevronDown, 
   ChevronsUpDown, Users, BookOpen, Home, Briefcase, CalendarDays, Printer, LayoutDashboard, 
@@ -26,6 +26,38 @@ const app = initializeApp(getFirebaseConfig());
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = 'bhs-school-scheduler-v3'; 
+
+// STEP 04: Scheduler lock is acquired/released atomically and belongs to one run.
+// The lease duration remains 5 minutes (matching the old lock), with periodic renewal.
+const SCHEDULER_LOCK_TTL_MS = 5 * 60 * 1000;
+const SCHEDULER_LOCK_RENEW_MS = 60 * 1000;
+
+const acquireSchedulerLock = (lockRef, ownerId) => runTransaction(db, async tx => {
+  const snap = await tx.get(lockRef);
+  const data = snap.exists() ? snap.data() : null;
+  const timestamp = Number(data?.timestamp);
+  // Treat a lock with a missing/invalid timestamp as occupied, rather than
+  // guessing it is safe to steal a possibly active lock.
+  const active = data?.locked === true &&
+    (!Number.isFinite(timestamp) || timestamp <= 0 || Date.now() - timestamp < SCHEDULER_LOCK_TTL_MS);
+  if (active) return false;
+  tx.set(lockRef, { locked: true, timestamp: Date.now(), ownerId });
+  return true;
+});
+
+const renewSchedulerLock = (lockRef, ownerId) => runTransaction(db, async tx => {
+  const snap = await tx.get(lockRef);
+  if (!snap.exists() || snap.data().locked !== true || snap.data().ownerId !== ownerId) return false;
+  tx.update(lockRef, { timestamp: Date.now() });
+  return true;
+});
+
+const releaseSchedulerLock = (lockRef, ownerId) => runTransaction(db, async tx => {
+  const snap = await tx.get(lockRef);
+  if (!snap.exists() || snap.data().locked !== true || snap.data().ownerId !== ownerId) return false;
+  tx.update(lockRef, { locked: false, timestamp: Date.now() });
+  return true;
+});
 
 const DEFAULT_PERIODS = [
   { id: '1', name: 'คาบ 1', start: '08:40', end: '09:30', isBreak: false },
@@ -132,7 +164,7 @@ const SortIcon = ({ column, sortConfig }) => {
 const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, teachers, subjects, classrooms, periods) => {
   const health = {
     status: 'ready', totalRequired: 0, scheduledForLoads: 0, missing: 0, overScheduled: 0, completionPercent: 0,
-    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
+    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
     teacherStats: {}, roomStats: {}, 
   };
 
@@ -148,7 +180,13 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
     const req = Number(l.periods) || 0;
     health.totalRequired += req;
     const lKey = `${l.teacherId}_${l.subjectId}_${l.classroomId}`;
-    loadTracker[lKey] = { ...l, required: req, scheduled: 0 };
+    if (loadTracker[lKey]) {
+      // ห้ามให้รายการซ้ำเขียนทับจำนวนคาบเดิม เพราะจะทำให้ Health Check แสดงผลผิด
+      loadTracker[lKey].required += req;
+      health.orphans.push(`พบภาระสอนซ้ำสำหรับครู ${l.teacherId} วิชา ${l.subjectId} ห้อง ${l.classroomId}`);
+    } else {
+      loadTracker[lKey] = { ...l, required: req, scheduled: 0 };
+    }
     if (!health.teacherStats[l.teacherId]) health.teacherStats[l.teacherId] = { req: 0, sch: 0, days: {}, gaps: 0, maxConsec: 0, subjects: new Set() };
     health.teacherStats[l.teacherId].req += req;
     health.teacherStats[l.teacherId].subjects.add(l.subjectId);
@@ -216,6 +254,19 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
     else { cappedScheduled += l.required; }
   });
 
+  // ตรวจความสมบูรณ์ของคาบคู่ แม้ยอดคาบจะตรงโควตาแล้วก็ตาม
+  Object.values(loadTracker).forEach(l => {
+    if (Number(subjectMap.get(l.subjectId)?.periodBlock) !== 2) return;
+    const relevant = [...schedules, ...fixed].filter(s =>
+      s.teacherId === l.teacherId && s.subjectId === l.subjectId && s.classroomId === l.classroomId
+    );
+    const singles = analyzeBlockPairing(relevant, periodContext).singles;
+    const allowedSingles = l.required % 2;
+    if (singles.length > allowedSingles) {
+      health.blockConflicts.push(`วิชา ${subjectMap.get(l.subjectId)?.name || l.subjectId} / ห้อง ${roomMap.get(l.classroomId)?.name || l.classroomId} มีคาบเดี่ยว ${singles.length} คาบ (อนุญาต ${allowedSingles})`);
+    }
+  });
+
   health.scheduledForLoads = cappedScheduled;
   health.completionPercent = health.totalRequired > 0 ? Math.min(100, Math.round((cappedScheduled / health.totalRequired) * 100)) : 0;
 
@@ -230,7 +281,7 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
     stat.gaps = totalGaps; stat.maxConsec = globalMaxConsec;
   });
 
-  const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.orphans.length > 0;
+  const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.blockConflicts.length > 0 || health.orphans.length > 0;
   if (hasHardConflict) health.status = 'error';
   else if (health.missing > 0 || health.overScheduled > 0) health.status = 'warning';
   else health.status = 'ready';
@@ -262,6 +313,86 @@ const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak) 
   if (maps.roomPlacements.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_CONFLICT" };
   if (teacherId && maps.teacherPlacements.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_CONFLICT" };
   return { ok: true, reason: "" };
+};
+
+// STEP 04: ตรวจความพร้อมของข้อมูลก่อนสร้างตาราง (ไม่มีการเขียน Firebase)
+// ตรวจเฉพาะสิ่งที่ทำให้ตารางไม่ถูกต้อง โดยไม่ปฏิเสธเพียงเพราะช่องเวลามีไม่พอ
+const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classrooms, periods,
+  schedules, fixedSchedules, unavailabilities, classroomUnavailabilities, semester }) => {
+  const problems = [];
+  const addProblem = message => { if (problems.length < 30) problems.push(message); };
+  const teacherIds = new Set(teachers.map(t => String(t.id)));
+  const classroomIds = new Set(classrooms.map(c => String(c.id)));
+  const subjectById = new Map(subjects.map(s => [String(s.id), s]));
+  const periodById = new Map(periods.map(p => [String(p.id), p]));
+  const validSubject = id => {
+    const subject = subjectById.get(String(id || ''));
+    return !!(subject && (!subject.term || subject.term === 'all' || String(subject.term) === String(semester)));
+  };
+  const loadKey = item => JSON.stringify([String(item.teacherId || ''), String(item.subjectId || ''), String(item.classroomId || '')]);
+  const loadByKey = new Map();
+
+  if (!teachingLoads.length) addProblem('ยังไม่มีข้อมูลภาระสอน กรุณาเพิ่มภาระสอนก่อนจัดตาราง');
+  if (!periods.some(p => !p.isBreak)) addProblem('ไม่พบคาบเรียนที่ใช้จัดตารางได้ กรุณาตรวจเมนูคาบเรียน');
+  if (periodById.size !== periods.length) addProblem('รหัสคาบเรียนซ้ำกัน กรุณาตรวจการตั้งค่าคาบเรียน');
+
+  teachingLoads.forEach((load, index) => {
+    const label = `ภาระสอนรายการที่ ${index + 1}`;
+    if (!load.teacherId || !teacherIds.has(String(load.teacherId))) addProblem(`${label}: ไม่พบรหัสครู ${load.teacherId || '-'}`);
+    if (!load.subjectId || !validSubject(load.subjectId)) addProblem(`${label}: ไม่พบรหัสวิชา ${load.subjectId || '-'} ในภาคเรียนนี้`);
+    if (!load.classroomId || !classroomIds.has(String(load.classroomId))) addProblem(`${label}: ไม่พบรหัสห้อง ${load.classroomId || '-'}`);
+    if (!Number.isInteger(Number(load.periods)) || Number(load.periods) < 1 || load.periods === '' || load.periods == null) {
+      addProblem(`${label}: จำนวนคาบต่อสัปดาห์ต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป`);
+    }
+    const key = loadKey(load);
+    if (loadByKey.has(key)) addProblem(`${label}: ภาระสอนครู–วิชา–ห้องซ้ำกับรายการที่ ${loadByKey.get(key).index}`);
+    else loadByKey.set(key, { load, index: index + 1 });
+  });
+
+  // ตารางที่เครื่องสร้างอัตโนมัติจะถูกสร้างใหม่ จึงตรวจเฉพาะตารางที่รักษาไว้กับกิจกรรมล็อก
+  const anchors = [
+    ...schedules.filter(s => !isAutoGeneratedSchedule(s)).map(s => ({ ...s, __kind: 'ตารางที่จัดด้วยมือ' })),
+    ...fixedSchedules.map(f => ({ ...f, __kind: 'กิจกรรมล็อก' })),
+  ];
+  const usedTeachers = new Set();
+  const usedRooms = new Set();
+  const anchorCounts = new Map();
+  const unavailableTeachers = new Set(unavailabilities.map(u => JSON.stringify([u.teacherId, u.day, String(u.periodId)])));
+  const unavailableRooms = new Set(classroomUnavailabilities.map(u => JSON.stringify([u.classroomId, u.day, String(u.periodId)])));
+
+  anchors.forEach((item, index) => {
+    const label = `${item.__kind} รายการที่ ${index + 1}`;
+    if (item.teacherId && !teacherIds.has(String(item.teacherId))) addProblem(`${label}: ไม่พบครู ${item.teacherId}`);
+    if (!validSubject(item.subjectId)) addProblem(`${label}: ไม่พบรายวิชา ${item.subjectId || '-'} ในภาคเรียนนี้`);
+    if (!classroomIds.has(String(item.classroomId))) addProblem(`${label}: ไม่พบห้อง ${item.classroomId || '-'}`);
+    if (!DAYS.includes(item.day)) addProblem(`${label}: วันไม่ถูกต้อง (${item.day || '-'})`);
+    const period = periodById.get(String(item.periodId));
+    if (!period || period.isBreak) addProblem(`${label}: คาบเรียนไม่ถูกต้องหรือเป็นคาบพัก (${item.periodId || '-'})`);
+    const slotTeacher = JSON.stringify([item.teacherId, item.day, String(item.periodId)]);
+    const slotRoom = JSON.stringify([item.classroomId, item.day, String(item.periodId)]);
+    if (item.teacherId) {
+      if (usedTeachers.has(slotTeacher)) addProblem(`${label}: ครู ${item.teacherId} มีตารางซ้อนในวัน${item.day} คาบ ${item.periodId}`);
+      usedTeachers.add(slotTeacher);
+      if (unavailableTeachers.has(slotTeacher)) addProblem(`${label}: ครู ${item.teacherId} ถูกจัดในเวลาไม่สะดวก`);
+    }
+    if (usedRooms.has(slotRoom)) addProblem(`${label}: ห้อง ${item.classroomId} มีตารางซ้อนในวัน${item.day} คาบ ${item.periodId}`);
+    usedRooms.add(slotRoom);
+    if (unavailableRooms.has(slotRoom)) addProblem(`${label}: ห้อง ${item.classroomId} ถูกจัดในเวลาที่ไม่ว่าง`);
+    if (item.__kind === 'ตารางที่จัดด้วยมือ' && !item.teacherId) addProblem(`${label}: ไม่ระบุครูผู้สอน`);
+    if (item.teacherId) {
+      const key = loadKey(item);
+      if (loadByKey.has(key)) anchorCounts.set(key, (anchorCounts.get(key) || 0) + 1);
+      else if (item.__kind === 'ตารางที่จัดด้วยมือ') addProblem(`${label}: ไม่มีภาระสอนรองรับครู ${item.teacherId} วิชา ${item.subjectId} ห้อง ${item.classroomId}`);
+      // กิจกรรมล็อกสามารถเป็นกิจกรรมทั่วไปที่ไม่อยู่ในภาระสอน จึงไม่บังคับให้มีภาระสอน
+    }
+  });
+  anchorCounts.forEach((count, key) => {
+    const { load } = loadByKey.get(key);
+    if (Number.isFinite(Number(load.periods)) && count > Number(load.periods)) {
+      addProblem(`ครู ${load.teacherId} วิชา ${load.subjectId} ห้อง ${load.classroomId}: คาบที่จัดเอง/ล็อก ${count} คาบ มากกว่าภาระสอน ${load.periods} คาบ`);
+    }
+  });
+  return problems;
 };
 
 const createSeededRandom = (seed) => {
@@ -610,7 +741,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, healt
         <div className={`bg-white p-5 rounded-2xl shadow-sm border flex flex-col justify-between ${health.status === 'error' ? 'border-rose-200 bg-rose-50/30' : 'border-slate-100'}`}>
            <div className={`font-bold mb-2 flex items-center gap-2 ${health.status === 'error' ? 'text-rose-600' : 'text-slate-500'}`}><AlertCircle size={18}/> ข้อขัดแย้ง (Conflicts)</div>
            <div className={`text-3xl font-bold ${health.status === 'error' ? 'text-rose-700' : 'text-[#081a39]'}`}>
-             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.orphans.length}
+             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.blockConflicts.length + health.orphans.length}
            </div>
         </div>
       </div>
@@ -739,7 +870,7 @@ const SubjectsView = ({ activeSubjects, subjects, dbAction, showToast, handleReq
   const saveForm = async () => {
     const periodsPerWeek = Number(form.periodsPerWeek);
     if (!form.id || !form.name) return showToast("กรอกข้อมูลให้ครบ", "error");
-    if (!Number.isFinite(periodsPerWeek) || periodsPerWeek < 1) return showToast("จำนวนคาบ/สัปดาห์ไม่ถูกต้อง", "error");
+    if (!Number.isInteger(periodsPerWeek) || periodsPerWeek < 1) return showToast("จำนวนคาบ/สัปดาห์ต้องเป็นจำนวนเต็มบวก", "error");
     if (!isEditing && subjects.some(s => s.id === form.id)) return showToast("รหัสวิชานี้มีอยู่แล้ว", "error");
     const ok = await dbAction('subjects', form.id, { ...form, periodsPerWeek, periodBlock: Number(form.periodBlock) });
     if (ok) { setIsModalOpen(false); showToast(isEditing ? "บันทึกการแก้ไขสำเร็จ" : "เพิ่มรายวิชาสำเร็จ"); }
@@ -855,7 +986,7 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
   
   const handleSave = async () => {
     const periodsValue = Number(form.periods);
-    if (!form.teacherId || !form.subjectId || !form.classroomId || !Number.isFinite(periodsValue) || periodsValue < 1) return showToast("กรุณากรอกข้อมูลให้ครบ", "error");
+    if (!form.teacherId || !form.subjectId || !form.classroomId || !Number.isInteger(periodsValue) || periodsValue < 1) return showToast("กรุณากรอกข้อมูลให้ครบ และกำหนดจำนวนคาบเป็นจำนวนเต็มบวก", "error");
     const isDuplicate = teachingLoads.some(l => l.teacherId === form.teacherId && l.subjectId === form.subjectId && l.classroomId === form.classroomId && l.id !== form.id );
     if (isDuplicate) return showToast("มีภาระสอนรายการนี้อยู่แล้ว กรุณาแก้ไขจำนวนคาบจากรายการเดิม", "error");
 
@@ -1197,6 +1328,34 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [addForm, setAddForm] = useState({ teacherId: '', subjectId: '', classroomId: '', day: 'จันทร์', periodId: '1' });
 
+  // จำกัดรายวิชาในหน้าต่างเพิ่มตารางสอนด้วยมือ ให้ตรงตามภาระสอนของครู/ห้องที่เลือก
+  const availableManualSubjects = useMemo(() => {
+    if (!addForm.teacherId) return [];
+
+    const relevantLoads = teachingLoads.filter(load =>
+      load.teacherId === addForm.teacherId &&
+      (!addForm.classroomId || load.classroomId === addForm.classroomId)
+    );
+    const loadBySubject = new Map(relevantLoads.map(load => [load.subjectId, load]));
+
+    return activeSubjects.filter(subject => loadBySubject.has(subject.id)).map(subject => {
+      const load = loadBySubject.get(subject.id);
+      // ยังไม่ได้เลือกห้อง: แสดงเฉพาะวิชาที่ครูมีภาระสอน แต่ไม่รวมยอดข้ามห้อง
+      if (!addForm.classroomId) return { ...subject, optionLabel: `${subject.name} (${subject.id})` };
+
+      const isSameLoad = item => item.teacherId === addForm.teacherId &&
+        item.subjectId === subject.id && item.classroomId === addForm.classroomId;
+      const assigned = schedules.filter(isSameLoad).length + fixedSchedules.filter(isSameLoad).length;
+      const required = Number(load.periods) || 0;
+      const remaining = Math.max(0, required - assigned);
+      const isComplete = remaining === 0;
+      return { ...subject, isComplete, optionLabel: isComplete
+        ? `${subject.name} (${subject.id}) — จัดครบแล้ว (${required}/${required} คาบ)`
+        : `${subject.name} (${subject.id}) — เหลือ ${remaining}/${required} คาบ` };
+    });
+  }, [addForm.teacherId, addForm.classroomId, teachingLoads, activeSubjects, schedules, fixedSchedules]);
+  const selectableManualSubjects = availableManualSubjects.filter(subject => !subject.isComplete);
+
   const handleCellClick = (day, periodId) => {
     if (!selectedId) return;
     setAddForm({ teacherId: viewMode === 'teacher' ? selectedId : '', subjectId: '', classroomId: viewMode === 'room' ? selectedId : '', day, periodId });
@@ -1351,9 +1510,9 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
       <Modal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} title="เพิ่มตารางสอน (รายคาบ)">
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">วัน</label><input value={addForm.day} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div><div><label className="block text-sm font-bold mb-1">คาบที่</label><input value={periods.find(p=>p.id===addForm.periodId)?.name} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div></div>
-          <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm({...addForm, teacherId: e.target.value})} disabled={viewMode === 'teacher'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
-          <div><label className="block text-sm font-bold mb-1">รายวิชา</label><select value={addForm.subjectId} onChange={e => setAddForm({...addForm, subjectId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกรายวิชา --</option>{activeSubjects.map(s => <option key={s.id} value={s.id}>{s.name} ({s.id})</option>)}</select></div>
-          <div><label className="block text-sm font-bold mb-1">ห้องเรียน</label><select value={addForm.classroomId} onChange={e => setAddForm({...addForm, classroomId: e.target.value})} disabled={viewMode === 'room'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
+          <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm(prev => ({ ...prev, teacherId: e.target.value, subjectId: '' }))} disabled={viewMode === 'teacher'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
+          <div><label className="block text-sm font-bold mb-1">รายวิชา</label><select value={addForm.subjectId} onChange={e => setAddForm({...addForm, subjectId: e.target.value})} disabled={!addForm.teacherId || selectableManualSubjects.length === 0} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">{!addForm.teacherId ? '-- กรุณาเลือกครูผู้สอนก่อน --' : availableManualSubjects.length === 0 ? '-- ไม่พบรายวิชาในภาระสอน --' : selectableManualSubjects.length === 0 ? '-- รายวิชาของครู/ห้องนี้จัดครบแล้ว --' : '-- เลือกรายวิชา --'}</option>{availableManualSubjects.map(s => <option key={s.id} value={s.id} disabled={!!s.isComplete}>{s.optionLabel}</option>)}</select>{addForm.teacherId && availableManualSubjects.length === 0 && <p role="status" className="text-sm text-amber-700 mt-2">{addForm.classroomId ? 'ไม่พบภาระสอนสำหรับครูและห้องเรียนนี้' : 'ไม่พบภาระสอนสำหรับครูคนนี้'} กรุณาตรวจสอบเมนูภาระสอน</p>}{addForm.teacherId && addForm.classroomId && availableManualSubjects.length > 0 && selectableManualSubjects.length === 0 && <p role="status" className="text-sm text-emerald-700 mt-2">รายวิชาในภาระสอนของครูและห้องนี้จัดครบทุกคาบแล้ว</p>}</div>
+          <div><label className="block text-sm font-bold mb-1">ห้องเรียน</label><select value={addForm.classroomId} onChange={e => setAddForm(prev => ({ ...prev, classroomId: e.target.value, subjectId: '' }))} disabled={viewMode === 'room'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
           <button onClick={handleManualAdd} className="w-full mt-2 bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึกคาบเรียน</button>
         </div>
       </Modal>
@@ -1423,6 +1582,7 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
               {health.unavailConflicts.map((c,i) => <li key={`uc-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.cUnavailConflicts.map((c,i) => <li key={`cuc-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.breakConflicts.map((c,i) => <li key={`bc-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
+              {health.blockConflicts.map((c,i) => <li key={`block-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.orphans.map((c,i) => <li key={`oc-${i}`} className="p-2 bg-slate-100 rounded border border-slate-300">ข้อมูลสูญหาย: {c}</li>)}
               {health.status !== 'error' && <li className="text-emerald-600 font-bold p-2 bg-emerald-50 rounded border border-emerald-100">ตรวจสอบผ่าน: ไม่พบข้อผิดพลาดร้ายแรง</li>}
             </ul>
@@ -1594,11 +1754,12 @@ export default function App() {
   
   const [isScheduling, setIsScheduling] = useState(false);
   const [scheduleResult, setScheduleResult] = useState(null);
+  const [autoScheduleIssues, setAutoScheduleIssues] = useState([]);
 
   const getTermKey = (settings) => `${settings?.academicYear || '2569'}-${settings?.semester || '1'}`;
 
   const health = useMemo(() => {
-    if (!periods || periods.length === 0) return { status: 'ready', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], teacherStats: {} };
+    if (!periods || periods.length === 0) return { status: 'ready', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherStats: {} };
     return calculateScheduleHealth(schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods);
   }, [schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods]);
 
@@ -1620,7 +1781,7 @@ export default function App() {
     
     unsubscribers.push(onSnapshot(collection(db, `${basePath}/periods`), snap => {
        const data = snap.docs.map(doc => ({ ...doc.data(), id: doc.id })).sort((a, b) => Number(a.id) - Number(b.id));
-       if(data.length > 0) setPeriods(data); else { DEFAULT_PERIODS.forEach(p => setDoc(doc(db, `${basePath}/periods`, p.id), p)); setPeriods(DEFAULT_PERIODS); }
+       if(data.length > 0) setPeriods(data); else setPeriods(DEFAULT_PERIODS); // ไม่เขียนข้อมูลอัตโนมัติจากทุก client
     }));
     unsubscribers.push(onSnapshot(doc(db, `${basePath}/config/settings`), snap => { if (snap.exists()) setSchoolSettings(snap.data()); setIsInitialLoading(false); }));
 
@@ -1755,23 +1916,45 @@ export default function App() {
         };
         return { type: 'set', ref: doc(db, `${termPath}/teachingLoads`, id), data: cleanItem };
       });
-      await commitOperationsInChunks(operations);
+      // STEP 03: one atomic batch, not several partially committed chunks.
+      await commitAtomicOperations(operations);
       return true;
     } catch (error) {
       console.error(error);
-      showToast("นำเข้าภาระสอนไม่สำเร็จ", "error");
+      showToast(error.code === 'ATOMIC_LIMIT' ? error.message : "นำเข้าภาระสอนไม่สำเร็จ (ไม่มีการนำเข้าเป็นบางส่วน)", "error");
       return false;
     }
   };
 
-  const replaceCollectionData = async (collectionPath, items) => {
-    const safeItems = Array.isArray(items) ? items : [];
-    const currentSnapshot = await getDocs(collection(db, collectionPath));
-    const currentById = new Map(currentSnapshot.docs.map(d => [d.id, { ...d.data(), id: d.id }]));
-    const targetIds = new Set();
-    const setOps = [];
+  // STEP 03: Firestore writeBatch is atomic only within one batch.
+  // Never fall back to sequential chunks for a destructive collection replacement.
+  const ATOMIC_OPERATION_LIMIT = 400;
+  const commitAtomicOperations = async (operations) => {
+    if (operations.length > ATOMIC_OPERATION_LIMIT) {
+      const error = new Error(`มีข้อมูลต้องเปลี่ยน ${operations.length} รายการ (เกินขีดจำกัด ${ATOMIC_OPERATION_LIMIT}) ระบบยังไม่แก้ข้อมูลใด ๆ กรุณาใช้ขั้นตอนบันทึกข้อมูลจำนวนมากที่รองรับความปลอดภัยก่อน`);
+      error.code = 'ATOMIC_LIMIT';
+      throw error;
+    }
+    if (operations.length === 0) return;
+    const batch = writeBatch(db);
+    operations.forEach(op => {
+      if (op.type === 'delete') batch.delete(op.ref);
+      else batch.set(op.ref, op.data);
+    });
+    await batch.commit();
+  };
 
-    safeItems.forEach(item => {
+  // Read SERVER data and assemble the entire replacement without writing anything.
+  const prepareCollectionReplacement = async (collectionPath, items) => {
+    if (!Array.isArray(items)) throw new Error('INVALID_REPLACEMENT_ITEMS');
+    const currentSnapshot = await getDocsFromServer(collection(db, collectionPath));
+    const previousItems = currentSnapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+    const currentById = new Map(previousItems.map(d => [d.id, d]));
+    const targetIds = new Set();
+    const operations = [];
+
+    items.forEach(item => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('INVALID_REPLACEMENT_ITEM');
       const cleanItem = { ...item };
       delete cleanItem._col;
       const itemId = String(cleanItem.id || '').trim();
@@ -1779,21 +1962,22 @@ export default function App() {
       if (targetIds.has(itemId)) throw new Error(`Duplicate document id ${itemId} in ${collectionPath}`);
       targetIds.add(itemId);
       cleanItem.id = itemId;
-
-      // Preserve document ที่เหมือนเดิม ไม่ต้องเขียน Firestore ซ้ำ
       const currentItem = currentById.get(itemId);
       if (!currentItem || !areFirestoreRecordsEqual(currentItem, cleanItem)) {
-        setOps.push({ type: 'set', ref: doc(db, collectionPath, itemId), data: cleanItem });
+        operations.push({ type: 'set', ref: doc(db, collectionPath, itemId), data: cleanItem });
       }
     });
-
-    // เขียนข้อมูลใหม่/เปลี่ยนจริงก่อน แล้วค่อยลบรายการเก่าที่ไม่มีใน snapshot
-    // ช่วยลด writes และลดความเสี่ยงข้อมูลหายหากการเชื่อมต่อสะดุดระหว่าง restore/commit
-    await commitOperationsInChunks(setOps);
-    const deleteOps = currentSnapshot.docs.filter(d => !targetIds.has(d.id)).map(d => ({ type: 'delete', ref: d.ref }));
-    await commitOperationsInChunks(deleteOps);
+    // Deletions are planned before any write, in the SAME atomic batch as sets.
+    currentSnapshot.docs.filter(d => !targetIds.has(d.id)).forEach(d => {
+      operations.push({ type: 'delete', ref: d.ref });
+    });
+    return { operations, previousItems };
   };
 
+  const replaceCollectionData = async (collectionPath, items) => {
+    const plan = await prepareCollectionReplacement(collectionPath, items);
+    await commitAtomicOperations(plan.operations);
+  };
 
   const readCollectionData = async (collectionPath) => {
     const snapshot = await getDocs(collection(db, collectionPath));
@@ -1841,55 +2025,95 @@ export default function App() {
 
   const handleRestoreBackup = (jsonData) => {
     const backupTermKey = jsonData?.termKey || (jsonData?.schoolSettings ? getTermKey(jsonData.schoolSettings) : '');
-    if (!jsonData || jsonData.backupVersion !== 2 || !backupTermKey) return showToast("ไฟล์สำรองข้อมูลไม่รองรับหรือข้อมูลไม่ครบ", "error");
+    const backupCollections = ['teachers', 'subjects', 'classrooms', 'periods', 'teachingLoads', 'unavailabilities', 'classroomUnavailabilities', 'fixedSchedules', 'schedules'];
+    if (!jsonData || jsonData.backupVersion !== 2 || jsonData.appId !== appId || !/^\d{4}-[12]$/.test(backupTermKey) || !backupCollections.every(key => Array.isArray(jsonData[key]))) {
+      return showToast("ไฟล์สำรองข้อมูลไม่ครบ หรือไม่ตรงระบบและภาคเรียนที่รองรับ", "error");
+    }
 
     setConfirmData({
       type: 'restore', title: 'นำเข้าข้อมูล', message: `เขียนทับตารางเดิมสำหรับเทอม ${backupTermKey} ใช่หรือไม่?`, confirmText: 'นำเข้า',
       action: async () => {
-         setConfirmData(prev => ({ ...prev, isLoading: true }));
-         try {
-           const masterCollections = [
-             ['teachers', jsonData.teachers],
-             ['subjects', jsonData.subjects],
-             ['classrooms', jsonData.classrooms],
-             ['periods', jsonData.periods],
-           ];
-           for (const [colName, items] of masterCollections) {
-             if (Array.isArray(items)) await replaceCollectionData(`school_data/${appId}/${colName}`, items);
-           }
-
-           const targetTermPath = `school_data/${appId}/terms/${backupTermKey}`;
-           try {
-             const previousSchedules = await readCollectionData(`${targetTermPath}/schedules`);
-             const previousFixedSchedules = await readCollectionData(`${targetTermPath}/fixedSchedules`);
-             await saveScheduleVersion('before_backup_restore', previousSchedules, previousFixedSchedules, backupTermKey);
-           } catch (versionError) {
-             console.error('Create restore snapshot failed', versionError);
-           }
-
-           const termCollections = [
-             ['teachingLoads', jsonData.teachingLoads],
-             ['unavailabilities', jsonData.unavailabilities],
-             ['classroomUnavailabilities', jsonData.classroomUnavailabilities],
-             ['fixedSchedules', jsonData.fixedSchedules],
-             ['schedules', jsonData.schedules],
-           ];
-           for (const [colName, items] of termCollections) {
-             if (Array.isArray(items)) await replaceCollectionData(`school_data/${appId}/terms/${backupTermKey}/${colName}`, items);
-           }
-
-           if (jsonData.schoolSettings) await setDoc(doc(db, `school_data/${appId}/config/settings`), jsonData.schoolSettings);
-           showToast("นำเข้าข้อมูลสำเร็จ!"); setConfirmData(null);
-         } catch (error) { console.error(error); showToast("เกิดข้อผิดพลาดในการนำเข้า", "error"); setConfirmData(null); }
+        setConfirmData(prev => ({ ...prev, isLoading: true }));
+        try {
+          const basePath = `school_data/${appId}`;
+          const targetTermPath = `${basePath}/terms/${backupTermKey}`;
+          const masterNames = ['teachers', 'subjects', 'classrooms', 'periods'];
+          // STEP 03: Plan ALL nine collections first; one batch commits everything or nothing.
+          const plans = {};
+          const allOperations = [];
+          for (const colName of backupCollections) {
+            const collectionPath = masterNames.includes(colName) ? `${basePath}/${colName}` : `${targetTermPath}/${colName}`;
+            const plan = await prepareCollectionReplacement(collectionPath, jsonData[colName]);
+            plans[colName] = plan;
+            allOperations.push(...plan.operations);
+          }
+          if (jsonData.schoolSettings) {
+            allOperations.push({ type: 'set', ref: doc(db, `${basePath}/config/settings`), data: jsonData.schoolSettings });
+          }
+          // Preflight size BEFORE writing either backup or target data.
+          if (allOperations.length > ATOMIC_OPERATION_LIMIT) {
+            const error = new Error(`ไฟล์สำรองต้องเขียน ${allOperations.length} รายการ เกินขีดจำกัด ${ATOMIC_OPERATION_LIMIT} จึงยกเลิกเพื่อป้องกันข้อมูลค้างครึ่งชุด`);
+            error.code = 'ATOMIC_LIMIT';
+            throw error;
+          }
+          // Only the schedule and fixed schedule are stored in legacy version history.
+          const restoreVersionId = await saveScheduleVersion('before_backup_restore', plans.schedules.previousItems, plans.fixedSchedules.previousItems, backupTermKey);
+          if (!restoreVersionId) throw new Error('RESTORE_SNAPSHOT_FAILED');
+          await commitAtomicOperations(allOperations);
+          showToast("นำเข้าข้อมูลสำเร็จ!"); setConfirmData(null);
+        } catch (error) {
+          console.error(error);
+          showToast(error.code === 'ATOMIC_LIMIT' ? error.message : "นำเข้าข้อมูลไม่สำเร็จ ระบบไม่ได้บันทึกข้อมูลเป็นบางส่วน", "error");
+          setConfirmData(null);
+        }
       }
     });
   };
 
+  // STEP 02: Snapshot the inputs used to produce the auto-scheduler preview.
+  // Keep this local to the preview/commit flow; no changes to regular CRUD or scheduler algorithm.
+  const schedulePreviewCollectionNames = [
+    'schedules', 'fixedSchedules', 'teachingLoads', 'unavailabilities',
+    'classroomUnavailabilities', 'teachers', 'subjects', 'classrooms', 'periods',
+  ];
+  const captureSchedulePreviewSource = (data, termKey) => {
+    const fingerprints = {};
+    schedulePreviewCollectionNames.forEach(name => {
+      // Ignore Firestore result ordering; compare records deterministically by document ID.
+      const records = (Array.isArray(data[name]) ? data[name] : [])
+        .map(cleanScheduleSnapshotItem)
+        .sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+      fingerprints[name] = stableSerializeData(records);
+    });
+    return { termKey, fingerprints };
+  };
+  const currentSchedulePreviewSource = () => captureSchedulePreviewSource({
+    schedules, fixedSchedules, teachingLoads, unavailabilities,
+    classroomUnavailabilities, teachers, subjects, classrooms, periods,
+  }, getTermKey(schoolSettings));
+
   const runSmartSchedule = async () => {
-    if (teachingLoads.length === 0) return showToast("ไม่มีภาระสอน", 'error');
     if (isScheduling) return;
-    const lockRef = doc(db, `school_data/${appId}/terms/${getTermKey(schoolSettings)}/config/schedulerLock`);
-    try { const lockSnap = await getDoc(lockRef); if (lockSnap.exists() && lockSnap.data().locked && (Date.now() - lockSnap.data().timestamp < 300000)) return showToast("มีผู้อื่นจัดตารางอยู่", "error"); await setDoc(lockRef, { locked: true, timestamp: Date.now() }); } catch (e) { return showToast("ตรวจ Lock ไม่ได้", "error"); }
+    // STEP 04: แจ้งรายการที่ต้องแก้ก่อนขอล็อกหรือเริ่มสร้างตาราง
+    const issues = validateAutoScheduleInputs({
+      teachingLoads, teachers, subjects, classrooms, periods, schedules, fixedSchedules,
+      unavailabilities, classroomUnavailabilities, semester: schoolSettings.semester,
+    });
+    if (issues.length) { setAutoScheduleIssues(issues); return; }
+    setAutoScheduleIssues([]);
+    // A frozen copy of the data as it was when scheduling began.
+    const previewSource = currentSchedulePreviewSource();
+    const lockCollection = `school_data/${appId}/terms/${getTermKey(schoolSettings)}/config`;
+    const lockRef = doc(db, `${lockCollection}/schedulerLock`);
+    // A randomly generated document ID acts as a unique owner token; no extra document is written.
+    const lockOwnerId = doc(collection(db, lockCollection)).id;
+    try {
+      const acquired = await acquireSchedulerLock(lockRef, lockOwnerId);
+      if (!acquired) return showToast("มีผู้อื่นจัดตารางอยู่", "error");
+    } catch (error) {
+      console.error('Acquire scheduler lock failed', error);
+      return showToast("ตรวจล็อกการจัดตารางไม่ได้ (อาจออฟไลน์หรือไม่มีสิทธิ์)", "error");
+    }
     setIsScheduling(true);
 
     setTimeout(async () => {
@@ -1975,6 +2199,7 @@ export default function App() {
         const runSeed = (Date.now() ^ (teachingLoads.length * 2654435761) ^ fixedSchedules.length ^ preservedSchedules.length) >>> 0;
         const candidatePool = [];
         const candidateSignatures = new Set();
+        let lastLockRenewal = Date.now();
 
         for (let c = 0; c < SCHEDULER_CONFIG.candidateCount; c++) {
           const random = createSeededRandom((runSeed + Math.imul(c + 1, 2246822519)) >>> 0);
@@ -2087,10 +2312,17 @@ export default function App() {
 
           // คืนเวลาให้ browser เป็นช่วง ๆ เพื่อให้ spinner/การโต้ตอบไม่ค้างระหว่างคำนวณหลาย candidate
           if ((c + 1) % SCHEDULER_CONFIG.yieldEveryCandidates === 0 && c + 1 < SCHEDULER_CONFIG.candidateCount) {
+            // Renew only if needed, to avoid adding a network round trip on every candidate.
+            if (Date.now() - lastLockRenewal >= SCHEDULER_LOCK_RENEW_MS) {
+              if (!(await renewSchedulerLock(lockRef, lockOwnerId))) throw new Error('SCHEDULER_LOCK_LOST');
+              lastLockRenewal = Date.now();
+            }
             await new Promise(resolve => setTimeout(resolve, 0));
           }
         }
 
+        // Do not publish a result if this run has lost ownership of the lock.
+        if (!(await renewSchedulerLock(lockRef, lockOwnerId))) throw new Error('SCHEDULER_LOCK_LOST');
         candidatePool.sort((a, b) => {
           if (a.missingCount !== b.missingCount) return a.missingCount - b.missingCount;
           if (a.score !== b.score) return b.score - a.score;
@@ -2104,6 +2336,7 @@ export default function App() {
         setScheduleResult({
           ...bestCandidate,
           candidates,
+          previewSource,
           stats: {
             totalReq,
             scheduled: Math.max(0, totalReq - missing),
@@ -2112,8 +2345,19 @@ export default function App() {
             generated: bestCandidate.generatedSchedule.length,
           },
         });
-      } catch (err) { console.error(err); showToast("เกิดข้อผิดพลาดในการประมวลผล", "error"); }
-      finally { setIsScheduling(false); setDoc(lockRef, { locked: false, timestamp: Date.now() }).catch(()=>{}); }
+      } catch (err) {
+        console.error(err);
+        showToast(err.message === 'SCHEDULER_LOCK_LOST'
+          ? "สิทธิ์ล็อกการจัดตารางสิ้นสุดหรือถูกเปลี่ยน ระบบยกเลิกผลรอบนี้ กรุณาจัดใหม่"
+          : "เกิดข้อผิดพลาดในการประมวลผล", "error");
+      } finally {
+        try { await releaseSchedulerLock(lockRef, lockOwnerId); }
+        catch (error) {
+          console.error('Release scheduler lock failed', error);
+          showToast("ปลดล็อกการจัดตารางไม่สำเร็จ กรุณาตรวจการเชื่อมต่อและลองใหม่ภายหลัง", "error");
+        }
+        setIsScheduling(false);
+      }
     }, 100);
   };
 
@@ -2123,23 +2367,57 @@ export default function App() {
       type: 'restore', title: 'ยืนยันการใช้ตารางใหม่', message: 'ตารางเดิมในเทอมนี้จะถูกแทนที่ ยืนยันหรือไม่?', confirmText: 'บันทึกตาราง',
       action: async () => {
         setConfirmData(prev => ({...prev, isLoading: true}));
-        const termPath = `school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
-        const previousSchedules = schedules.map(cleanScheduleSnapshotItem);
+        const termKey = getTermKey(schoolSettings);
+        const termPath = `school_data/${appId}/terms/${termKey}`;
+        let previousSchedules = [];
         try {
-          await saveScheduleVersion('before_auto_commit', previousSchedules, fixedSchedules);
+          const expected = scheduleResult.previewSource;
+          if (!expected || expected.termKey !== termKey) {
+            throw Object.assign(new Error('ภาคเรียนเปลี่ยนไปหลังจัดตาราง กรุณาจัดใหม่'), { code: 'STALE_PREVIEW' });
+          }
+
+          // First reject changes already received via live Firestore listeners.
+          const localNow = currentSchedulePreviewSource();
+          if (schedulePreviewCollectionNames.some(name => localNow.fingerprints[name] !== expected.fingerprints[name])) {
+            throw Object.assign(new Error('มีข้อมูลเปลี่ยนไประหว่างเปิดตัวอย่าง กรุณาจัดตารางใหม่'), { code: 'STALE_PREVIEW' });
+          }
+
+          // Then verify against the SERVER, not the browser cache. If offline, refuse to overwrite.
+          const basePath = `school_data/${appId}`;
+          const remoteSettings = await getDocFromServer(doc(db, `${basePath}/config/settings`));
+          if (remoteSettings.exists() && getTermKey(remoteSettings.data()) !== termKey) {
+            throw Object.assign(new Error('ภาคเรียนในฐานข้อมูลเปลี่ยนไป กรุณาโหลดใหม่'), { code: 'STALE_PREVIEW' });
+          }
+          const serverData = {};
+          await Promise.all(schedulePreviewCollectionNames.map(async name => {
+            const isTermData = ['schedules', 'fixedSchedules', 'teachingLoads', 'unavailabilities', 'classroomUnavailabilities'].includes(name);
+            const path = isTermData ? `${termPath}/${name}` : `${basePath}/${name}`;
+            const snap = await getDocsFromServer(collection(db, path));
+            const records = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+            // The app displays default periods when there are no period documents yet.
+            serverData[name] = name === 'periods' && records.length === 0 ? DEFAULT_PERIODS : records;
+          }));
+          const serverNow = captureSchedulePreviewSource(serverData, termKey);
+          if (schedulePreviewCollectionNames.some(name => serverNow.fingerprints[name] !== expected.fingerprints[name])) {
+            throw Object.assign(new Error('ข้อมูลจากอีกเครื่องเปลี่ยนไปหลังสร้างตัวอย่าง กรุณาจัดตารางใหม่'), { code: 'STALE_PREVIEW' });
+          }
+
+          // Use a fresh server copy for the recovery snapshot, not potentially stale React state.
+          previousSchedules = serverData.schedules.map(cleanScheduleSnapshotItem);
+          const versionId = await saveScheduleVersion('before_auto_commit', previousSchedules, serverData.fixedSchedules);
+          if (!versionId) throw new Error('บันทึกจุดย้อนกลับไม่สำเร็จ จึงยังไม่เปลี่ยนตาราง');
           await replaceCollectionData(`${termPath}/schedules`, scheduleResult.schedule.map(cleanScheduleSnapshotItem));
           showToast("ใช้งานตารางสอนใหม่สำเร็จ!"); setScheduleResult(null); setConfirmData(null);
         } catch (e) {
           console.error(e);
-          let rollbackOk = false;
-          try {
-            await replaceCollectionData(`${termPath}/schedules`, previousSchedules);
-            rollbackOk = true;
-          } catch (rollbackError) {
-            console.error('Rollback schedule failed', rollbackError);
-          }
-          showToast(rollbackOk ? "บันทึกไม่สำเร็จ ระบบคืนตารางเดิมแล้ว" : "เกิดข้อผิดพลาดในการบันทึกและคืนตารางเดิมไม่สำเร็จ", "error");
-          setConfirmData(prev => ({...prev, isLoading: false}));
+          // STEP 03: Failed writeBatch is atomic; do not run a second replacement
+          // as "rollback" (it could overwrite another user's concurrent changes).
+          if (e.code === 'STALE_PREVIEW') setScheduleResult(null);
+          const message = e.code === 'ATOMIC_LIMIT' ? e.message
+            : e.code === 'STALE_PREVIEW' ? e.message
+            : 'บันทึกไม่สำเร็จ ไม่ได้เขียนตารางเป็นบางส่วน: ' + e.message;
+          showToast(message, 'error');
+          setConfirmData(null);
         }
       }
     });
@@ -2230,6 +2508,17 @@ export default function App() {
           {activeTab === 'print' && <PrintView {...commonProps} />}
         </div>
       </main>
+
+      <Modal isOpen={autoScheduleIssues.length > 0} onClose={() => setAutoScheduleIssues([])} title="ตรวจข้อมูลก่อนจัดตารางอัตโนมัติ">
+        <div className="space-y-4">
+          <p className="text-sm text-slate-700">พบข้อมูลที่ต้องแก้ก่อนเริ่มจัดตาราง กรุณาตรวจสอบรายการด้านล่างแล้วลองกดจัดตารางอีกครั้ง ระบบยังไม่ได้เปลี่ยนตารางเดิม</p>
+          <ul className="list-disc pl-5 space-y-2 text-sm text-rose-700" role="alert">
+            {autoScheduleIssues.map((issue, index) => <li key={index}>{issue}</li>)}
+          </ul>
+          {autoScheduleIssues.length === 30 && <p className="text-xs text-amber-700">ระบบแสดงสูงสุด 30 รายการ กรุณาแก้ไขแล้วตรวจอีกครั้ง</p>}
+          <button onClick={() => setAutoScheduleIssues([])} className="w-full py-3 rounded-xl bg-[#081a39] text-white font-bold">รับทราบ</button>
+        </div>
+      </Modal>
 
       <Modal isOpen={!!scheduleResult} onClose={() => setScheduleResult(null)} title="ผลการจัดตารางอัตโนมัติ (AI Preview)">
         {scheduleResult && (
