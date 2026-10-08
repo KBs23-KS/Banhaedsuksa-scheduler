@@ -73,6 +73,15 @@ const DEFAULT_PERIODS = [
 const DAYS = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์'];
 // STEP 10: กิจกรรมล็อกทุกห้องเก็บเป็นเอกสารเดียว (ครูผู้ดูแลไม่นับซ้ำหลายห้อง)
 const ALL_CLASSROOMS_ID = '__ALL_CLASSROOMS__';
+const activityTeacherEntries = (activityGroups, fixedSchedules) => {
+  const byId=new Map((fixedSchedules||[]).map(item=>[item.id,item]));
+  return (activityGroups||[]).filter(item=>item.teacherId && byId.has(item.fixedId)).map(item=>{
+    const fixed=byId.get(item.fixedId);
+    return { id:`activity_${item.id}`, teacherId:item.teacherId, day:fixed.day,
+      periodId:fixed.periodId, subjectId:fixed.subjectId, classroomId:item.classroomId,
+      __activityTeacherOnly:true };
+  });
+};
 const fixedAppliesToClassroom = (fixedItem, classroomId) =>
   fixedItem.classroomId === classroomId || fixedItem.classroomId === ALL_CLASSROOMS_ID;
 const SUBJECT_AREAS = [
@@ -86,6 +95,69 @@ const SUBJECT_COLORS = {
   "สุขศึกษาและพลศึกษา": "text-orange-500", "ศิลปะ": "text-purple-600", "การงานอาชีพ": "text-cyan-600",
   "ภาษาต่างประเทศ": "text-indigo-600"
 };
+
+// STAGE 2: ขีดจำกัดวิชาเดียวกันต่อหนึ่งวัน แยกแต่ละห้องเรียน
+const subjectDailyKey = (classroomId, subjectId, day) => JSON.stringify([classroomId, subjectId, day]);
+const registerSubjectDayPeriod = (maps, item) => {
+  if (!item.subjectId || !item.classroomId) return;
+  const key = subjectDailyKey(item.classroomId, item.subjectId, item.day);
+  maps.subjectDayCounts.set(key, (maps.subjectDayCounts.get(key) || 0) + 1);
+};
+const canPlaceSubjectDailyEntries = (load, entries, maps) => {
+  if (!load.subjectId || !load.classroomId) return { ok: true, reason: '' };
+  const limits = (maps.customRules || []).filter(rule => rule.mode === 'dailyLimit' && rule.targetType === 'subject' && rule.targetId === load.subjectId);
+  if (!limits.length) return { ok: true, reason: '' };
+  const maxPerDay = Math.min(...limits.map(rule => Number(rule.maxPerDay)));
+  const perDay = new Map();
+  entries.forEach(entry => perDay.set(entry.day, (perDay.get(entry.day) || 0) + 1));
+  for (const [day, proposed] of perDay) {
+    const regular = maps.subjectDayCounts.get(subjectDailyKey(load.classroomId, load.subjectId, day)) || 0;
+    // กิจกรรมล็อกทุกห้องต้องนับเป็นหนึ่งคาบในทุกห้อง
+    const common = load.classroomId === ALL_CLASSROOMS_ID ? 0 :
+      (maps.subjectDayCounts.get(subjectDailyKey(ALL_CLASSROOMS_ID, load.subjectId, day)) || 0);
+    if (regular + common + proposed > maxPerDay) return { ok: false, reason: 'SUBJECT_DAILY_LIMIT' };
+  }
+  return { ok: true, reason: '' };
+};
+const findSubjectDailyLimitConflicts = (items, classrooms, customRules) => {
+  const rules = (customRules || []).filter(r => r.mode === 'dailyLimit');
+  if (!rules.length) return [];
+  const maps = { subjectDayCounts: new Map(), customRules: rules };
+  items.forEach(item => registerSubjectDayPeriod(maps, item));
+  const ids = [...new Set([...classrooms.map(r => r.id), ALL_CLASSROOMS_ID])];
+  const result = [];
+  rules.forEach(rule => {
+    const seenDays = new Set(items.filter(x => x.subjectId === rule.targetId).map(x => x.day));
+    seenDays.forEach(day => {
+      ids.filter(roomId => roomId !== ALL_CLASSROOMS_ID).forEach(classroomId => {
+        const regular = maps.subjectDayCounts.get(subjectDailyKey(classroomId, rule.targetId, day)) || 0;
+        const common = maps.subjectDayCounts.get(subjectDailyKey(ALL_CLASSROOMS_ID, rule.targetId, day)) || 0;
+        if (regular + common > Number(rule.maxPerDay)) result.push(`วิชา ${rule.targetId} ห้อง ${classroomId} วัน${day}: ${regular + common} คาบ เกินกำหนด ${rule.maxPerDay} คาบ/วัน`);
+      });
+    });
+  });
+  return [...new Set(result)];
+};
+
+// STAGE 1: กฎรายคาบที่ผู้ดูแลตั้งเอง (แยกตามภาคเรียน)
+// block = ข้อบังคับ, prefer = ข้อแนะนำในการเลือกรอบจัดตาราง
+const isValidCustomRule = (rule, teachers, subjects, classrooms, periods) => {
+  const source = rule?.targetType === 'teacher' ? teachers : rule?.targetType === 'subject' ? subjects : rule?.targetType === 'classroom' ? classrooms : null;
+  if (!source || !source.some(item => String(item.id) === String(rule.targetId))) return false;
+  if (rule.mode === 'dailyLimit') return rule.targetType === 'subject' &&
+    Number.isInteger(Number(rule.maxPerDay)) && Number(rule.maxPerDay) >= 1 &&
+    Number(rule.maxPerDay) <= periods.filter(p => !p.isBreak).length;
+  return ['block', 'prefer'].includes(rule.mode) && DAYS.includes(rule.day) &&
+    periods.some(p => !p.isBreak && String(p.id) === String(rule.periodId));
+};
+const customRuleMatches = (rule, item) => !!(rule && item && rule.day === item.day &&
+  String(rule.periodId) === String(item.periodId) &&
+  (rule.targetType === 'teacher' ? !!item.teacherId && rule.targetId === item.teacherId :
+   rule.targetType === 'subject' ? !!item.subjectId && rule.targetId === item.subjectId :
+   rule.targetType === 'classroom' ? (rule.targetId === item.classroomId || item.classroomId === ALL_CLASSROOMS_ID) : false));
+const blocksCustomRule = (rules, item) => (rules || []).some(r => r.mode === 'block' && customRuleMatches(r, item));
+const customRulePreferenceScore = (rules, item) => (rules || []).reduce((score, r) =>
+  score + (r.mode === 'prefer' && customRuleMatches(r, item) ? 18 : 0), 0);
 
 const SCHEDULER_CONFIG = { candidateCount: 50, maxConsecutiveTeacherPeriods: 3, maxTeacherPeriodsPerDay: 5, candidateChoicePool: 4, placementJitter: 2.5, yieldEveryCandidates: 5 };
 const SCHEDULE_VERSION_LIMIT = 10;
@@ -109,10 +181,36 @@ const getPeriodDisplayName = (periods, periodId) => {
   return period?.name || `คาบ ${periodId ?? '-'}`;
 };
 
+// STAGE 7: locked automatic rows remain anchors for future regeneration.
 const isAutoGeneratedSchedule = (scheduleItem) => {
+  if (scheduleItem?.keepOnRegenerate === true || scheduleItem?.source === 'manual') return false;
   if (!scheduleItem) return false;
   if (scheduleItem.source === 'auto') return true;
   return /^sch_auto_/.test(String(scheduleItem.id || ''));
+};
+
+// STAGE 8: pure drag planner; never mutates input schedules or writes data.
+const buildScheduleDragPlan = ({schedules, sourceId, targetDay, targetPeriodId, periods, subject}) => {
+  const source=schedules.find(x=>x.id===sourceId);
+  if(!source) throw new Error('MISSING_SOURCE');
+  if(source.keepOnRegenerate) throw new Error('LOCKED_SOURCE');
+  if(!DAYS.includes(targetDay)) throw new Error('INVALID_DAY');
+  const targetIndex=periods.findIndex(p=>p.id===targetPeriodId&&!p.isBreak);
+  if(targetIndex<0) throw new Error('INVALID_PERIOD');
+  const currentIndex=periods.findIndex(p=>p.id===source.periodId);
+  if(currentIndex<0) throw new Error('INVALID_SOURCE_PERIOD');
+  const sameLoad=schedules.filter(x=>x.teacherId===source.teacherId&&x.subjectId===source.subjectId&&x.classroomId===source.classroomId);
+  const partner=Number(subject?.periodBlock)===2 ? findBlockPartner(source,sameLoad,periods) : null;
+  const moved=partner?[source,partner]:[source];
+  if(moved.some(item=>item.keepOnRegenerate)) throw new Error('LOCKED_PARTNER');
+  const planned=moved.map(item=>{
+    const index=targetIndex+(periods.findIndex(p=>p.id===item.periodId)-currentIndex);
+    const slot=periods[index];
+    if(!slot || slot.isBreak) throw new Error('INVALID_BLOCK_PAIR');
+    return {...item,day:targetDay,periodId:slot.id,source:'manual'};
+  });
+  const remaining=schedules.filter(x=>!moved.some(item=>item.id===x.id));
+  return {source,moved,planned,remaining};
 };
 
 const getTeachingLoadKey = (item) => `${item?.teacherId || ''}_${item?.subjectId || ''}_${item?.classroomId || ''}`;
@@ -132,6 +230,46 @@ const stableSerializeData = (value) => {
 };
 
 const areFirestoreRecordsEqual = (a, b) => stableSerializeData(a) === stableSerializeData(b);
+
+// STAGE 5A: เทียบประวัติตารางแบบอ่านอย่างเดียว
+// "เพิ่มในปัจจุบัน" หมายถึงมีในตารางปัจจุบัน แต่ไม่มีในประวัติ
+// STAGE 5B: deterministic integrity fingerprint for snapshot rows. This is a corruption
+// detector (not a cryptographic signature or security authorization).
+const fingerprintScheduleRows = rows => {
+  const serialized = stableSerializeData((rows || []).map(cleanScheduleSnapshotItem)
+    .sort((a,b) => String(a.id).localeCompare(String(b.id))));
+  let hash = 2166136261;
+  for (let i=0;i<serialized.length;i++) hash = Math.imul(hash ^ serialized.charCodeAt(i), 16777619);
+  return `${serialized.length}:${(hash >>> 0).toString(16)}`;
+};
+const makeScheduleSnapshotChunks = (schedules, fixedSchedules) => {
+  const chunks = []; let current = { schedules: [], fixedSchedules: [] }; let byteSize=0;
+  const flush = () => { if (current.schedules.length || current.fixedSchedules.length) {
+    chunks.push(current); current = { schedules: [], fixedSchedules: [] }; byteSize=0;
+  }};
+  for (const [kind, items] of [['schedules', schedules], ['fixedSchedules', fixedSchedules]]) {
+    for (const item of items) {
+      const bytes = new TextEncoder().encode(JSON.stringify(item)).length + 150;
+      if (bytes > 180000) throw new Error('SNAPSHOT_ROW_TOO_LARGE');
+      if (byteSize + bytes > 180000 || current.schedules.length + current.fixedSchedules.length >= 150) flush();
+      current[kind].push(item);byteSize+=bytes;
+    }
+  }
+  flush(); return chunks;
+};
+
+const compareScheduleSnapshotRows = (currentItems, oldItems) => {
+  const current = new Map(currentItems.map(item => [String(item.id), cleanScheduleSnapshotItem(item)]));
+  const old = new Map(oldItems.map(item => [String(item.id), cleanScheduleSnapshotItem(item)]));
+  const result = { added: [], deleted: [], changed: [], identical: 0 };
+  current.forEach((item, id) => {
+    if (!old.has(id)) result.added.push(item);
+    else if (!areFirestoreRecordsEqual(item, old.get(id))) result.changed.push({ before: old.get(id), after: item });
+    else result.identical++;
+  });
+  old.forEach((item, id) => { if (!current.has(id)) result.deleted.push(item); });
+  return result;
+};
 
 const useSortableData = (items, config = null) => {
   const [sortConfig, setSortConfig] = useState(config || { key: null, direction: 'asc' });
@@ -165,10 +303,10 @@ const SortIcon = ({ column, sortConfig }) => {
   return sortConfig.direction === 'asc' ? <ChevronUp size={14} /> : <ChevronDown size={14} />;
 };
 
-const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, teachers, subjects, classrooms, periods) => {
+const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, teachers, subjects, classrooms, periods, customRules = [], activityGroups = []) => {
   const health = {
     status: 'ready', totalRequired: 0, scheduledForLoads: 0, missing: 0, overScheduled: 0, completionPercent: 0,
-    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], teacherLimitConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
+    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], teacherLimitConflicts: [], customRuleConflicts: [], subjectDailyConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
     teacherStats: {}, roomStats: {}, 
   };
 
@@ -248,6 +386,21 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
 
   schedules.forEach(s => checkPlacement(s, false));
   fixed.forEach(f => checkPlacement(f, true));
+  // Activity group teachers count as busy, but the all-room activity already occupies
+  // the classroom slot; group overlays must NOT duplicate room occupancy.
+  const groupTeacherItems=activityTeacherEntries(activityGroups,fixed);
+  groupTeacherItems.forEach(item=>{
+    if (!teacherMap.has(item.teacherId)) health.orphans.push(`ครูกิจกรรมกลุ่ม ${item.teacherId} ไม่มีในระบบ`);
+    if (unavail.some(u=>u.teacherId===item.teacherId&&u.day===item.day&&u.periodId===item.periodId))
+      health.unavailConflicts.push(`ครูกิจกรรมกลุ่ม ${item.teacherId} ไม่ว่างวัน${item.day} คาบ ${item.periodId}`);
+    const key=`${item.teacherId}_${item.day}_${item.periodId}`;
+    (tPlacement[key] ||= []).push(item);
+  });
+  activityGroups.forEach(g=>{
+    const root=fixed.find(f=>f.id===g.fixedId && f.classroomId===ALL_CLASSROOMS_ID);
+    if(!root || !roomMap.has(g.classroomId) || !String(g.name||'').trim())
+      health.orphans.push(`กิจกรรมกลุ่ม ${g.id||'-'} อ้างอิงกิจกรรมหลักหรือห้องเรียนไม่ถูกต้อง`);
+  });
 
   Object.entries(tPlacement).filter(([_, arr]) => arr.length > 1).forEach(([_, arr]) => health.teacherConflicts.push(`ครู ${teacherMap.get(arr[0].teacherId)?.name || arr[0].teacherId} ซ้อนทับ ${arr.length} วิชา (วัน${arr[0].day} ${getPeriodDisplayName(periods, arr[0].periodId)})`));
   Object.entries(rPlacement).filter(([_, arr]) => arr.length > 1).forEach(([_, arr]) => health.roomConflicts.push(`ห้อง ${roomMap.get(arr[0].classroomId)?.name || arr[0].classroomId} ซ้อนทับ ${arr.length} วิชา (วัน${arr[0].day} ${getPeriodDisplayName(periods, arr[0].periodId)})`));
@@ -290,8 +443,11 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
     stat.gaps = totalGaps; stat.maxConsec = globalMaxConsec;
   });
 
-  health.teacherLimitConflicts = findTeacherTeachingLimitConflicts([...schedules, ...fixed], periods, teachers);
-  const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.blockConflicts.length > 0 || health.teacherLimitConflicts.length > 0 || health.orphans.length > 0;
+  health.subjectDailyConflicts = findSubjectDailyLimitConflicts([...schedules, ...fixed], classrooms, customRules);
+  health.customRuleConflicts = [...schedules, ...fixed].filter(item => blocksCustomRule(customRules, item)).map(item =>
+    `ข้อบังคับที่ตั้งเอง: ${item.subjectId || '-'} / วัน${item.day} ${getPeriodDisplayName(periods, item.periodId)} ไม่สามารถจัดได้`);
+  health.teacherLimitConflicts = findTeacherTeachingLimitConflicts([...schedules, ...fixed, ...groupTeacherItems], periods, teachers);
+  const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.blockConflicts.length > 0 || health.teacherLimitConflicts.length > 0 || health.customRuleConflicts.length > 0 || health.subjectDailyConflicts.length > 0 || health.orphans.length > 0;
   if (hasHardConflict) health.status = 'error';
   else if (loads.length === 0) health.status = 'empty';
   else if (health.missing > 0 || health.overScheduled > 0) health.status = 'warning';
@@ -329,31 +485,40 @@ const canPlaceTeacherEntries = (teacherId, entries, maps) => {
   return { ok: true, reason: '' };
 };
 
-const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = DEFAULT_PERIODS) => {
-  const maps = { tUnavailMap: new Set(), cUnavailMap: new Set(), fixedMap: new Set(), teacherPlacements: new Set(), roomPlacements: new Set(), teacherDayPeriods: new Map(), periodContext: buildPeriodContext(periods) };
+const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = DEFAULT_PERIODS, customRules = [], activityGroups = []) => {
+  const maps = { tUnavailMap: new Set(), cUnavailMap: new Set(), fixedMap: new Set(), teacherPlacements: new Set(), roomPlacements: new Set(), teacherDayPeriods: new Map(), subjectDayCounts: new Map(), periodContext: buildPeriodContext(periods), customRules };
   tUnavail.forEach(u => maps.tUnavailMap.add(`${u.teacherId}_${u.day}_${u.periodId}`));
   cUnavail.forEach(u => maps.cUnavailMap.add(`${u.classroomId}_${u.day}_${u.periodId}`));
   fixedSch.forEach(f => {
     maps.fixedMap.add(`${f.day}_${f.periodId}_${f.classroomId}`);
     if (f.teacherId) maps.teacherPlacements.add(`${f.teacherId}_${f.day}_${f.periodId}`);
     registerTeacherPeriod(maps, f);
+    registerSubjectDayPeriod(maps, f);
     maps.roomPlacements.add(`${f.classroomId}_${f.day}_${f.periodId}`);
+  });
+  activityTeacherEntries(activityGroups,fixedSch).forEach(item=>{
+    maps.teacherPlacements.add(`${item.teacherId}_${item.day}_${item.periodId}`);
+    registerTeacherPeriod(maps,item);
   });
   schedules.forEach(s => {
     if (s.teacherId) maps.teacherPlacements.add(`${s.teacherId}_${s.day}_${s.periodId}`);
     registerTeacherPeriod(maps, s);
+    registerSubjectDayPeriod(maps, s);
     maps.roomPlacements.add(`${s.classroomId}_${s.day}_${s.periodId}`);
   });
   return maps;
 };
 
-const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak) => {
+const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak, subjectId = '') => {
   if (isBreak) return { ok: false, reason: "BREAK_PERIOD" };
+  if (blocksCustomRule(maps.customRules, { teacherId, classroomId, subjectId, day, periodId })) return { ok: false, reason: 'CUSTOM_RULE_BLOCKED' };
   if (maps.cUnavailMap.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_UNAVAILABLE" };
   if (teacherId && maps.tUnavailMap.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_UNAVAILABLE" };
   if (maps.fixedMap.has(`${day}_${periodId}_${classroomId}`) || maps.fixedMap.has(`${day}_${periodId}_${ALL_CLASSROOMS_ID}`)) return { ok: false, reason: "FIXED_SCHEDULE_CONFLICT" };
   if (maps.roomPlacements.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_CONFLICT" };
   if (teacherId && maps.teacherPlacements.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_CONFLICT" };
+  const subjectLimit = canPlaceSubjectDailyEntries({ classroomId, subjectId }, [{ day, periodId }], maps);
+  if (!subjectLimit.ok) return subjectLimit;
   const teachingLimit = canPlaceTeacherEntries(teacherId, [{ day, periodId }], maps);
   if (!teachingLimit.ok) return teachingLimit;
   return { ok: true, reason: "" };
@@ -362,7 +527,7 @@ const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak) 
 // STEP 04: ตรวจความพร้อมของข้อมูลก่อนสร้างตาราง (ไม่มีการเขียน Firebase)
 // ตรวจเฉพาะสิ่งที่ทำให้ตารางไม่ถูกต้อง โดยไม่ปฏิเสธเพียงเพราะช่องเวลามีไม่พอ
 const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classrooms, periods,
-  schedules, fixedSchedules, unavailabilities, classroomUnavailabilities, semester }) => {
+  schedules, fixedSchedules, unavailabilities, classroomUnavailabilities, semester, customRules = [], activityGroups = [] }) => {
   const problems = [];
   const addProblem = message => { if (problems.length < 30) problems.push(message); };
   const teacherIds = new Set(teachers.map(t => String(t.id)));
@@ -442,8 +607,147 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
       addProblem(`ครู ${load.teacherId} วิชา ${load.subjectId} ห้อง ${load.classroomId}: คาบที่จัดเอง/ล็อก ${count} คาบ มากกว่าภาระสอน ${load.periods} คาบ`);
     }
   });
-  findTeacherTeachingLimitConflicts(anchors, periods, teachers).forEach(addProblem);
+  customRules.forEach((rule, index) => {
+    if (!isValidCustomRule(rule, teachers, subjects, classrooms, periods) ||
+        (rule.targetType === 'subject' && !validSubject(rule.targetId))) {
+      addProblem(`เงื่อนไขเพิ่มเติมรายการที่ ${index + 1}: อ้างอิงข้อมูลไม่ถูกต้องหรือใช้กับวิชาคนละภาคเรียน`);
+    }
+  });
+  findSubjectDailyLimitConflicts(anchors, classrooms, customRules).forEach(addProblem);
+  anchors.filter(item => blocksCustomRule(customRules, item)).forEach(item =>
+    addProblem(`ตารางเดิม/กิจกรรมล็อกฝ่าฝืนข้อบังคับเพิ่มเติม: วัน${item.day} คาบ ${item.periodId}`));
+  const groupTeachers=activityTeacherEntries(activityGroups,fixedSchedules);
+  activityGroups.forEach(g=>{
+    if(!fixedSchedules.some(f=>f.id===g.fixedId&&f.classroomId===ALL_CLASSROOMS_ID)) addProblem(`กิจกรรมกลุ่ม ${g.id}: ไม่พบกิจกรรมล็อกทุกห้องที่อ้างอิง`);
+    if(!classroomIds.has(g.classroomId)) addProblem(`กิจกรรมกลุ่ม ${g.id}: ไม่พบห้องเรียน`);
+  });
+  const busy=new Set(anchors.filter(x=>x.teacherId).map(x=>JSON.stringify([x.teacherId,x.day,String(x.periodId)])));
+  groupTeachers.forEach(item=>{
+    const key=JSON.stringify([item.teacherId,item.day,String(item.periodId)]);
+    if(!teacherIds.has(item.teacherId)) addProblem(`ครูกิจกรรม ${item.teacherId} ไม่มีในระบบ`);
+    if(busy.has(key)) addProblem(`ครูกิจกรรม ${item.teacherId} ซ้อนกับคาบอื่น วัน${item.day} คาบ ${item.periodId}`);
+    busy.add(key);
+    if(unavailableTeachers.has(key)) addProblem(`ครูกิจกรรม ${item.teacherId} ไม่ว่างในเวลาที่กำหนด`);
+  });
+  findTeacherTeachingLimitConflicts([...anchors,...groupTeachers], periods, teachers).forEach(addProblem);
   return problems;
+};
+
+// STAGE 3: วิเคราะห์ขอบเขตความเป็นไปได้แบบไม่เขียนข้อมูลและไม่เรียกตัวจัดตาราง
+// เป็นเพียง necessary conditions: ผ่านการตรวจนี้ยังไม่ได้รับประกันว่าจัดครบได้
+const analyzeScheduleFeasibility = ({ teachingLoads, teachers, subjects, classrooms, periods,
+  schedules, fixedSchedules, unavailabilities, classroomUnavailabilities, customRules = [], semester }) => {
+  const invalidInputs = validateAutoScheduleInputs({ teachingLoads, teachers, subjects, classrooms,
+    periods, schedules, fixedSchedules, unavailabilities, classroomUnavailabilities, customRules, semester });
+  const result = { invalidInputs, blocking: [], advisories: [], totalRequired: teachingLoads.reduce((n,l)=>n+(Number(l.periods)||0),0),
+    activePeriods: periods.filter(p=>!p.isBreak).length, teacherCount: teachers.length, roomCount: classrooms.length };
+  // ข้อมูลอ้างอิงไม่ถูกต้อง: ไม่คำนวณขีดจำกัดต่อ เพื่อหลีกเลี่ยงรายงานผิด
+  if (invalidInputs.length) return result;
+  const active = periods.filter(p => !p.isBreak);
+  const allSlots = DAYS.length * active.length;
+  const anchored = schedules.filter(s => !isAutoGeneratedSchedule(s));
+  const anchors = [...anchored, ...fixedSchedules];
+  const baseMaps = buildConstraintMaps(anchored, unavailabilities, classroomUnavailabilities,
+    fixedSchedules, periods, customRules);
+  const teacherDemand = new Map(), roomDemand = new Map();
+  teachingLoads.forEach(load => {
+    const count = Number(load.periods);
+    teacherDemand.set(load.teacherId, (teacherDemand.get(load.teacherId)||0)+count);
+    roomDemand.set(load.classroomId, (roomDemand.get(load.classroomId)||0)+count);
+  });
+  const seen = new Set();
+  const block = message => { if (!seen.has(message)) { seen.add(message); result.blocking.push(message); } };
+
+  teacherDemand.forEach((required, teacherId) => {
+    // upper bound ignores room collisions & subject distributions, but includes teacher-wide rules
+    let upper = 0;
+    DAYS.forEach(day => {
+      const slots = active.filter(p =>
+        !unavailabilities.some(u => u.teacherId === teacherId && u.day === day && String(u.periodId) === String(p.id)) &&
+        !blocksCustomRule(customRules, {teacherId, day, periodId:p.id, classroomId:'', subjectId:''})
+      ).length;
+      upper += Math.min(SCHEDULER_CONFIG.maxTeacherPeriodsPerDay, slots);
+    });
+    if (required > upper) block(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: ภาระสอน ${required} คาบ แต่มีเพดานตามเวลาว่างและข้อบังคับไม่เกิน ${upper} คาบ/สัปดาห์`);
+    else if (upper > 0 && required / upper >= .85) result.advisories.push(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: ภาระสอนใช้ ${Math.round(required/upper*100)}% ของเพดานสูงสุดที่คำนวณแบบคร่าว ๆ`);
+  });
+  roomDemand.forEach((required, roomId) => {
+    if (required > allSlots) block(`ห้อง ${classrooms.find(r=>r.id===roomId)?.name || roomId}: ต้องจัด ${required} คาบ แต่มีเพียง ${allSlots} คาบเรียนต่อสัปดาห์`);
+  });
+
+  teachingLoads.forEach(load => {
+    const required = Number(load.periods);
+    const matching = anchors.filter(a => a.teacherId === load.teacherId && a.subjectId === load.subjectId && a.classroomId === load.classroomId).length;
+    let available = 0;
+    DAYS.forEach(day => active.forEach(p => {
+      if (canPlaceSchedule(load.teacherId, load.classroomId, day, p.id, baseMaps, false, load.subjectId).ok) available++;
+    }));
+    // Each free slot is considered independently: this is an optimistic upper bound.
+    // A real timetable may place fewer slots due to conflicts, blocks and consecutive-period rules.
+    if (required > matching + available) {
+      block(`วิชา ${subjects.find(s=>s.id===load.subjectId)?.name || load.subjectId} ห้อง ${classrooms.find(r=>r.id===load.classroomId)?.name || load.classroomId} (${teachers.find(t=>t.id===load.teacherId)?.name || load.teacherId}): ต้องการ ${required} คาบ แต่มีคาบเดิม ${matching} + ช่องว่างที่ผ่านเงื่อนไขเบื้องต้นไม่เกิน ${available} คาบ`);
+    }
+    if (Number(subjects.find(s=>s.id===load.subjectId)?.periodBlock) === 2 && required >= 2) {
+      const pairs = DAYS.reduce((acc, day) => acc + buildPeriodContext(periods).doublePairs.filter(([a,b]) =>
+        canPlaceSchedule(load.teacherId, load.classroomId, day, a.id, baseMaps, false, load.subjectId).ok &&
+        canPlaceSchedule(load.teacherId, load.classroomId, day, b.id, baseMaps, false, load.subjectId).ok &&
+        canPlaceTeacherEntries(load.teacherId, [{day,periodId:a.id},{day,periodId:b.id}], baseMaps).ok &&
+        canPlaceSubjectDailyEntries(load, [{day,periodId:a.id},{day,periodId:b.id}], baseMaps).ok
+      ).length, 0);
+      if (pairs === 0 && required > matching) result.advisories.push(`วิชาคาบคู่ ${load.subjectId} ห้อง ${load.classroomId}: ไม่พบคาบคู่ที่ว่างอยู่ในขณะนี้ อาจต้องย้ายคาบที่จัดไว้`);
+    }
+  });
+  return result;
+};
+
+// STAGE 4: อธิบายสาเหตุเชิงสังเกตของช่องที่จัดไม่ได้หลังจัดตาราง
+// ไม่เปลี่ยนอัลกอริทึม ไม่ย้ายคาบ และไม่กล่าวอ้างว่าเป็นสาเหตุเดียวที่แท้จริง
+const describeUnassignedReasons = ({ load, schedules, fixedSchedules, periods,
+  unavailabilities, classroomUnavailabilities, customRules = [] }) => {
+  const labels = {
+    BREAK_PERIOD: 'คาบพักกลางวัน', ROOM_UNAVAILABLE: 'ห้องเรียนไม่ว่างตามข้อจำกัด',
+    TEACHER_UNAVAILABLE: 'ครูไม่สะดวกในคาบนี้', FIXED_SCHEDULE_CONFLICT: 'มีกิจกรรมล็อกคาบนี้',
+    ROOM_CONFLICT: 'ห้องมีวิชาอื่นแล้ว', TEACHER_CONFLICT: 'ครูมีสอนอีกห้องในคาบนี้',
+    TEACHER_DAILY_LIMIT: 'ครูครบ 5 คาบต่อวัน', TEACHER_CONSECUTIVE_LIMIT: 'ครูติดกันเกิน 3 คาบ',
+    SUBJECT_DAILY_LIMIT: 'วิชาเกินเพดานคาบต่อวัน', CUSTOM_RULE_BLOCKED: 'ขัดกับข้อบังคับเพิ่มเติม',
+  };
+  const hints = {
+    ROOM_UNAVAILABLE: 'ตรวจช่วงเวลาที่ห้องไม่ว่าง', TEACHER_UNAVAILABLE: 'ตรวจช่วงเวลาที่ครูไม่สะดวก',
+    FIXED_SCHEDULE_CONFLICT: 'ตรวจเวลาของกิจกรรมล็อก ก่อนปรับแก้รายการที่เกี่ยวข้อง',
+    ROOM_CONFLICT: 'พิจารณาสลับคาบในห้องเรียนนี้ โดยคงข้อบังคับทั้งหมด',
+    TEACHER_CONFLICT: 'พิจารณาสลับคาบครูในห้องอื่น โดยคงข้อบังคับทั้งหมด',
+    TEACHER_DAILY_LIMIT: 'กระจายภาระสอนของครูไปวันอื่น',
+    TEACHER_CONSECUTIVE_LIMIT: 'จัดให้มีคาบว่างคั่นก่อนสอนต่อ',
+    SUBJECT_DAILY_LIMIT: 'กระจายวิชานี้ไปวันอื่นโดยไม่เกินเพดาน',
+    CUSTOM_RULE_BLOCKED: 'ตรวจข้อบังคับเพิ่มเติมของครู วิชา และห้อง',
+  };
+  const context = buildPeriodContext(periods);
+  const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities,
+    fixedSchedules, periods, customRules);
+  const counts = new Map();
+  let singleOptions = 0;
+  DAYS.forEach(day => context.activePeriods.forEach(p => {
+    const attempt = canPlaceSchedule(load.teacherId, load.classroomId, day, p.id, maps, false, load.subjectId);
+    if (attempt.ok) singleOptions++;
+    else counts.set(attempt.reason, (counts.get(attempt.reason)||0)+1);
+  }));
+  const topReasons = [...counts].sort((a,b)=>b[1]-a[1]).slice(0,3)
+    .map(([code,count])=>({ code, count, label:labels[code] || code }));
+  let pairOptions = 0;
+  if (load.reason === 'DOUBLE_PERIOD_NOT_AVAILABLE' || load.reason === 'BLOCK_COMPANION_NOT_AVAILABLE') {
+    DAYS.forEach(day => context.doublePairs.forEach(([a,b]) => {
+      const entries = [{day,periodId:a.id},{day,periodId:b.id}];
+      if (entries.every(e=>canPlaceSchedule(load.teacherId,load.classroomId,e.day,e.periodId,maps,false,load.subjectId).ok) &&
+          canPlaceTeacherEntries(load.teacherId,entries,maps).ok && canPlaceSubjectDailyEntries(load,entries,maps).ok) pairOptions++;
+    }));
+  }
+  const mainCode = topReasons[0]?.code || '';
+  const suggestion = load.reason === 'BLOCK_COMPANION_NOT_AVAILABLE'
+    ? 'ตรวจคาบที่ล็อกหรือจัดเองซึ่งต้องมีคาบข้างเคียงสำหรับจับคู่'
+    : load.reason === 'DOUBLE_PERIOD_NOT_AVAILABLE' && pairOptions === 0
+      ? 'หาคาบว่างติดกัน 2 คาบ โดยอาจสลับคาบอื่นก่อน แล้วตรวจข้อบังคับเดิมซ้ำ'
+      : hints[mainCode] || 'ลองจัดตารางใหม่หรือปรับคาบที่จัดด้วยมือ โดยตรวจข้อบังคับทั้งหมด';
+  return { singleOptions, pairOptions, topReasons, suggestion };
 };
 
 const createSeededRandom = (seed) => {
@@ -466,7 +770,9 @@ const cloneConstraintMaps = (maps) => ({
   teacherPlacements: new Set(maps.teacherPlacements),
   roomPlacements: new Set(maps.roomPlacements),
   teacherDayPeriods: new Map([...maps.teacherDayPeriods].map(([day, values]) => [day, new Set(values)])),
+  subjectDayCounts: new Map(maps.subjectDayCounts),
   periodContext: maps.periodContext,
+  customRules: maps.customRules,
 });
 
 const buildPeriodContext = (periods) => {
@@ -590,7 +896,7 @@ const registerPlacementState = (state, scheduleItem) => {
   state.roomSubjectDayCounts.set(rsdKey, (state.roomSubjectDayCounts.get(rsdKey) || 0) + 1);
 };
 
-const scorePlacementOption = (entries, load, state, periodsOrContext, getSubject) => {
+const scorePlacementOption = (entries, load, state, periodsOrContext, getSubject, customRules = []) => {
   if (!entries.length) return -Infinity;
   let score = 0;
   const subject = getSubject(load.subjectId);
@@ -638,14 +944,15 @@ const scorePlacementOption = (entries, load, state, periodsOrContext, getSubject
     }
   });
 
+  entries.forEach(entry => { score += customRulePreferenceScore(customRules, { ...load, ...entry }); });
   return score;
 };
 
-const choosePlacementOption = (options, load, state, periodsOrContext, getSubject, random) => {
+const choosePlacementOption = (options, load, state, periodsOrContext, getSubject, random, customRules = []) => {
   if (!options.length) return null;
   const ranked = options.map(entries => ({
     entries,
-    score: scorePlacementOption(entries, load, state, periodsOrContext, getSubject) + (random() * SCHEDULER_CONFIG.placementJitter),
+    score: scorePlacementOption(entries, load, state, periodsOrContext, getSubject, customRules) + (random() * SCHEDULER_CONFIG.placementJitter),
   })).sort((a, b) => b.score - a.score);
   const poolSize = Math.min(SCHEDULER_CONFIG.candidateChoicePool, ranked.length);
   const pickIndex = Math.min(poolSize - 1, Math.floor(Math.pow(random(), 2) * poolSize));
@@ -689,13 +996,14 @@ const findBlockPartner = (target, items, periods) => {
   return pair[0].id === target.id ? pair[1] : pair[0];
 };
 
-const calculateScheduleScore = (schedules, teachers, subjects, periodsOrContext, getSubject) => {
+const calculateScheduleScore = (schedules, teachers, subjects, periodsOrContext, getSubject, customRules = []) => {
   let score = WEIGHTS.BASE_SCORE;
   const teacherStats = {}; const roomSubjectStats = {};
   const periodContext = getPeriodContext(periodsOrContext);
   const morningPeriods = periodContext.morningIds;
 
   schedules.forEach(sch => {
+    score += customRulePreferenceScore(customRules, sch);
     if (sch.teacherId) {
       if (!teacherStats[sch.teacherId]) teacherStats[sch.teacherId] = { days: {} };
       if (!teacherStats[sch.teacherId].days[sch.day]) teacherStats[sch.teacherId].days[sch.day] = [];
@@ -818,7 +1126,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, healt
         <div className={`bg-white p-5 rounded-2xl shadow-sm border flex flex-col justify-between ${health.status === 'error' ? 'border-rose-200 bg-rose-50/30' : 'border-slate-100'}`}>
            <div className={`font-bold mb-2 flex items-center gap-2 ${health.status === 'error' ? 'text-rose-600' : 'text-slate-500'}`}><AlertCircle size={18}/> ข้อขัดแย้ง (Conflicts)</div>
            <div className={`text-3xl font-bold ${health.status === 'error' ? 'text-rose-700' : 'text-[#081a39]'}`}>
-             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.blockConflicts.length + health.teacherLimitConflicts.length + health.orphans.length}
+             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.blockConflicts.length + health.teacherLimitConflicts.length + health.customRuleConflicts.length + health.subjectDailyConflicts.length + health.orphans.length}
            </div>
         </div>
       </div>
@@ -829,6 +1137,8 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, healt
 const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, fullDataForBackup, handleRestoreBackup }) => {
   const [form, setForm] = useState(schoolSettings);
   const fileInputRef = useRef(null);
+  // Step 0: indicate a server-verified backup is in progress.
+  const [isBackingUp, setIsBackingUp] = useState(false);
   useEffect(() => { setForm(schoolSettings); }, [schoolSettings]);
 
   const handleSave = async () => {
@@ -837,13 +1147,54 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
     catch (e) { showToast("เกิดข้อผิดพลาดในการบันทึก", "error"); }
   };
 
-  const handleBackup = () => {
-    const backupData = { backupVersion: 2, appId, academicYear: schoolSettings.academicYear, semester: schoolSettings.semester, termKey: getTermKey(schoolSettings), exportedAt: new Date().toISOString(), schoolSettings, ...fullDataForBackup };
-    const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a"); link.href = url; link.download = `BHS-Backup-${backupData.termKey}-${new Date().toISOString().split('T')[0]}.json`;
-    document.body.appendChild(link); link.click(); document.body.removeChild(link); URL.revokeObjectURL(url);
-    showToast("ดาวน์โหลดไฟล์สำรองข้อมูลสำเร็จ");
+  // STEP 00: Export all nine collections from the FIRESTORE SERVER, never from
+  // partially initialized React listeners or stale term data. Preserve JSON v2.
+  // This is a best-effort multi-collection export, NOT an atomic database snapshot.
+  const handleBackup = async () => {
+    if (isBackingUp) return;
+    if (!user) return showToast("กรุณาเชื่อมต่อระบบก่อนสำรองข้อมูล", "error");
+    setIsBackingUp(true);
+    try {
+      const basePath = `school_data/${appId}`;
+      const settingsRef = doc(db, `${basePath}/config/settings`);
+      const settingsSnap = await getDocFromServer(settingsRef);
+      if (!settingsSnap.exists()) throw new Error('BACKUP_SETTINGS_MISSING');
+      const serverSettings = settingsSnap.data();
+      const termKey = getTermKey(serverSettings);
+      if (termKey !== getTermKey(schoolSettings)) throw new Error('BACKUP_TERM_CHANGED');
+      const names = ['teachers', 'subjects', 'classrooms', 'periods', 'teachingLoads', 'unavailabilities', 'classroomUnavailabilities', 'fixedSchedules', 'schedules', 'scheduleRules', 'activityGroups'];
+      const masterNames = new Set(['teachers', 'subjects', 'classrooms', 'periods']);
+      const entries = await Promise.all(names.map(async name => {
+        const path = masterNames.has(name) ? `${basePath}/${name}` : `${basePath}/terms/${termKey}/${name}`;
+        const snapshot = await getDocsFromServer(collection(db, path));
+        return [name, snapshot.docs.map(item => ({ ...item.data(), id: item.id }))];
+      }));
+      // Reject if the active term/settings changed while downloading the data.
+      const finalSettingsSnap = await getDocFromServer(settingsRef);
+      if (!finalSettingsSnap.exists() || stableSerializeData(serverSettings) !== stableSerializeData(finalSettingsSnap.data())) {
+        throw new Error('BACKUP_SETTINGS_CHANGED');
+      }
+      const backupData = {
+        backupVersion: 2, appId, academicYear: serverSettings.academicYear,
+        semester: serverSettings.semester, termKey, exportedAt: new Date().toISOString(),
+        schoolSettings: serverSettings, ...Object.fromEntries(entries),
+      };
+      const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `BHS-Backup-${termKey}-${new Date().toISOString().split('T')[0]}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      showToast("ดาวน์โหลดไฟล์สำรองข้อมูลจากเซิร์ฟเวอร์สำเร็จ");
+    } catch (error) {
+      console.error('Server backup failed', error);
+      showToast("สำรองข้อมูลไม่สำเร็จ ไม่ได้สร้างไฟล์สำรองที่อาจไม่ครบ กรุณาตรวจการเชื่อมต่อและภาคเรียน", "error");
+    } finally {
+      setIsBackingUp(false);
+    }
   };
 
   const handleFileChange = (e) => {
@@ -878,7 +1229,7 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-8 max-w-2xl mx-auto animate-in fade-in">
         <h2 className="text-xl font-bold text-[#081a39] mb-4 flex items-center gap-2">การจัดการข้อมูลสำรอง (Backup & Restore)</h2>
         <div className="grid grid-cols-2 gap-4">
-          <button onClick={handleBackup} className="flex items-center justify-center gap-2 py-3 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-bold transition-all shadow-sm"><Download size={18} className="text-emerald-600" /> สำรองข้อมูล (JSON)</button>
+          <button onClick={handleBackup} disabled={isBackingUp} className="flex items-center justify-center gap-2 py-3 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-bold transition-all shadow-sm disabled:opacity-50 disabled:cursor-wait"><Download size={18} className="text-emerald-600" /> {isBackingUp ? "กำลังอ่านข้อมูลจากเซิร์ฟเวอร์..." : "สำรองข้อมูล (JSON)"}</button>
           <button onClick={() => fileInputRef.current.click()} className="flex items-center justify-center gap-2 py-3 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-bold transition-all shadow-sm"><UploadCloud size={18} className="text-amber-600" /> นำเข้าข้อมูลสำรอง</button>
           <input type="file" accept=".json" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
         </div>
@@ -1352,7 +1703,7 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
   );
 };
 
-const ConstraintsView = ({ unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, showToast, handleRequestDelete, getTeacher, getClassroom, getSubject }) => {
+const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, showToast, handleRequestDelete, getTeacher, getClassroom, getSubject, customRules, rulesReady }) => {
   const [activeSubTab, setActiveSubTab] = useState('teacher');
   const [tForm, setTForm] = useState({ teacherId: '', day: 'จันทร์', periodId: '1' });
   const [cForm, setCForm] = useState({ classroomId: '', day: 'จันทร์', periodId: '1', reason: '' });
@@ -1372,16 +1723,17 @@ const ConstraintsView = ({ unavailabilities, classroomUnavailabilities, fixedSch
       const ok = await dbAction('classroomUnavailabilities', id, { ...cForm, id });
       if (ok) showToast("บันทึกเวลาห้องไม่ว่างสำเร็จ");
     } else if (type === 'fixed') {
+      if (!rulesReady) return showToast('ยังโหลดเงื่อนไขไม่สำเร็จ', 'error');
       if (!fForm.subjectId || !fForm.classroomId) return showToast("กรุณาเลือกวิชาและห้อง", "error");
-      const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
+      const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods, customRules, activityGroups);
       const targetRooms = fForm.classroomId === ALL_CLASSROOMS_ID ? classrooms : classrooms.filter(c => c.id === fForm.classroomId);
       if (targetRooms.length === 0) return showToast("ยังไม่มีห้องเรียนให้ล็อกกิจกรรม", "error");
       const selectedPeriod = periods.find(p => p.id === fForm.periodId);
       if (!selectedPeriod || selectedPeriod.isBreak) return showToast("ไม่สามารถล็อกกิจกรรมในคาบพักหรือคาบที่ไม่มีอยู่", "error");
       for (const room of targetRooms) {
-        const valid = canPlaceSchedule(fForm.teacherId, room.id, fForm.day, fForm.periodId, maps, false);
+        const valid = canPlaceSchedule(fForm.teacherId, room.id, fForm.day, fForm.periodId, maps, false, fForm.subjectId);
         if (!valid.ok) {
-          const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้" };
+          const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้", "CUSTOM_RULE_BLOCKED": "ขัดกับเงื่อนไขห้ามจัดที่ตั้งไว้", "SUBJECT_DAILY_LIMIT": "วิชานี้เต็มจำนวนคาบสูงสุดต่อวันของห้องแล้ว" };
           return showToast(`${room.name}: ${reasons[valid.reason] || "ไม่สามารถล็อกตารางในเวลานี้ได้"}`, "error");
         }
       }
@@ -1448,10 +1800,134 @@ const ConstraintsView = ({ unavailabilities, classroomUnavailabilities, fixedSch
   );
 };
 
-const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion }) => {
+// STAGE 1: ผู้ดูแลเพิ่มเงื่อนไขรายวัน/คาบ โดยไม่เปลี่ยนข้อบังคับครู 5/3
+const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, periods, schedules, fixedSchedules, dbAction, showToast, rulesReady }) => {
+  const [form, setForm] = useState({ targetType: 'teacher', targetId: '', day: 'จันทร์', periodId: '', mode: 'block' });
+  const [saving, setSaving] = useState(false);
+  const [dailySubjectId, setDailySubjectId] = useState('');
+  const [dailyMax, setDailyMax] = useState('2');
+  const targets = form.targetType === 'teacher' ? teachers : form.targetType === 'subject' ? activeSubjects : classrooms;
+  const listForRule = r => r.targetType === 'teacher' ? teachers : r.targetType === 'subject' ? activeSubjects : classrooms;
+  const labelForRule = r => listForRule(r).find(x => x.id === r.targetId)?.name || r.targetId;
+  const handleAdd = async () => {
+    if (saving) return;
+    if (!rulesReady) return showToast('ยังโหลดเงื่อนไขไม่สำเร็จ กรุณาตรวจการเชื่อมต่อ', 'error');
+    if (!isValidCustomRule(form, teachers, activeSubjects, classrooms, periods)) return showToast('กรุณาระบุครู/วิชา/ห้อง วัน และคาบที่ถูกต้อง', 'error');
+    if (customRules.some(r => r.targetType === form.targetType && r.targetId === form.targetId && r.day === form.day && String(r.periodId) === String(form.periodId) && r.mode === form.mode))
+      return showToast('มีเงื่อนไขนี้แล้ว', 'error');
+    if (form.mode === 'block' && [...schedules, ...fixedSchedules].some(item => customRuleMatches(form, item)))
+      return showToast('มีตารางเดิมหรือกิจกรรมล็อกในช่วงนี้ กรุณาจัดการตารางเดิมก่อน', 'error');
+    setSaving(true);
+    try {
+      const id = `RULE_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const ok = await dbAction('scheduleRules', id, { ...form, id });
+      if (ok) { setForm(prev => ({ ...prev, targetId: '' })); showToast('เพิ่มเงื่อนไขสำเร็จ'); }
+    } finally { setSaving(false); }
+  };
+  const handleAddDailyLimit = async () => {
+    if (!rulesReady || saving) return showToast('ยังไม่พร้อมบันทึกเงื่อนไข', 'error');
+    const rule = { targetType: 'subject', targetId: dailySubjectId, mode: 'dailyLimit', maxPerDay: Number(dailyMax) };
+    if (!isValidCustomRule(rule, teachers, activeSubjects, classrooms, periods)) return showToast('เลือกวิชาและจำนวนคาบสูงสุดให้ถูกต้อง', 'error');
+    if (customRules.some(x => x.mode === 'dailyLimit' && x.targetId === dailySubjectId)) return showToast('วิชานี้มีข้อจำกัดจำนวนคาบแล้ว กรุณาลบรายการเก่าก่อน', 'error');
+    if (findSubjectDailyLimitConflicts([...schedules, ...fixedSchedules], classrooms, [rule]).length) return showToast('ตารางเดิมมีวิชานี้เกินค่าที่กำหนด กรุณาจัดการตารางเดิมก่อน', 'error');
+    setSaving(true);
+    try {
+      const id = `DAILY_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const ok = await dbAction('scheduleRules', id, { ...rule, id });
+      if (ok) { setDailySubjectId(''); showToast('เพิ่มเพดานคาบรายวิชาสำเร็จ'); }
+    } finally { setSaving(false); }
+  };
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl border border-slate-100 p-6 max-w-4xl">
+        <h2 className="text-xl font-bold text-[#081a39] mb-2">เงื่อนไขการจัดตารางเพิ่มเติม</h2>
+        {!rulesReady && <p role="alert" className="text-rose-700 mb-3">กำลังโหลดเงื่อนไขจาก Firebase หรือไม่มีสิทธิ์อ่านข้อมูล กรุณาตรวจการเชื่อมต่อก่อนแก้ไข</p>}
+        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ข้อบังคับครูไม่เกิน 5 คาบ/วัน และ 3 คาบติดกันยังคงเดิม</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <label className="text-sm font-bold">ประเภทข้อมูล<select className="w-full border rounded-xl p-3 mt-1" value={form.targetType} onChange={e => setForm(prev => ({ ...prev, targetType: e.target.value, targetId: '' }))}><option value="teacher">ครู</option><option value="subject">รายวิชา</option><option value="classroom">ห้องเรียน</option></select></label>
+          <label className="text-sm font-bold">เลือกบุคคล/รายการ<select className="w-full border rounded-xl p-3 mt-1" value={form.targetId} onChange={e => setForm(prev => ({ ...prev, targetId: e.target.value }))}><option value="">-- เลือก --</option>{targets.map(x => <option key={x.id} value={x.id}>{x.name} ({x.id})</option>)}</select></label>
+          <label className="text-sm font-bold">วัน<select className="w-full border rounded-xl p-3 mt-1" value={form.day} onChange={e => setForm(prev => ({ ...prev, day: e.target.value }))}>{DAYS.map(day => <option key={day} value={day}>{day}</option>)}</select></label>
+          <label className="text-sm font-bold">คาบ<select className="w-full border rounded-xl p-3 mt-1" value={form.periodId} onChange={e => setForm(prev => ({ ...prev, periodId: e.target.value }))}><option value="">-- เลือกคาบ --</option>{periods.filter(p => !p.isBreak).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+          <label className="text-sm font-bold sm:col-span-2">เงื่อนไข<select className="w-full border rounded-xl p-3 mt-1" value={form.mode} onChange={e => setForm(prev => ({ ...prev, mode: e.target.value }))}><option value="block">ข้อบังคับ: ห้ามจัดในคาบนี้</option><option value="prefer">ข้อแนะนำ: พยายามจัดในคาบนี้</option></select></label>
+        </div>
+        <button disabled={saving || !rulesReady || !form.targetId || !form.periodId} onClick={handleAdd} className="mt-4 px-6 py-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">{saving ? 'กำลังบันทึก...' : 'เพิ่มเงื่อนไข'}</button>
+      </div>
+      <div className="bg-white border rounded-2xl p-6 max-w-4xl">
+        <h3 className="font-bold text-lg mb-3">จำกัดจำนวนคาบวิชาเดียวกันต่อวัน (แต่ละห้องเรียน)</h3>
+        <p className="text-slate-600 text-sm mb-3">เช่น ตั้งคณิตศาสตร์ไม่เกิน 2 คาบต่อวัน/ห้อง โดยวิชาแบบ Block 2 ยังสามารถจัดสองคาบติดกันได้</p>
+        <div className="flex flex-wrap gap-3 items-end">
+          <label className="text-sm font-bold flex-1 min-w-[200px]">รายวิชา<select className="w-full border rounded-xl p-3 mt-1" value={dailySubjectId} onChange={e=>setDailySubjectId(e.target.value)}><option value="">-- เลือกรายวิชา --</option>{activeSubjects.map(x=><option key={x.id} value={x.id}>{x.name} ({x.id})</option>)}</select></label>
+          <label className="text-sm font-bold w-36">สูงสุด (คาบ/วัน)<input className="w-full border rounded-xl p-3 mt-1" type="number" min="1" max={periods.filter(p=>!p.isBreak).length} value={dailyMax} onChange={e=>setDailyMax(e.target.value)} /></label>
+          <button disabled={saving || !rulesReady || !dailySubjectId} onClick={handleAddDailyLimit} className="px-5 py-3 bg-[#081a39] text-white rounded-xl font-bold disabled:opacity-50">เพิ่มเพดานคาบ</button>
+        </div>
+      </div>
+      <div className="bg-white border rounded-2xl p-6 max-w-4xl">
+        <h3 className="font-bold text-lg mb-3">รายการเงื่อนไข ({customRules.length})</h3>
+        {!customRules.length && <p className="text-slate-500 text-sm">ยังไม่มีเงื่อนไขเพิ่มเติม</p>}
+        <div className="space-y-2">{customRules.map(rule => <div key={rule.id} className="flex flex-wrap gap-2 items-center justify-between border rounded-xl p-3"><div className="text-sm"><span className="font-bold">{labelForRule(rule)}</span> · {rule.mode === 'dailyLimit' ? `ไม่เกิน ${rule.maxPerDay} คาบต่อวัน/ห้อง` : `วัน${rule.day} · ${getPeriodDisplayName(periods, rule.periodId)}`} <span className={rule.mode === 'block' ? 'text-rose-700' : 'text-emerald-700'}>({rule.mode === 'dailyLimit' ? 'ข้อบังคับจำนวนคาบ' : rule.mode === 'block' ? 'ห้ามจัด' : 'ควรจัด'})</span></div><button className="text-rose-700 border border-rose-200 px-3 py-2 rounded-lg" onClick={async () => { if (window.confirm('ยืนยันลบเงื่อนไขนี้?')) await dbAction('scheduleRules', rule.id, null, 'delete'); }}>ลบ</button></div>)}</div>
+      </div>
+    </div>
+  );
+};
+
+// STAGE 6: per-classroom activity labels under a single all-room fixed time slot.
+const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teachers, schedules, rulesReady,
+  unavailabilities, periods, customRules, dbAction, showToast}) => {
+  const roots=fixedSchedules.filter(f=>f.classroomId===ALL_CLASSROOMS_ID);
+  const [form,setForm]=useState({fixedId:'',classroomId:'',name:'',teacherId:''});
+  const [busy,setBusy]=useState(false);
+  const save=async()=>{
+    if(!rulesReady) return showToast('รอโหลดเงื่อนไขและกิจกรรมกลุ่มก่อน','error');
+    const root=roots.find(f=>f.id===form.fixedId);
+    if(!root || !classrooms.some(c=>c.id===form.classroomId) || !form.name.trim())
+      return showToast('เลือกกิจกรรมหลัก ห้องเรียน และกรอกชื่อกิจกรรมก่อน','error');
+    if(activityGroups.some(x=>x.fixedId===form.fixedId&&x.classroomId===form.classroomId))
+      return showToast('ห้องนี้มีกิจกรรมย่อยของช่วงเวลาที่เลือกอยู่แล้ว','error');
+    if(form.teacherId){
+      const groups=activityTeacherEntries(activityGroups,fixedSchedules);
+      const other=[...schedules,...fixedSchedules,...groups].filter(x=>x.teacherId===form.teacherId);
+      if(other.some(x=>x.day===root.day&&x.periodId===root.periodId))
+        return showToast('ครูคนนี้มีคาบหรือกิจกรรมอื่นในเวลาเดียวกัน','error');
+      if(unavailabilities.some(x=>x.teacherId===form.teacherId&&x.day===root.day&&x.periodId===root.periodId))
+        return showToast('ครูไม่สะดวกในช่วงเวลานี้','error');
+      if(blocksCustomRule(customRules,{teacherId:form.teacherId,day:root.day,periodId:root.periodId}))
+        return showToast('ครูติดเงื่อนไขห้ามจัดในช่วงเวลานี้','error');
+      const extended=[...other,{teacherId:form.teacherId,day:root.day,periodId:root.periodId}];
+      if(findTeacherTeachingLimitConflicts(extended,periods,teachers).length)
+        return showToast('เกินข้อบังคับ 5 คาบต่อวันหรือ 3 คาบติดกัน','error');
+    }
+    setBusy(true);
+    try {
+      const id=`AG_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+      const ok=await dbAction('activityGroups',id,{...form,id,name:form.name.trim()});
+      if(ok){setForm(old=>({...old,name:'',teacherId:''}));showToast('บันทึกกิจกรรมกลุ่มสำเร็จ');}
+    } finally {setBusy(false);}
+  };
+  return <div className="space-y-5">
+    <div className="bg-white rounded-2xl p-6 border space-y-4">
+      <h2 className="text-xl font-bold">กิจกรรมพัฒนาผู้เรียนแยกตามห้อง</h2>
+      <p className="text-sm text-slate-600">สร้างกิจกรรมล็อก “ทุกห้องเรียน” ก่อน แล้วกำหนดชื่อกิจกรรม/ครูให้แต่ละห้องได้โดยไม่เพิ่มคาบล็อกซ้ำ</p>
+      <select className="w-full border rounded-xl p-3" value={form.fixedId} onChange={e=>setForm({...form,fixedId:e.target.value})}><option value="">-- เลือกกิจกรรมหลักที่ล็อกทุกห้อง --</option>{roots.map(f=><option key={f.id} value={f.id}>{f.day} คาบ {f.periodId} · {f.subjectId}</option>)}</select>
+      <select className="w-full border rounded-xl p-3" value={form.classroomId} onChange={e=>setForm({...form,classroomId:e.target.value})}><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
+      <input className="w-full border rounded-xl p-3" placeholder="ชื่อกิจกรรม เช่น ชุมนุมดนตรี" value={form.name} onChange={e=>setForm({...form,name:e.target.value})}/>
+      <select className="w-full border rounded-xl p-3" value={form.teacherId} onChange={e=>setForm({...form,teacherId:e.target.value})}><option value="">-- ครูผู้รับผิดชอบ (ไม่ระบุได้) --</option>{teachers.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select>
+      <button onClick={save} disabled={busy||!roots.length||!rulesReady} className="px-6 py-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">บันทึกกิจกรรมกลุ่ม</button>
+    </div>
+    <div className="bg-white rounded-2xl p-5 border space-y-3"><h3 className="font-bold">รายการกิจกรรมย่อย ({activityGroups.length})</h3>
+      {activityGroups.map(g=><div key={g.id} className="flex justify-between gap-3 items-center border-b pb-2">
+        <div><strong>{classrooms.find(c=>c.id===g.classroomId)?.name||g.classroomId}: {g.name}</strong><p className="text-xs text-slate-500">{teachers.find(t=>t.id===g.teacherId)?.name||'ไม่ได้ระบุครู'}</p></div>
+        <button onClick={async()=>{if(window.confirm('ยืนยันลบกิจกรรมกลุ่มนี้?')) await dbAction('activityGroups',g.id,null,'delete');}} className="text-rose-600 border rounded-lg p-2"><Trash2 size={16}/></button>
+      </div>)}
+    </div>
+  </div>;
+};
+
+const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, customRules, rulesReady, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion }) => {
   const [viewMode, setViewMode] = useState('room');
   const [selectedId, setSelectedId] = useState('');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [feasibility, setFeasibility] = useState(null);
+  const [editingRows,setEditingRows] = useState(false);
   const [addForm, setAddForm] = useState({ teacherId: '', subjectId: '', classroomId: '', day: 'จันทร์', periodId: '1' });
 
   // จำกัดรายวิชาในหน้าต่างเพิ่มตารางสอนด้วยมือ ให้ตรงตามภาระสอนของครู/ห้องที่เลือก
@@ -1488,7 +1964,15 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
     setIsAddModalOpen(true);
   };
 
+  const handleFeasibilityClick = () => {
+    if (!rulesReady) return showToast('ยังโหลดเงื่อนไขเพิ่มเติมไม่สำเร็จ กรุณาลองใหม่', 'error');
+    setFeasibility(analyzeScheduleFeasibility({ teachingLoads, teachers, subjects:activeSubjects,
+      classrooms, periods, schedules, fixedSchedules, unavailabilities,
+      classroomUnavailabilities, customRules, semester:schoolSettings.semester, activityGroups }));
+  };
+
   const handleManualAdd = async () => {
+    if (!rulesReady) return showToast('ยังโหลดเงื่อนไขไม่สำเร็จ', 'error');
     if (!addForm.teacherId || !addForm.subjectId || !addForm.classroomId) return showToast("กรุณากรอกข้อมูลให้ครบ", "error");
     if (!DAYS.includes(addForm.day)) return showToast("วันที่เลือกไม่ถูกต้อง", "error");
 
@@ -1507,10 +1991,10 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
     const remaining = required - assignedItems.length;
     if (remaining <= 0) return showToast("ภาระสอนรายการนี้จัดครบแล้ว", "error");
 
-    const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
-    const selectedValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, addForm.periodId, maps, false);
+    const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods, customRules, activityGroups);
+    const selectedValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, addForm.periodId, maps, false, addForm.subjectId);
     if (!selectedValid.ok) {
-      const reasons = { "BREAK_PERIOD": "จัดลงคาบพักเที่ยงไม่ได้", "ROOM_UNAVAILABLE": "ห้องไม่สะดวก", "TEACHER_UNAVAILABLE": "ครูไม่สะดวก", "FIXED_SCHEDULE_CONFLICT": "มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีวิชาอื่นแล้ว", "TEACHER_CONFLICT": "ครูมีสอนแล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้" };
+      const reasons = { "BREAK_PERIOD": "จัดลงคาบพักเที่ยงไม่ได้", "ROOM_UNAVAILABLE": "ห้องไม่สะดวก", "TEACHER_UNAVAILABLE": "ครูไม่สะดวก", "FIXED_SCHEDULE_CONFLICT": "มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีวิชาอื่นแล้ว", "TEACHER_CONFLICT": "ครูมีสอนแล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้", "CUSTOM_RULE_BLOCKED": "ขัดกับเงื่อนไขห้ามจัดที่ตั้งไว้", "SUBJECT_DAILY_LIMIT": "วิชานี้เต็มจำนวนคาบสูงสุดต่อวันของห้องแล้ว" };
       return showToast(reasons[selectedValid.reason] || "ติดเงื่อนไขจัดไม่ได้", "error");
     }
 
@@ -1535,17 +2019,17 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
 
           const candidatePairs = [];
           neighborPeriods.forEach(neighbor => {
-            const neighborValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, neighbor.id, maps, false);
+            const neighborValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, neighbor.id, maps, false, addForm.subjectId);
             if (neighborValid.ok) {
               const pair = [{ day: addForm.day, periodId: addForm.periodId }, { day: addForm.day, periodId: neighbor.id }];
-              if (canPlaceTeacherEntries(addForm.teacherId, pair, maps).ok) candidatePairs.push(pair);
+              if (canPlaceTeacherEntries(addForm.teacherId, pair, maps).ok && canPlaceSubjectDailyEntries(addForm, pair, maps).ok) candidatePairs.push(pair);
             }
           });
 
           if (candidatePairs.length === 0) return showToast("วิชานี้กำหนดเป็น Block 2 แต่ไม่มีคาบข้างเคียงที่ว่างสำหรับจัดติดกัน", "error");
 
           const placementState = buildPlacementState([...fixedSchedules, ...schedules]);
-          candidatePairs.sort((a, b) => scorePlacementOption(b, matchingLoad, placementState, periods, getSubject) - scorePlacementOption(a, matchingLoad, placementState, periods, getSubject));
+          candidatePairs.sort((a, b) => scorePlacementOption(b, matchingLoad, placementState, periods, getSubject, customRules) - scorePlacementOption(a, matchingLoad, placementState, periods, getSubject, customRules));
           plannedEntries = candidatePairs[0];
         }
       }
@@ -1559,6 +2043,8 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
       }
     }
 
+    const subjectLimit = canPlaceSubjectDailyEntries(addForm, plannedEntries, maps);
+    if (!subjectLimit.ok) return showToast('วิชาเดียวกันเกินจำนวนคาบสูงสุดต่อวันของห้องนี้', 'error');
     const teacherLimit = canPlaceTeacherEntries(addForm.teacherId, plannedEntries, maps);
     if (!teacherLimit.ok) return showToast(teacherLimit.reason === 'TEACHER_DAILY_LIMIT'
       ? 'ครูสอนเกิน 5 คาบต่อวันไม่ได้' : 'ครูสอนเกิน 3 คาบติดต่อกันไม่ได้', 'error');
@@ -1582,30 +2068,106 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
     }
   };
 
+  // STAGE 7: preserve selected generated lessons when re-running the scheduler.
+  const toggleKeepSchedule = async item => {
+    if(isScheduling||editingRows) return;
+    const target=schedules.find(x=>x.id===item.id);
+    if(!target) return;
+    if(!isAutoGeneratedSchedule(target) && target.source!=='auto')
+      return showToast('คาบที่เพิ่มด้วยมือถูกเก็บไว้เมื่อจัดใหม่อยู่แล้ว');
+    const next=target.keepOnRegenerate!==true;
+    const related=schedules.filter(x=>x.teacherId===target.teacherId&&x.subjectId===target.subjectId&&x.classroomId===target.classroomId);
+    const partner=Number(getSubject(target.subjectId)?.periodBlock)===2 ? findBlockPartner(target,related,periods) : null;
+    const affected=partner?[target,partner]:[target];
+    setEditingRows(true);
+    try {
+      const snapshotId=await saveScheduleVersion('before_toggle_keep');
+      if(!snapshotId) throw new Error('สร้างจุดย้อนกลับไม่สำเร็จ');
+      const batch=writeBatch(db);
+      const termPath=`school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
+      affected.forEach(row=>batch.set(doc(db,`${termPath}/schedules`,row.id),{...row,keepOnRegenerate:next}));
+      await batch.commit();
+      showToast(next?'ล็อกคาบไว้สำหรับการจัดใหม่แล้ว':'ปลดล็อกคาบสำหรับจัดใหม่แล้ว');
+    }catch(error){console.error(error);showToast('เปลี่ยนสถานะล็อกไม่สำเร็จ','error');}
+    finally{setEditingRows(false);}
+  };
+
+  // STAGE 8: drop keeps source room/teacher/subject, and moves Block-2 pairs together.
+  const moveScheduleByDrag = async (scheduleId, targetDay, targetPeriodId) => {
+    if(isScheduling || editingRows || !rulesReady) return;
+    let movePlan;
+    try {
+      movePlan=buildScheduleDragPlan({schedules,sourceId:scheduleId,targetDay,targetPeriodId,
+        periods,subject:getSubject(schedules.find(s=>s.id===scheduleId)?.subjectId)});
+    }catch(error){return showToast('ย้ายไม่ได้: '+error.message,'error');}
+    const {source,moved,planned,remaining}=movePlan;
+    if(planned.every((item,i)=>item.day===moved[i].day&&item.periodId===moved[i].periodId)) return;
+    const maps=buildConstraintMaps(remaining,unavailabilities,classroomUnavailabilities,fixedSchedules,periods,customRules,activityGroups);
+    const entries=planned.map(x=>({day:x.day,periodId:x.periodId}));
+    for(const item of planned){
+      const valid=canPlaceSchedule(item.teacherId,item.classroomId,item.day,item.periodId,maps,false,item.subjectId);
+      if(!valid.ok) return showToast(`ย้ายไม่ได้: ${valid.reason}`,'error');
+    }
+    if(!canPlaceTeacherEntries(source.teacherId,entries,maps).ok || !canPlaceSubjectDailyEntries(source,entries,maps).ok)
+      return showToast('ย้ายไม่ได้ เพราะเกินข้อบังคับครูหรือวิชาในวันเดียวกัน','error');
+    const outcome=findTeacherTeachingLimitConflicts([...remaining,...planned,...fixedSchedules,...activityTeacherEntries(activityGroups,fixedSchedules)],periods,teachers);
+    if(outcome.length) return showToast('ย้ายไม่ได้: '+outcome[0],'error');
+    const subjectIssues=findSubjectDailyLimitConflicts([...remaining,...planned,...fixedSchedules],classrooms,customRules);
+    if(subjectIssues.length) return showToast('ย้ายไม่ได้: '+subjectIssues[0],'error');
+    if(!window.confirm(`ย้าย ${moved.length} คาบ ไปวัน${targetDay} คาบ ${targetPeriodId} และตำแหน่งติดกัน (ถ้ามี) ใช่หรือไม่?`)) return;
+    setEditingRows(true);
+    try {
+      const termPath=`school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
+      // Check the affected source documents from server to avoid a stale drag.
+      for(const item of moved){
+        const snap=await getDocFromServer(doc(db,`${termPath}/schedules`,item.id));
+        if(!snap.exists() || !areFirestoreRecordsEqual({...snap.data(),id:snap.id},item))
+          throw new Error('คาบต้นทางมีการเปลี่ยนแปลง กรุณาโหลดหน้าใหม่');
+      }
+      const latest=await getDocsFromServer(collection(db,`${termPath}/schedules`));
+      const now=latest.docs.map(d=>({...d.data(),id:d.id}));
+      if(fingerprintScheduleRows(now)!==fingerprintScheduleRows(schedules))
+        throw new Error('ตารางถูกแก้จากเครื่องอื่น โปรดลองใหม่');
+      const snapshotId=await saveScheduleVersion('before_drag_move');
+      if(!snapshotId) throw new Error('สร้างจุดย้อนกลับไม่สำเร็จ');
+      const batch=writeBatch(db);
+      planned.forEach(item=>batch.set(doc(db,`${termPath}/schedules`,item.id),item));
+      await batch.commit();
+      showToast(`ย้ายคาบสำเร็จ ${planned.length} คาบ`);
+    } catch(error) { console.error(error);showToast('ย้ายคาบไม่สำเร็จ: '+error.message,'error'); }
+    finally {setEditingRows(false);}
+  };
+
   const getCellContent = (day, periodId) => {
      if (!selectedId) return null;
      const cellSch = schedules.filter(s => viewMode === 'room' ? s.classroomId === selectedId && s.day === day && s.periodId === periodId : s.teacherId === selectedId && s.day === day && s.periodId === periodId);
      const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? fixedAppliesToClassroom(f, selectedId) && f.day === day && f.periodId === periodId : f.teacherId === selectedId && f.day === day && f.periodId === periodId);
-     if (cellSch.length === 0 && cellFix.length === 0) return null;
-     const isConflict = cellSch.length + cellFix.length > 1;
+     const cellGroups = viewMode==='teacher' ? activityGroups.filter(g=>g.teacherId===selectedId && fixedSchedules.some(f=>f.id===g.fixedId && f.day===day && f.periodId===periodId)) : [];
+     if (cellSch.length === 0 && cellFix.length === 0 && cellGroups.length===0) return null;
+     const isConflict = cellSch.length + cellFix.length + cellGroups.length > 1;
 
      return (
        <div className={`p-1.5 h-full w-full rounded-xl flex flex-col items-center justify-center text-xs text-center border-l-4 shadow-sm relative group ${isConflict ? 'bg-rose-50 border-rose-500' : 'bg-white border-[#d4af37]'}`}>
          {isConflict && <div className="absolute -top-2 -right-2 text-rose-500 bg-rose-100 rounded-full p-0.5 shadow-sm"><AlertCircle size={14}/></div>}
          {cellFix.map((f, idx) => (
            <div key={f.id} className={idx > 0 || cellSch.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
-             <div className="font-bold text-amber-700 flex items-center justify-center gap-1"><Pin size={10}/> {getSubject(f.subjectId).name}</div>
+             <div className="font-bold text-amber-700 flex items-center justify-center gap-1"><Pin size={10}/> {viewMode==='room' && f.classroomId===ALL_CLASSROOMS_ID
+               ? (activityGroups.find(g=>g.fixedId===f.id&&g.classroomId===selectedId)?.name || getSubject(f.subjectId).name)
+               : getSubject(f.subjectId).name}</div>
              <button onClick={(e) => { e.stopPropagation(); handleRequestDelete('fixed', f); }} className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-rose-500 text-white rounded-full p-0.5 z-10"><X size={12}/></button>
            </div>
          ))}
+         {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{g.name} · {getClassroom(g.classroomId).name}</div>)}
          {cellSch.map((sch, idx) => (
-           <div key={sch.id} className={idx > 0 || cellFix.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
+           <div key={sch.id} draggable={!isScheduling&&!editingRows} onDragStart={e=>{e.dataTransfer.setData('text/plain',sch.id);e.dataTransfer.effectAllowed='move';}}
+             title="ลากเพื่อย้ายคาบ หรือกดไอคอนเพื่อเก็บคาบนี้เมื่อจัดใหม่" className={idx > 0 || cellFix.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
              <div className="font-bold text-[#081a39] truncate">{getSubject(sch.subjectId).name}</div>
              {viewMode === 'room' ? (
                <><div className="text-slate-600 truncate">{getShortTeacherName(getTeacher(sch.teacherId).name)}</div></>
              ) : (
                <><div className="text-slate-600 truncate">{getClassroom(sch.classroomId).name}</div></>
              )}
+             <button onClick={e=>{e.stopPropagation();toggleKeepSchedule(sch);}} title={sch.keepOnRegenerate?'ปลดล็อกคาบ':'ล็อกคาบไว้เมื่อจัดใหม่'} className="absolute top-0 left-0 text-xs text-indigo-700 bg-indigo-50 rounded p-0.5 z-10">{sch.keepOnRegenerate?'🔒':'🔓'}</button>
              <button onClick={(e) => { e.stopPropagation(); handleRequestDelete('schedule', sch); }} className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-rose-500 text-white rounded-full p-0.5 z-10"><X size={12}/></button>
            </div>
          ))}
@@ -1620,7 +2182,11 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
           <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId('');}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">ตารางเรียน (รายห้อง)</option><option value="teacher">ตารางสอน (รายครู)</option></select>
           <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
         </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-indigo-700 font-medium">ลากคาบเรียนเพื่อย้ายได้ · คลิก 🔓 เพื่อเก็บไว้เมื่อจัดใหม่ · ล็อกไว้ {schedules.filter(s=>s.keepOnRegenerate).length} คาบ · จัดใหม่เฉพาะคาบ Auto ที่ไม่ล็อก</span>
+          <button onClick={handleFeasibilityClick} disabled={isScheduling || !rulesReady} className="flex items-center gap-2 px-4 py-3 bg-slate-100 text-[#081a39] border border-slate-200 rounded-xl font-bold disabled:opacity-50"><Search size={17}/> ตรวจความเป็นไปได้</button>
         <button onClick={runSmartSchedule} disabled={isScheduling} className={`flex items-center gap-2 px-6 py-3 text-white rounded-xl shadow-md font-bold transition-all ${isScheduling ? 'bg-slate-400 cursor-not-allowed' : 'bg-gradient-to-r from-[#d4af37] to-[#b8952b] hover:shadow-lg'}`}><RefreshCw size={18} className={isScheduling ? "animate-spin" : ""} /> {isScheduling ? "กำลังจัดตาราง (AI)..." : "จัดตารางอัตโนมัติ"}</button>
+        </div>
       </div>
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto p-4 min-h-[500px]">
         <table className="w-full text-left border-collapse min-w-[900px] table-fixed">
@@ -1630,7 +2196,10 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
               <tr key={day} className="border-b border-slate-100 group"><td className="p-4 font-bold text-center bg-slate-50 border-r border-slate-100 text-[#081a39]">{day}</td>{periods.map(p => {
                   const content = getCellContent(day, p.id);
                   return (
-                    <td key={`${day}-${p.id}`} className={`p-1.5 border-r border-slate-100 h-28 align-top relative group/cell ${p.isBreak ? 'bg-slate-50/80' : (selectedId ? 'hover:bg-slate-50 cursor-pointer' : '')}`} onClick={() => { if (!p.isBreak && selectedId) handleCellClick(day, p.id); }}>
+                    <td key={`${day}-${p.id}`} className={`p-1.5 border-r border-slate-100 h-28 align-top relative group/cell ${p.isBreak ? 'bg-slate-50/80' : (selectedId ? 'hover:bg-slate-50 cursor-pointer' : '')}`}
+                      onDragOver={e=>{if(!p.isBreak&&selectedId)e.preventDefault();}}
+                      onDrop={e=>{e.preventDefault();const sourceId=e.dataTransfer.getData('text/plain');if(sourceId&&!p.isBreak)moveScheduleByDrag(sourceId,day,p.id);}}
+                      onClick={() => { if (!p.isBreak && selectedId) handleCellClick(day, p.id); }}>
                       {p.isBreak ? <div className="h-full flex items-center justify-center text-slate-400 text-sm font-bold opacity-60">พักเที่ยง</div> : <>{content}{!content && selectedId && !isScheduling && <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/cell:opacity-100 transition-opacity"><div className="bg-[#081a39]/5 p-2 rounded-full text-[#081a39]/40"><Plus size={24} /></div></div>}</>}
                     </td>
                   );
@@ -1640,6 +2209,17 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
           </tbody>
         </table>
       </div>
+      <Modal isOpen={!!feasibility} onClose={() => setFeasibility(null)} title="วิเคราะห์ความเป็นไปได้ก่อนจัดตาราง">
+        {feasibility && <div className="space-y-4 text-sm">
+          <p className="text-slate-700">ภาระสอน {feasibility.totalRequired} คาบ · {feasibility.teacherCount} ครู · {feasibility.roomCount} ห้อง · {feasibility.activePeriods} คาบเรียนต่อวัน</p>
+          {feasibility.invalidInputs.length > 0 ? <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg"><strong>ข้อมูลต้องแก้ก่อนจัดตาราง</strong><ul className="list-disc pl-5 mt-2 space-y-1">{feasibility.invalidInputs.map((msg,i)=><li key={i}>{msg}</li>)}</ul></div> :
+           feasibility.blocking.length > 0 ? <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg"><strong>พบข้อจำกัดด้านความจุที่ทำให้จัดครบไม่ได้</strong><ul className="list-disc pl-5 mt-2 space-y-1">{feasibility.blocking.map((msg,i)=><li key={i}>{msg}</li>)}</ul></div> :
+           <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg font-medium text-emerald-800">ยังไม่พบข้อจำกัดด้านความจุที่ยืนยันว่าจัดไม่ครบ</div>}
+          {feasibility.advisories.length > 0 && <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg"><strong>ข้อสังเกตเพิ่มเติม</strong><ul className="list-disc pl-5 mt-2 space-y-1">{feasibility.advisories.map((msg,i)=><li key={i}>{msg}</li>)}</ul></div>}
+          <p className="text-slate-500">การวิเคราะห์นี้เป็นการคัดกรองเบื้องต้น ไม่ใช่การทดลองแก้โจทย์ครบทุกความเป็นไปได้ และไม่รับประกันว่าการจัดตารางอัตโนมัติจะจัดได้ครบ</p>
+          <button onClick={()=>setFeasibility(null)} className="w-full p-3 bg-[#081a39] text-white rounded-xl font-bold">ปิดรายงาน</button>
+        </div>}
+      </Modal>
       <Modal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} title="เพิ่มตารางสอน (รายคาบ)">
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">วัน</label><input value={addForm.day} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div><div><label className="block text-sm font-bold mb-1">คาบที่</label><input value={periods.find(p=>p.id===addForm.periodId)?.name} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div></div>
@@ -1651,6 +2231,94 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
       </Modal>
     </div>
   );
+};
+
+// STAGE 5A: ประวัติตารางปัจจุบัน (อ่านอย่างเดียว ไม่กู้คืน/เขียนข้อมูล)
+const ScheduleHistoryView = ({ db, appId, schoolSettings, getTermKey, getSubject, getTeacher, getClassroom, readScheduleVersion, restoreScheduleVersion }) => {
+  const termKey = getTermKey(schoolSettings);
+  const [versions, setVersions] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [comparison, setComparison] = useState(null);
+  const [selectedId, setSelectedId] = useState('');
+  const termPath = `school_data/${appId}/terms/${termKey}`;
+
+  const refreshVersions = async () => {
+    setLoading(true); setError(''); setComparison(null);setSelectedId('');
+    try {
+      const snap = await getDocsFromServer(collection(db, `${termPath}/scheduleVersions`));
+      const records = snap.docs.map(d => ({ ...d.data(), id:d.id }))
+        .sort((a,b) => (Number(b.createdAt)||0) - (Number(a.createdAt)||0));
+      setVersions(records);
+    } catch (e) {
+      console.error('Read schedule history failed', e);
+      setVersions([]);setError('อ่านประวัติจากเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจอินเทอร์เน็ตและสิทธิ์ Firebase');
+    } finally { setLoading(false); }
+  };
+  useEffect(() => { refreshVersions(); }, [termKey]);
+
+  const compareVersion = async record => {
+    setLoading(true);setError('');setComparison(null);setSelectedId(record.id);
+    try {
+      const restored = await readScheduleVersion(termKey,record.id);
+      const [currentSchedules,currentFixed] = await Promise.all([
+        getDocsFromServer(collection(db, `${termPath}/schedules`)),
+        getDocsFromServer(collection(db, `${termPath}/fixedSchedules`)),
+      ]);
+      const newSchedules = currentSchedules.docs.map(d => ({ ...d.data(), id:d.id }));
+      const newFixed = currentFixed.docs.map(d => ({ ...d.data(), id:d.id }));
+      setComparison({ record, fingerprints:{ schedules:fingerprintScheduleRows(newSchedules), fixedSchedules:fingerprintScheduleRows(newFixed) },
+        regular:compareScheduleSnapshotRows(newSchedules,restored.schedules),
+        fixed:compareScheduleSnapshotRows(newFixed,restored.fixedSchedules),
+      });
+    } catch (e) {
+      console.error('Compare schedule history failed', e);
+      setError(e.message === 'UNSUPPORTED_HISTORY_FORMAT'
+        ? 'ไฟล์ประวัตินี้เป็นรูปแบบที่ยังไม่รองรับการเทียบ กรุณาอย่าใช้คืนค่า'
+        : 'อ่านตารางล่าสุดจากเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่');
+    } finally { setLoading(false); }
+  };
+  const describeItem = item => `${getSubject(item.subjectId)?.name || item.subjectId || '-'} / ${getClassroom(item.classroomId)?.name || item.classroomId || '-'} / ${getTeacher(item.teacherId)?.name || '-'} / วัน${item.day || '-'} คาบ ${item.periodId || '-'}`;
+  const changeRows = diff => [
+    ...diff.added.map(item=>({label:'เพิ่มในตารางปัจจุบัน',item})),
+    ...diff.deleted.map(item=>({label:'มีในประวัติ แต่ไม่มีในปัจจุบัน',item})),
+    ...diff.changed.map(pair=>({label:'เปลี่ยนรายละเอียด',item:pair.after,was:pair.before})),
+  ];
+
+  return <div className="space-y-5 animate-in fade-in">
+    <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 flex flex-wrap items-center justify-between gap-3">
+      <div><h2 className="text-xl font-bold text-[#081a39] flex gap-2 items-center"><Clock size={20}/> ประวัติและเปรียบเทียบตาราง</h2>
+        <p className="text-sm text-slate-500 mt-1">ภาคเรียน {termKey} · ตรวจและเปรียบเทียบก่อนกู้คืน · รองรับประวัติรูปแบบเก่า</p>
+      </div>
+      <button disabled={loading} onClick={refreshVersions} className="px-4 py-2 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">โหลดประวัติใหม่</button>
+    </div>
+    {error && <p role="alert" className="bg-rose-50 text-rose-700 border border-rose-200 rounded-xl p-4">{error}</p>}
+    <div className="bg-white border rounded-2xl p-5 space-y-3">
+      <h3 className="font-bold">รายการเวอร์ชันที่บันทึกไว้ ({versions.length})</h3>
+      {loading && <p className="text-slate-500">กำลังอ่านข้อมูลจาก Firebase...</p>}
+      {!loading && versions.length===0 && !error && <p className="text-slate-500">ยังไม่พบประวัติที่บันทึกไว้ในภาคเรียนนี้</p>}
+      {versions.map(v=><div key={v.id} className="flex flex-wrap items-center gap-2 justify-between border-b pb-3 last:border-0">
+        <div><div className="font-bold">{Number.isFinite(Number(v.createdAt)) ? new Date(Number(v.createdAt)).toLocaleString('th-TH') : '-'} · {v.reason || 'ไม่มีเหตุผลกำกับ'}</div>
+          <p className="text-xs text-slate-500">ตารางสอน {Number(v.scheduleCount)||0} คาบ / กิจกรรมล็อก {Number(v.fixedScheduleCount)||0} รายการ</p></div>
+        <button disabled={loading} onClick={()=>compareVersion(v)} className="px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-50 disabled:opacity-50">เปรียบเทียบ</button>
+      </div>)}
+    </div>
+    {comparison && selectedId===comparison.record.id && <div className="bg-white border rounded-2xl p-5 space-y-4">
+      <h3 className="font-bold text-lg">เปรียบเทียบตารางปัจจุบันกับประวัติที่เลือก</h3>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {[['ตารางสอน',comparison.regular],['กิจกรรมล็อก',comparison.fixed]].map(([name,diff])=><div key={name} className="border rounded-xl p-4">
+          <div className="font-bold mb-1">{name}</div>
+          <p className="text-sm text-slate-600">เพิ่มในปัจจุบัน {diff.added.length} · ไม่มีแล้ว {diff.deleted.length} · เปลี่ยนรายละเอียด {diff.changed.length} · เหมือนเดิม {diff.identical}</p>
+          <ul className="list-disc pl-5 mt-2 max-h-56 overflow-y-auto text-xs text-slate-600 space-y-2">
+            {changeRows(diff).slice(0,80).map((row,i)=><li key={i}><strong>{row.label}:</strong> {describeItem(row.item)}{row.was && <div className="text-slate-500">เดิม: {describeItem(row.was)}</div>}</li>)}
+          </ul>
+          {changeRows(diff).length>80 && <p className="text-amber-700 text-xs mt-2">แสดงรายละเอียดสูงสุด 80 รายการ แต่ยอดรวมแสดงครบ</p>}
+        </div>)}
+      </div>
+      <p className="text-sm text-slate-500">การกู้คืนจะตรวจความขัดแย้งกับข้อมูลปัจจุบันและสร้างจุดย้อนกลับก่อนเสมอ</p>
+      <button disabled={loading} onClick={()=>restoreScheduleVersion(comparison.record.id,comparison.fingerprints)} className="w-full px-4 py-3 bg-amber-600 text-white rounded-xl font-bold disabled:opacity-50">กู้คืนตารางเวอร์ชันที่เลือก (ต้องยืนยัน)</button>
+    </div>}
+  </div>;
 };
 
 const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSettings, schedules, fixedSchedules, getSubject, getTeacher, getClassroom }) => {
@@ -1717,6 +2385,8 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
               {health.breakConflicts.map((c,i) => <li key={`bc-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.blockConflicts.map((c,i) => <li key={`block-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.teacherLimitConflicts.map((c,i) => <li key={`limit-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
+              {health.customRuleConflicts.map((c,i) => <li key={`rule-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
+              {health.subjectDailyConflicts.map((c,i) => <li key={`daily-${i}`} className="p-2 bg-rose-50 rounded border border-rose-100">{c}</li>)}
               {health.orphans.map((c,i) => <li key={`oc-${i}`} className="p-2 bg-slate-100 rounded border border-slate-300">ข้อมูลสูญหาย: {c}</li>)}
               {health.status === 'empty' && <li className="text-slate-600 p-2 bg-slate-50 rounded border border-slate-200">ยังไม่มีภาระสอน กรุณานำเข้าหรือเพิ่มข้อมูลก่อนจัดตาราง</li>}
               {health.status === 'ready' && <li className="text-emerald-600 font-bold p-2 bg-emerald-50 rounded border border-emerald-100">ตรวจสอบผ่าน: ไม่พบข้อผิดพลาดร้ายแรง</li>}
@@ -1804,14 +2474,17 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
   );
 };
 
-const PrintView = ({ schedules, classrooms, teachers, periods, schoolSettings, getSubject, getShortTeacherName, getClassroom, getTeacher, fixedSchedules }) => {
+const PrintView = ({ activityGroups, schedules, classrooms, teachers, periods, schoolSettings, getSubject, getShortTeacherName, getClassroom, getTeacher, fixedSchedules }) => {
   const [viewMode, setViewMode] = useState('room');
   const [selectedId, setSelectedId] = useState('');
 
   const getCellContent = (targetId, day, periodId, vMode) => {
     const cellSchedules = schedules.filter(s => vMode === 'room' ? s.classroomId === targetId && s.day === day && s.periodId === periodId : s.teacherId === targetId && s.day === day && s.periodId === periodId);
     const cellFixed = fixedSchedules.filter(f => vMode === 'room' ? fixedAppliesToClassroom(f, targetId) && f.day === day && f.periodId === periodId : f.teacherId === targetId && f.day === day && f.periodId === periodId);
-    const combined = [...cellFixed, ...cellSchedules];
+    const groupTeacherRows = vMode==='teacher' ? activityTeacherEntries(activityGroups,fixedSchedules)
+      .filter(item=>item.teacherId===targetId&&item.day===day&&item.periodId===periodId)
+      .map(item=>({...item,groupLabel:activityGroups.find(g=>`activity_${g.id}`===item.id)?.name})) : [];
+    const combined = [...cellFixed, ...cellSchedules,...groupTeacherRows];
     if (combined.length === 0) return null;
     return (
       <div className="flex flex-col items-center justify-center text-[11px] text-center w-full h-full">
@@ -1819,9 +2492,9 @@ const PrintView = ({ schedules, classrooms, teachers, periods, schoolSettings, g
           <div key={sch.id} className={`w-full ${idx > 0 ? 'mt-1 pt-1 border-t border-black/20' : ''}`}>
             <div className={`font-bold truncate text-[11px] ${cellFixed.includes(sch) ? 'text-amber-800' : ''}`}>{sch.subjectId}</div>
             {vMode === 'room' ? (
-               <><div className="truncate text-[11px]">{sch.teacherId ? getShortTeacherName(getTeacher(sch.teacherId).name) : '-'}</div><div className="text-[10px] truncate">{getSubject(sch.subjectId).name}</div></>
+               <><div className="truncate text-[11px]">{sch.teacherId ? getShortTeacherName(getTeacher(sch.teacherId).name) : '-'}</div><div className="text-[10px] truncate">{sch.groupLabel || (vMode==='room' && sch.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===sch.id&&g.classroomId===targetId)?.name : '') || getSubject(sch.subjectId).name}</div></>
              ) : (
-               <><div className="truncate text-[11px]">{getClassroom(sch.classroomId).name}</div><div className="text-[10px] truncate">{getSubject(sch.subjectId).name}</div></>
+               <><div className="truncate text-[11px]">{getClassroom(sch.classroomId).name}</div><div className="text-[10px] truncate">{sch.groupLabel || (vMode==='room' && sch.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===sch.id&&g.classroomId===targetId)?.name : '') || getSubject(sch.subjectId).name}</div></>
              )}
           </div>
         ))}
@@ -1886,17 +2559,22 @@ export default function App() {
   const [classroomUnavailabilities, setClassroomUnavailabilities] = useState([]);
   const [fixedSchedules, setFixedSchedules] = useState([]);
   const [schedules, setSchedules] = useState([]);
+  const [customRules, setCustomRules] = useState([]);
+  const [activityGroups,setActivityGroups] = useState([]);
+  const [rulesLoadedTerm, setRulesLoadedTerm] = useState('');
+  const [groupsLoadedTerm,setGroupsLoadedTerm] = useState('');
   
   const [isScheduling, setIsScheduling] = useState(false);
   const [scheduleResult, setScheduleResult] = useState(null);
   const [autoScheduleIssues, setAutoScheduleIssues] = useState([]);
 
   const getTermKey = (settings) => `${settings?.academicYear || '2569'}-${settings?.semester || '1'}`;
+  const rulesReady = !!user && rulesLoadedTerm === getTermKey(schoolSettings) && groupsLoadedTerm === getTermKey(schoolSettings);
 
   const health = useMemo(() => {
-    if (!periods || periods.length === 0) return { status: teachingLoads.length === 0 ? 'empty' : 'warning', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherLimitConflicts: [], teacherStats: {} };
-    return calculateScheduleHealth(schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods);
-  }, [schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods]);
+    if (!periods || periods.length === 0) return { status: teachingLoads.length === 0 ? 'empty' : 'warning', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherLimitConflicts: [], customRuleConflicts: [], subjectDailyConflicts: [], teacherStats: {} };
+    return calculateScheduleHealth(schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods, customRules, activityGroups);
+  }, [schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods, customRules, activityGroups]);
 
   useEffect(() => {
     signInAnonymously(auth).catch(err => console.error(err));
@@ -1927,6 +2605,8 @@ export default function App() {
     if (!user || !schoolSettings.academicYear || !schoolSettings.semester) return;
     const termKey = getTermKey(schoolSettings);
     const termPath = `school_data/${appId}/terms/${termKey}`;
+    setRulesLoadedTerm('');
+    setGroupsLoadedTerm('');
     let unsubscribers = [];
     const createTermListener = (col, setter) => onSnapshot(collection(db, `${termPath}/${col}`), snap => setter(snap.docs.map(doc => ({ ...doc.data(), id: doc.id }))));
 
@@ -1935,6 +2615,14 @@ export default function App() {
     unsubscribers.push(createTermListener('classroomUnavailabilities', setClassroomUnavailabilities));
     unsubscribers.push(createTermListener('fixedSchedules', setFixedSchedules));
     unsubscribers.push(createTermListener('schedules', setSchedules));
+    unsubscribers.push(onSnapshot(collection(db,`${termPath}/activityGroups`), snap=>{
+      setActivityGroups(snap.docs.map(d=>({...d.data(),id:d.id})));
+      setGroupsLoadedTerm(termKey);
+    },error=>{console.error('Load activity groups failed',error);setGroupsLoadedTerm('');}));
+    unsubscribers.push(onSnapshot(collection(db, `${termPath}/scheduleRules`), snap => {
+      setCustomRules(snap.docs.map(item => ({ ...item.data(), id: item.id })));
+      setRulesLoadedTerm(termKey);
+    }, error => { console.error('Load schedule rules failed', error); setRulesLoadedTerm(''); }));
 
     return () => unsubscribers.forEach(unsub => unsub && unsub());
   }, [user, schoolSettings.academicYear, schoolSettings.semester]);
@@ -1943,7 +2631,7 @@ export default function App() {
 
   const dbAction = async (collectionName, id, data, action = 'set') => {
     if (!user) return false;
-    const isTermData = ['teachingLoads', 'schedules', 'unavailabilities', 'classroomUnavailabilities', 'fixedSchedules'].includes(collectionName);
+    const isTermData = ['teachingLoads', 'schedules', 'unavailabilities', 'classroomUnavailabilities', 'fixedSchedules', 'scheduleRules', 'activityGroups'].includes(collectionName);
     const basePath = isTermData ? `school_data/${appId}/terms/${getTermKey(schoolSettings)}` : `school_data/${appId}`;
     try {
       if (action === 'set') await setDoc(doc(db, `${basePath}/${collectionName}`, id), { ...(data || {}), id });
@@ -2097,6 +2785,8 @@ export default function App() {
   };
 
   const handleRequestDelete = (type, item) => {
+    if(type==='fixed' && activityGroups.some(g=>g.fixedId===item.id))
+      return showToast('ต้องลบกิจกรรมย่อยของทุกห้องที่อ้างถึงกิจกรรมนี้ก่อน','error');
     let errors = [];
     let scheduleDeleteItems = [item];
     let deleteMessage = 'ข้อมูลนี้จะถูกลบถาวร ดำเนินการต่อหรือไม่?';
@@ -2282,54 +2972,135 @@ export default function App() {
     return snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
   };
 
-  const pruneScheduleVersions = async (termPath) => {
-    try {
-      const versionsSnapshot = await getDocs(collection(db, `${termPath}/scheduleVersions`));
-      const versions = versionsSnapshot.docs
-        .map(d => ({ ref: d.ref, createdAt: Number(d.data()?.createdAt) || 0 }))
-        .sort((a, b) => b.createdAt - a.createdAt);
-      const excess = versions.slice(SCHEDULE_VERSION_LIMIT);
-      if (excess.length > 0) await commitOperationsInChunks(excess.map(v => ({ type: 'delete', ref: v.ref })));
-    } catch (error) {
-      console.error('Prune schedule versions failed', error);
+  // STAGE 5B: history manifests point to bounded-size documents. The manifest is
+  // committed LAST, so incomplete chunk uploads are not advertised as restorable.
+  const readScheduleVersion = async (termKey, versionId) => {
+    const versionPath = `school_data/${appId}/terms/${termKey}/scheduleVersions/${versionId}`;
+    const header = await getDocFromServer(doc(db, versionPath));
+    if (!header.exists()) throw new Error('ไม่พบประวัติตารางนี้');
+    const data = header.data();
+    if (Array.isArray(data.schedules) && Array.isArray(data.fixedSchedules)) return {
+      ...data, id:versionId, schedules:data.schedules.map(cleanScheduleSnapshotItem),
+      fixedSchedules:data.fixedSchedules.map(cleanScheduleSnapshotItem),
+    }; // preserve legacy format
+    if (data.formatVersion !== 2 || data.state !== 'ready' || !Number.isInteger(data.chunkCount) ||
+      data.chunkCount < 0 || data.chunkCount > 1000) throw new Error('รูปแบบประวัติไม่ถูกต้องหรือยังบันทึกไม่สำเร็จ');
+    const chunkSnap = await getDocsFromServer(collection(db, `${versionPath}/chunks`));
+    if (chunkSnap.docs.length !== data.chunkCount) throw new Error('ประวัติตารางมีชิ้นส่วนไม่ครบ');
+    const byId = new Map(chunkSnap.docs.map(d => [d.id,d.data()]));
+    const result={ schedules:[], fixedSchedules:[] };
+    for(let i=0;i<data.chunkCount;i++) {
+      const part=byId.get(`part_${String(i).padStart(5,'0')}`);
+      if(!part || !Array.isArray(part.schedules) || !Array.isArray(part.fixedSchedules)) throw new Error('ประวัติตารางมีชิ้นส่วนเสียหาย');
+      result.schedules.push(...part.schedules);
+      result.fixedSchedules.push(...part.fixedSchedules);
     }
+    if(result.schedules.length!==data.scheduleCount || result.fixedSchedules.length!==data.fixedScheduleCount ||
+      fingerprintScheduleRows(result.schedules)!==data.scheduleFingerprint ||
+      fingerprintScheduleRows(result.fixedSchedules)!==data.fixedFingerprint) throw new Error('ข้อมูลประวัติไม่ตรงกับรายการที่บันทึกไว้');
+    return { ...data, id:versionId, ...result };
   };
-
+  const pruneScheduleVersions = async termPath => {
+    try {
+      const snapshot = await getDocsFromServer(collection(db, `${termPath}/scheduleVersions`));
+      const versions=snapshot.docs.map(d=>({ref:d.ref, data:d.data()}))
+        .sort((a,b)=>(Number(b.data.createdAt)||0)-(Number(a.data.createdAt)||0));
+      for(const item of versions.slice(SCHEDULE_VERSION_LIMIT)) {
+        // Delete child documents first; deleting a Firestore parent does not delete children.
+        const children=await getDocsFromServer(collection(db, `${item.ref.path}/chunks`));
+        for(const part of children.docs) await deleteDoc(part.ref);
+        await deleteDoc(item.ref);
+      }
+    } catch(error) { console.error('Prune schedule versions failed; old history retained',error); }
+  };
   const saveScheduleVersion = async (reason = 'manual_snapshot', scheduleItems = schedules, fixedItems = fixedSchedules, explicitTermKey = null) => {
     if (!user) return null;
+    const termKey=explicitTermKey || getTermKey(schoolSettings);
+    if (!/^\d{4}-[12]$/.test(termKey)) return null;
+    const termPath=`school_data/${appId}/terms/${termKey}`;
+    const versionRef=doc(collection(db, `${termPath}/scheduleVersions`));
+    const regular=(Array.isArray(scheduleItems)?scheduleItems:[]).map(cleanScheduleSnapshotItem);
+    const fixed=(Array.isArray(fixedItems)?fixedItems:[]).map(cleanScheduleSnapshotItem);
+    const chunks=makeScheduleSnapshotChunks(regular,fixed);
+    const saved=[];
     try {
-      const termKey = explicitTermKey || getTermKey(schoolSettings);
-      if (!termKey) return null;
-      const termPath = `school_data/${appId}/terms/${termKey}`;
-      const versionRef = doc(collection(db, `${termPath}/scheduleVersions`));
-      const safeSchedules = (Array.isArray(scheduleItems) ? scheduleItems : []).map(cleanScheduleSnapshotItem);
-      const safeFixedSchedules = (Array.isArray(fixedItems) ? fixedItems : []).map(cleanScheduleSnapshotItem);
-      await setDoc(versionRef, {
-        id: versionRef.id,
-        createdAt: Date.now(),
-        reason: String(reason || 'manual_snapshot'),
-        scheduleCount: safeSchedules.length,
-        fixedScheduleCount: safeFixedSchedules.length,
-        schedules: safeSchedules,
-        fixedSchedules: safeFixedSchedules,
-      });
-      await pruneScheduleVersions(termPath);
-      return versionRef.id;
-    } catch (error) {
-      console.error('Save schedule version failed', error);
+      for(let i=0;i<chunks.length;i++) {
+        const partRef=doc(db, `${versionRef.path}/chunks/part_${String(i).padStart(5,'0')}`);
+        await setDoc(partRef,chunks[i]);saved.push(partRef);
+      }
+      await setDoc(versionRef, { id:versionRef.id, formatVersion:2,state:'ready',createdAt:Date.now(),
+        reason:String(reason || 'manual_snapshot'),scheduleCount:regular.length,fixedScheduleCount:fixed.length,
+        chunkCount:chunks.length,scheduleFingerprint:fingerprintScheduleRows(regular),
+        fixedFingerprint:fingerprintScheduleRows(fixed) });
+    } catch(error) {
+      console.error('Save schedule version failed; no ready manifest created',error);
+      for(const part of saved) try { await deleteDoc(part); } catch(cleanupError) { console.error('Orphan history chunk',cleanupError); }
       return null;
     }
+    await pruneScheduleVersions(termPath);
+    return versionRef.id;
+  };
+
+  // STAGE 5C: restores both the regular and fixed collection as ONE atomic write.
+  // Reject obsolete previews and invalid historical references before any write.
+  const restoreScheduleVersion = (versionId, expectedFingerprints) => {
+    const termKey=getTermKey(schoolSettings);
+    setConfirmData({ type:'restore',title:'ยืนยันกู้คืนตารางสอน',confirmText:'กู้คืนเวอร์ชันนี้',
+      message:`ระบบจะเปลี่ยนตารางสอนและกิจกรรมล็อกของภาคเรียน ${termKey} กลับไปตามประวัติที่เลือก\nจะบันทึกจุดย้อนกลับของตารางปัจจุบันก่อน และไม่เปลี่ยนข้อมูลครู/ภาระสอน ยืนยันหรือไม่?`,
+      action:async()=>{
+        setConfirmData(prev=>({...prev,isLoading:true}));
+        try {
+          if (getTermKey(schoolSettings)!==termKey) throw new Error('ภาคเรียนเปลี่ยนไป');
+          const restored=await readScheduleVersion(termKey,versionId);
+          const path=`school_data/${appId}/terms/${termKey}`;
+          const [liveSch,liveFix] = await Promise.all([
+            getDocsFromServer(collection(db,`${path}/schedules`)),
+            getDocsFromServer(collection(db,`${path}/fixedSchedules`)),
+          ]);
+          const previousSchedules=liveSch.docs.map(x=>({...x.data(),id:x.id}));
+          const previousFixed=liveFix.docs.map(x=>({...x.data(),id:x.id}));
+          if (fingerprintScheduleRows(previousSchedules)!==expectedFingerprints.schedules ||
+              fingerprintScheduleRows(previousFixed)!==expectedFingerprints.fixedSchedules)
+            throw new Error('ตารางเปลี่ยนหลังเปิดหน้าประวัติ กรุณาโหลดและเปรียบเทียบใหม่');
+          const healthCheck=calculateScheduleHealth(restored.schedules,teachingLoads,unavailabilities,
+            classroomUnavailabilities,restored.fixedSchedules,teachers,subjects,classrooms,periods,customRules,activityGroups);
+          if (healthCheck.status==='error') throw new Error('ประวัตินี้ขัดกับข้อมูลหรือข้อบังคับปัจจุบัน กรุณาตรวจภาระสอนและเงื่อนไขก่อน');
+          const [regularPlan,fixedPlan] = await Promise.all([
+            prepareCollectionReplacement(`${path}/schedules`,restored.schedules),
+            prepareCollectionReplacement(`${path}/fixedSchedules`,restored.fixedSchedules),
+          ]);
+          const operations=[...regularPlan.operations,...fixedPlan.operations];
+          assertAtomicWriteCapacity(operations);
+          const rollbackId=await saveScheduleVersion('before_history_restore',previousSchedules,previousFixed,termKey);
+          if (!rollbackId) throw new Error('สร้างจุดย้อนกลับไม่สำเร็จ ระบบจึงไม่เปลี่ยนตาราง');
+          // Re-check immediately before commit. Multi-client edits racing the commit
+          // still require a shared version fence enforced by Security Rules/backend.
+          const [checkSch,checkFixed]=await Promise.all([
+            getDocsFromServer(collection(db,`${path}/schedules`)),
+            getDocsFromServer(collection(db,`${path}/fixedSchedules`)),
+          ]);
+          if(fingerprintScheduleRows(checkSch.docs.map(d=>({...d.data(),id:d.id})))!==expectedFingerprints.schedules ||
+             fingerprintScheduleRows(checkFixed.docs.map(d=>({...d.data(),id:d.id})))!==expectedFingerprints.fixedSchedules)
+            throw new Error('ข้อมูลตารางเปลี่ยนขณะกู้คืน จึงยกเลิกโดยไม่เขียนทับ');
+          await commitAtomicOperations(operations);
+          setConfirmData(null);showToast('กู้คืนตารางสำเร็จ มีจุดย้อนกลับก่อนกู้คืนแล้ว');
+        } catch(error) { console.error('Restore history failed',error);setConfirmData(null);
+          showToast(`กู้คืนไม่สำเร็จ: ${error.message}`,'error'); }
+      }
+    });
   };
 
   const handleRestoreBackup = (jsonData) => {
     const backupTermKey = jsonData?.termKey || (jsonData?.schoolSettings ? getTermKey(jsonData.schoolSettings) : '');
     const backupCollections = ['teachers', 'subjects', 'classrooms', 'periods', 'teachingLoads', 'unavailabilities', 'classroomUnavailabilities', 'fixedSchedules', 'schedules'];
+    // Older v2 backups do not contain scheduleRules. Preserve live rules for those backups.
+    const restoreCollections = [...backupCollections, ...(Array.isArray(jsonData?.scheduleRules)?['scheduleRules']:[]), ...(Array.isArray(jsonData?.activityGroups)?['activityGroups']:[])];
     if (!jsonData || jsonData.backupVersion !== 2 || jsonData.appId !== appId || !/^\d{4}-[12]$/.test(backupTermKey) || !backupCollections.every(key => Array.isArray(jsonData[key]))) {
       return showToast("ไฟล์สำรองข้อมูลไม่ครบ หรือไม่ตรงระบบและภาคเรียนที่รองรับ", "error");
     }
 
     setConfirmData({
-      type: 'restore', title: 'นำเข้าข้อมูล', message: `เขียนทับตารางเดิมสำหรับเทอม ${backupTermKey} ใช่หรือไม่?`, confirmText: 'นำเข้า',
+      type: 'restore', title: 'นำเข้าข้อมูล', message: `เขียนทับตารางเดิมสำหรับเทอม ${backupTermKey} ใช่หรือไม่?${!Array.isArray(jsonData.scheduleRules) ? '\nไฟล์นี้ไม่มีเงื่อนไขเพิ่มเติม ระบบจะเก็บเงื่อนไขปัจจุบันไว้' : ''}`, confirmText: 'นำเข้า',
       action: async () => {
         setConfirmData(prev => ({ ...prev, isLoading: true }));
         try {
@@ -2339,7 +3110,7 @@ export default function App() {
           // STEP 03: Plan ALL nine collections first; one batch commits everything or nothing.
           const plans = {};
           const allOperations = [];
-          for (const colName of backupCollections) {
+          for (const colName of restoreCollections) {
             const collectionPath = masterNames.includes(colName) ? `${basePath}/${colName}` : `${targetTermPath}/${colName}`;
             const plan = await prepareCollectionReplacement(collectionPath, jsonData[colName]);
             plans[colName] = plan;
@@ -2368,7 +3139,7 @@ export default function App() {
   // Keep this local to the preview/commit flow; no changes to regular CRUD or scheduler algorithm.
   const schedulePreviewCollectionNames = [
     'schedules', 'fixedSchedules', 'teachingLoads', 'unavailabilities',
-    'classroomUnavailabilities', 'teachers', 'subjects', 'classrooms', 'periods',
+    'classroomUnavailabilities', 'teachers', 'subjects', 'classrooms', 'periods', 'scheduleRules', 'activityGroups',
   ];
   const captureSchedulePreviewSource = (data, termKey) => {
     const fingerprints = {};
@@ -2383,15 +3154,16 @@ export default function App() {
   };
   const currentSchedulePreviewSource = () => captureSchedulePreviewSource({
     schedules, fixedSchedules, teachingLoads, unavailabilities,
-    classroomUnavailabilities, teachers, subjects, classrooms, periods,
+    classroomUnavailabilities, teachers, subjects, classrooms, periods, scheduleRules: customRules, activityGroups,
   }, getTermKey(schoolSettings));
 
   const runSmartSchedule = async () => {
     if (isScheduling) return;
+    if (!rulesReady) return showToast('ยังโหลดเงื่อนไขเพิ่มเติมไม่สำเร็จ จึงไม่เริ่มจัดตาราง', 'error');
     // STEP 04: แจ้งรายการที่ต้องแก้ก่อนขอล็อกหรือเริ่มสร้างตาราง
     const issues = validateAutoScheduleInputs({
       teachingLoads, teachers, subjects, classrooms, periods, schedules, fixedSchedules,
-      unavailabilities, classroomUnavailabilities, semester: schoolSettings.semester,
+      unavailabilities, classroomUnavailabilities, semester: schoolSettings.semester, customRules, activityGroups,
     });
     if (issues.length) { setAutoScheduleIssues(issues); return; }
     setAutoScheduleIssues([]);
@@ -2420,7 +3192,7 @@ export default function App() {
         const preservedSchedules = schedules
           .filter(s => !isAutoGeneratedSchedule(s))
           .map(s => ({ ...cleanScheduleSnapshotItem(s), source: s.source || 'manual' }));
-        const baseMaps = buildConstraintMaps(preservedSchedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
+        const baseMaps = buildConstraintMaps(preservedSchedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods, customRules, activityGroups);
         const loadKeys = new Set(teachingLoads.map(getTeachingLoadKey));
         const fixedByLoad = new Map();
         const preservedByLoad = new Map();
@@ -2453,7 +3225,7 @@ export default function App() {
           days.forEach(day => {
             activePeriods.forEach(period => {
               if (allowedIds && !allowedIds.has(period.id)) return;
-              const valid = canPlaceSchedule(load.teacherId, load.classroomId, day, period.id, maps, false);
+              const valid = canPlaceSchedule(load.teacherId, load.classroomId, day, period.id, maps, false, load.subjectId);
               if (valid.ok) options.push([{ day, periodId: period.id }]);
             });
           });
@@ -2464,11 +3236,11 @@ export default function App() {
           const options = [];
           DAYS.forEach(day => {
             periodContext.doublePairs.forEach(([p1, p2]) => {
-              const valid1 = canPlaceSchedule(load.teacherId, load.classroomId, day, p1.id, maps, false);
-              const valid2 = canPlaceSchedule(load.teacherId, load.classroomId, day, p2.id, maps, false);
+              const valid1 = canPlaceSchedule(load.teacherId, load.classroomId, day, p1.id, maps, false, load.subjectId);
+              const valid2 = canPlaceSchedule(load.teacherId, load.classroomId, day, p2.id, maps, false, load.subjectId);
               if (valid1.ok && valid2.ok) {
                 const pair = [{ day, periodId: p1.id }, { day, periodId: p2.id }];
-                if (canPlaceTeacherEntries(load.teacherId, pair, maps).ok) options.push(pair);
+                if (canPlaceTeacherEntries(load.teacherId, pair, maps).ok && canPlaceSubjectDailyEntries(load, pair, maps).ok) options.push(pair);
               }
             });
           });
@@ -2522,6 +3294,7 @@ export default function App() {
               generatedSchedule.push(item);
               if (load.teacherId) currentMaps.teacherPlacements.add(`${load.teacherId}_${entry.day}_${entry.periodId}`);
               registerTeacherPeriod(currentMaps, item);
+              registerSubjectDayPeriod(currentMaps, item);
               currentMaps.roomPlacements.add(`${load.classroomId}_${entry.day}_${entry.periodId}`);
               registerPlacementState(placementState, item);
             });
@@ -2556,7 +3329,7 @@ export default function App() {
               for (const anchorItem of companionTargets) {
                 if (remain <= 0) break;
                 const options = getCompanionOptions(load, anchorItem, currentMaps);
-                const chosen = choosePlacementOption(options, load, placementState, periodContext, getSubject, random);
+                const chosen = choosePlacementOption(options, load, placementState, periodContext, getSubject, random, customRules);
                 if (chosen) addEntries(load, chosen);
                 else mandatoryBlockMissing += 1;
                 remain -= 1;
@@ -2573,7 +3346,7 @@ export default function App() {
                 options = enumerateSingleOptions(load, currentMaps);
               }
               if (options.length === 0) break;
-              const chosen = choosePlacementOption(options, load, placementState, periodContext, getSubject, random);
+              const chosen = choosePlacementOption(options, load, placementState, periodContext, getSubject, random, customRules);
               if (!chosen) break;
               addEntries(load, chosen);
               remain -= placementSize;
@@ -2587,7 +3360,7 @@ export default function App() {
           }
 
           const fullSchedule = [...preservedSchedules, ...generatedSchedule];
-          const score = calculateScheduleScore([...fixedTeachingSchedules, ...fullSchedule], teachers, subjects, periodContext, getSubject);
+          const score = calculateScheduleScore([...fixedTeachingSchedules, ...fullSchedule], teachers, subjects, periodContext, getSubject, customRules);
           const missingCount = currentUnassigned.reduce((acc, curr) => acc + (Number(curr.missing) || 0), 0);
           const finalScore = score - (missingCount * 1000);
           const signature = generatedSchedule
@@ -2629,6 +3402,7 @@ export default function App() {
 
         const candidates = candidatePool.slice(0, SCHEDULER_CANDIDATE_KEEP);
         const bestCandidate = candidates[0] || { schedule: preservedSchedules, generatedSchedule: [], preservedCount: preservedSchedules.length, unassigned: [], score: -Infinity, missingCount: 0, generationId: String(runSeed) };
+        if (findSubjectDailyLimitConflicts([...fixedSchedules, ...bestCandidate.schedule], classrooms, customRules).length) throw new Error('SUBJECT_DAILY_LIMIT_FAILED');
         if (findTeacherTeachingLimitConflicts([...fixedSchedules, ...bestCandidate.schedule], periods, teachers).length) {
           throw new Error('TEACHER_HARD_LIMIT_FAILED');
         }
@@ -2691,7 +3465,7 @@ export default function App() {
           }
           const serverData = {};
           await Promise.all(schedulePreviewCollectionNames.map(async name => {
-            const isTermData = ['schedules', 'fixedSchedules', 'teachingLoads', 'unavailabilities', 'classroomUnavailabilities'].includes(name);
+            const isTermData = ['schedules', 'fixedSchedules', 'teachingLoads', 'unavailabilities', 'classroomUnavailabilities', 'scheduleRules', 'activityGroups'].includes(name);
             const path = isTermData ? `${termPath}/${name}` : `${basePath}/${name}`;
             const snap = await getDocsFromServer(collection(db, path));
             const records = snap.docs.map(d => ({ ...d.data(), id: d.id }));
@@ -2759,11 +3533,11 @@ export default function App() {
   const TABS = [
     { id: 'dashboard', name: 'หน้าแรก', icon: LayoutDashboard }, { id: 'teachers', name: 'ข้อมูลครู', icon: Users }, { id: 'subjects', name: 'รายวิชา', icon: BookOpen },
     { id: 'classrooms', name: 'ห้องเรียน', icon: Home }, { id: 'loads', name: 'ภาระสอน', icon: Briefcase }, { id: 'constraints', name: 'ข้อจำกัดเวลา', icon: Clock },
-    { id: 'schedule', name: 'จัดตารางสอน', icon: CalendarDays }, { id: 'reports', name: 'รายงานและ Export', icon: Activity }, { id: 'print', name: 'พิมพ์ตาราง', icon: Printer },
+    { id: 'rules', name: 'เงื่อนไขเพิ่มเติม', icon: Filter }, { id:'activityGroups',name:'กิจกรรมกลุ่ม',icon:Users }, { id: 'schedule', name: 'จัดตารางสอน', icon: CalendarDays }, { id: 'history', name: 'ประวัติตาราง', icon: Clock }, { id: 'reports', name: 'รายงานและ Export', icon: Activity }, { id: 'print', name: 'พิมพ์ตาราง', icon: Printer },
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, bulkDeleteSubjects, renameSubjectId, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, bulkDeleteSubjects, renameSubjectId, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, activityGroups, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
@@ -2804,7 +3578,10 @@ export default function App() {
           {activeTab === 'classrooms' && <ClassroomsView {...commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
           {activeTab === 'loads' && <LoadsView {...commonProps} />}
           {activeTab === 'constraints' && <ConstraintsView {...commonProps} />}
+          {activeTab === 'rules' && <CustomRulesView {...commonProps} />}
+          {activeTab === 'activityGroups' && <ActivityGroupsView {...commonProps} />}
           {activeTab === 'schedule' && <ScheduleView {...commonProps} runSmartSchedule={runSmartSchedule} isScheduling={isScheduling} />}
+          {activeTab === 'history' && <ScheduleHistoryView key={getTermKey(schoolSettings)} {...commonProps} />}
           {activeTab === 'reports' && <ReportsView {...commonProps} />}
           {activeTab === 'print' && <PrintView {...commonProps} />}
         </div>
@@ -2833,7 +3610,24 @@ export default function App() {
                 <div className="bg-rose-50 p-3 font-bold text-rose-700 flex items-center gap-2 border-b border-rose-200"><AlertTriangle size={18}/> รายการที่จัดไม่ได้ (รอแก้ไข/จัดด้วยมือ)</div>
                 <div className="max-h-48 overflow-y-auto bg-white p-3 space-y-2">
                   {scheduleResult.unassigned.map((u, i) => (
-                    <div key={i} className="text-sm flex justify-between border-b pb-2 last:border-0 last:pb-0"><div><span className="font-bold text-[#081a39]">{getSubject(u.subjectId).name}</span> ห้อง {getClassroom(u.classroomId).name}</div><div className="text-rose-600 text-right">ขาด {u.missing} คาบ<div className="text-[10px] text-slate-500">{u.reason}</div></div></div>
+                    <div key={i} className="text-sm border-b pb-3 last:border-0 last:pb-0 space-y-2">
+                      <div className="flex justify-between gap-3"><div><span className="font-bold text-[#081a39]">{getSubject(u.subjectId).name}</span> ห้อง {getClassroom(u.classroomId).name} · {getTeacher(u.teacherId).name}</div><div className="text-rose-600 font-bold whitespace-nowrap">ขาด {u.missing} คาบ</div></div>
+                      <details className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <summary className="font-bold cursor-pointer text-[#081a39]">ดูสาเหตุที่เป็นไปได้และแนวทางแก้</summary>
+                        {(() => {
+                          const diag = describeUnassignedReasons({ load:u, schedules:scheduleResult.schedule,
+                            fixedSchedules, periods, unavailabilities, classroomUnavailabilities, customRules });
+                          return <div className="mt-2 space-y-2 text-slate-700">
+                            <p>ช่องเดี่ยวที่วางเพิ่มได้ในตารางผลลัพธ์ปัจจุบัน: {diag.singleOptions} ช่อง</p>
+                            {u.reason !== 'NO_AVAILABLE_SLOT' && <p>ผลการวางคาบคู่ที่ว่างพร้อมกัน: {diag.pairOptions} คู่</p>}
+                            <p className="font-semibold">สาเหตุที่พบจากช่องซึ่งถูกปฏิเสธ (มากสุด 3 กลุ่ม):</p>
+                            {diag.topReasons.length ? <ul className="list-disc pl-5">{diag.topReasons.map(r=><li key={r.code}>{r.label} — {r.count} ช่อง</li>)}</ul> : <p>ยังมีช่องเดี่ยวที่ว่างบางส่วน อาจต้องจัดลำดับหรือจับคู่คาบใหม่</p>}
+                            <p className="text-blue-900 font-medium">ข้อเสนอ: {diag.suggestion}</p>
+                            <p className="text-xs text-slate-500">เป็นการอธิบายจากสภาพตารางผลลัพธ์ ไม่ใช่ข้อสรุปว่าสาเหตุนั้นทำให้จัดไม่ครบแน่นอน</p>
+                          </div>;
+                        })()}
+                      </details>
+                    </div>
                   ))}
                 </div>
               </div>
