@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, getDocs, getDocsFromServer, getDocFromServer, writeBatch, runTransaction } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, getDocs, getDocsFromServer, getDocFromServer, collectionGroup, query, where, writeBatch, runTransaction } from 'firebase/firestore';
 import { 
   FileJson, Settings, X, AlertCircle, CheckCircle2, Plus, Edit, Trash2, ChevronUp, ChevronDown, 
   ChevronsUpDown, Users, BookOpen, Home, Briefcase, CalendarDays, Printer, LayoutDashboard, 
@@ -71,6 +71,10 @@ const DEFAULT_PERIODS = [
 ];
 
 const DAYS = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์'];
+// STEP 10: กิจกรรมล็อกทุกห้องเก็บเป็นเอกสารเดียว (ครูผู้ดูแลไม่นับซ้ำหลายห้อง)
+const ALL_CLASSROOMS_ID = '__ALL_CLASSROOMS__';
+const fixedAppliesToClassroom = (fixedItem, classroomId) =>
+  fixedItem.classroomId === classroomId || fixedItem.classroomId === ALL_CLASSROOMS_ID;
 const SUBJECT_AREAS = [
   "ไม่มีกลุ่มสาระการเรียนรู้", "ภาษาไทย", "คณิตศาสตร์", "วิทยาศาสตร์และเทคโนโลยี", 
   "สังคมศึกษา ศาสนา และวัฒนธรรม", "สุขศึกษาและพลศึกษา", "ศิลปะ", "การงานอาชีพ", "ภาษาต่างประเทศ"
@@ -199,7 +203,7 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   
   const checkPlacement = (sch, isFixed = false) => {
     const teacherExists = !sch.teacherId || teacherMap.has(sch.teacherId);
-    const roomExists = roomMap.has(sch.classroomId);
+    const roomExists = roomMap.has(sch.classroomId) || (isFixed && sch.classroomId === ALL_CLASSROOMS_ID && classrooms.length > 0);
     const subjectExists = subjectMap.has(sch.subjectId);
     const dayExists = DAYS.includes(sch.day);
     const periodExists = validPeriodIds.has(sch.periodId);
@@ -217,13 +221,15 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
       tPlacement[tKey].push(sch);
     }
 
-    if (sch.classroomId) {
-      const rKey = `${sch.classroomId}_${sch.day}_${sch.periodId}`;
+    const roomIds = isFixed && sch.classroomId === ALL_CLASSROOMS_ID
+      ? classrooms.map(c => c.id) : (sch.classroomId ? [sch.classroomId] : []);
+    roomIds.forEach(roomId => {
+      const rKey = `${roomId}_${sch.day}_${sch.periodId}`;
       if (!rPlacement[rKey]) rPlacement[rKey] = [];
       rPlacement[rKey].push(sch);
-    }
+    });
 
-    const hasCompleteTeachingRef = Boolean(sch.teacherId && sch.subjectId && sch.classroomId);
+    const hasCompleteTeachingRef = Boolean(sch.teacherId && sch.subjectId && sch.classroomId !== ALL_CLASSROOMS_ID && sch.classroomId);
     const lKey = hasCompleteTeachingRef ? `${sch.teacherId}_${sch.subjectId}_${sch.classroomId}` : '';
     const matchedLoad = lKey ? loadTracker[lKey] : null;
 
@@ -345,7 +351,7 @@ const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak) 
   if (isBreak) return { ok: false, reason: "BREAK_PERIOD" };
   if (maps.cUnavailMap.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_UNAVAILABLE" };
   if (teacherId && maps.tUnavailMap.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_UNAVAILABLE" };
-  if (maps.fixedMap.has(`${day}_${periodId}_${classroomId}`)) return { ok: false, reason: "FIXED_SCHEDULE_CONFLICT" };
+  if (maps.fixedMap.has(`${day}_${periodId}_${classroomId}`) || maps.fixedMap.has(`${day}_${periodId}_${ALL_CLASSROOMS_ID}`)) return { ok: false, reason: "FIXED_SCHEDULE_CONFLICT" };
   if (maps.roomPlacements.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_CONFLICT" };
   if (teacherId && maps.teacherPlacements.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_CONFLICT" };
   const teachingLimit = canPlaceTeacherEntries(teacherId, [{ day, periodId }], maps);
@@ -402,22 +408,28 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
     const label = `${item.__kind} รายการที่ ${index + 1}`;
     if (item.teacherId && !teacherIds.has(String(item.teacherId))) addProblem(`${label}: ไม่พบครู ${item.teacherId}`);
     if (!validSubject(item.subjectId)) addProblem(`${label}: ไม่พบรายวิชา ${item.subjectId || '-'} ในภาคเรียนนี้`);
-    if (!classroomIds.has(String(item.classroomId))) addProblem(`${label}: ไม่พบห้อง ${item.classroomId || '-'}`);
+    const appliesToAll = item.__kind === 'กิจกรรมล็อก' && item.classroomId === ALL_CLASSROOMS_ID;
+    if (appliesToAll ? classrooms.length === 0 : !classroomIds.has(String(item.classroomId))) {
+      addProblem(`${label}: ไม่พบห้อง ${item.classroomId || '-'}`);
+    }
     if (!DAYS.includes(item.day)) addProblem(`${label}: วันไม่ถูกต้อง (${item.day || '-'})`);
     const period = periodById.get(String(item.periodId));
     if (!period || period.isBreak) addProblem(`${label}: คาบเรียนไม่ถูกต้องหรือเป็นคาบพัก (${item.periodId || '-'})`);
     const slotTeacher = JSON.stringify([item.teacherId, item.day, String(item.periodId)]);
-    const slotRoom = JSON.stringify([item.classroomId, item.day, String(item.periodId)]);
     if (item.teacherId) {
       if (usedTeachers.has(slotTeacher)) addProblem(`${label}: ครู ${item.teacherId} มีตารางซ้อนในวัน${item.day} คาบ ${item.periodId}`);
       usedTeachers.add(slotTeacher);
       if (unavailableTeachers.has(slotTeacher)) addProblem(`${label}: ครู ${item.teacherId} ถูกจัดในเวลาไม่สะดวก`);
     }
-    if (usedRooms.has(slotRoom)) addProblem(`${label}: ห้อง ${item.classroomId} มีตารางซ้อนในวัน${item.day} คาบ ${item.periodId}`);
-    usedRooms.add(slotRoom);
-    if (unavailableRooms.has(slotRoom)) addProblem(`${label}: ห้อง ${item.classroomId} ถูกจัดในเวลาที่ไม่ว่าง`);
+    const affectedRoomIds = appliesToAll ? classrooms.map(c => c.id) : [item.classroomId];
+    affectedRoomIds.forEach(roomId => {
+      const slotRoom = JSON.stringify([roomId, item.day, String(item.periodId)]);
+      if (usedRooms.has(slotRoom)) addProblem(`${label}: ห้อง ${roomId} มีตารางซ้อนในวัน${item.day} คาบ ${item.periodId}`);
+      usedRooms.add(slotRoom);
+      if (unavailableRooms.has(slotRoom)) addProblem(`${label}: ห้อง ${roomId} ถูกจัดในเวลาที่ไม่ว่าง`);
+    });
     if (item.__kind === 'ตารางที่จัดด้วยมือ' && !item.teacherId) addProblem(`${label}: ไม่ระบุครูผู้สอน`);
-    if (item.teacherId) {
+    if (item.teacherId && !appliesToAll) {
       const key = loadKey(item);
       if (loadByKey.has(key)) anchorCounts.set(key, (anchorCounts.get(key) || 0) + 1);
       else if (item.__kind === 'ตารางที่จัดด้วยมือ') addProblem(`${label}: ไม่มีภาระสอนรองรับครู ${item.teacherId} วิชา ${item.subjectId} ห้อง ${item.classroomId}`);
@@ -938,10 +950,11 @@ const getBulkDeletableSubjectIds = (subjectItems, teachingLoads, schedules, fixe
   return subjectItems.filter(item => !usedIds.has(item.id)).map(item => item.id);
 };
 
-const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixedSchedules, bulkDeleteSubjects, dbAction, showToast, handleRequestDelete, schoolSettings }) => {
+const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixedSchedules, bulkDeleteSubjects, renameSubjectId, dbAction, showToast, handleRequestDelete, schoolSettings }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [form, setForm] = useState({ id: '', name: '', abbr: '', periodsPerWeek: 1, term: '1', periodBlock: 1, preferredTime: 'any' });
   const [isEditing, setIsEditing] = useState(false);
+  const [originalSubjectId, setOriginalSubjectId] = useState('');
   const { items: sortedSubjects, requestSort, sortConfig } = useSortableData(activeSubjects);
   const [selectedSubjectIds, setSelectedSubjectIds] = useState([]);
   const deletableIds = useMemo(() => getBulkDeletableSubjectIds(activeSubjects, teachingLoads, schedules, fixedSchedules), [activeSubjects, teachingLoads, schedules, fixedSchedules]);
@@ -956,11 +969,20 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
   const toggleAllSubjects = () => setSelectedSubjectIds(allSelected ? [] : [...deletableIds]);
 
   const saveForm = async () => {
+    const nextId = String(form.id || '').trim();
     const periodsPerWeek = Number(form.periodsPerWeek);
-    if (!form.id || !form.name) return showToast("กรอกข้อมูลให้ครบ", "error");
+    if (!nextId || !String(form.name || '').trim()) return showToast("กรอกข้อมูลให้ครบ", "error");
+    if (nextId.includes('/') || nextId === '.' || nextId === '..') return showToast("รหัสวิชาไม่สามารถมี / หรือเป็น . หรือ .. ได้", "error");
     if (!Number.isInteger(periodsPerWeek) || periodsPerWeek < 1) return showToast("จำนวนคาบ/สัปดาห์ต้องเป็นจำนวนเต็มบวก", "error");
-    if (!isEditing && subjects.some(s => s.id === form.id)) return showToast("รหัสวิชานี้มีอยู่แล้ว", "error");
-    const ok = await dbAction('subjects', form.id, { ...form, periodsPerWeek, periodBlock: Number(form.periodBlock) });
+    if (subjects.some(s => s.id === nextId && (!isEditing || s.id !== originalSubjectId))) return showToast("รหัสวิชานี้มีอยู่แล้ว", "error");
+    const updated = { ...form, id: nextId, name: form.name.trim(), periodsPerWeek, periodBlock: Number(form.periodBlock) };
+    if (isEditing && originalSubjectId !== nextId) {
+      // Changing a subject code is a document-ID migration, not a simple field update.
+      // Only close this editor after the confirmed atomic migration succeeds.
+      await renameSubjectId(originalSubjectId, updated, () => setIsModalOpen(false));
+      return;
+    }
+    const ok = await dbAction('subjects', nextId, updated);
     if (ok) { setIsModalOpen(false); showToast(isEditing ? "บันทึกการแก้ไขสำเร็จ" : "เพิ่มรายวิชาสำเร็จ"); }
   };
 
@@ -968,7 +990,7 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
     <div className="animate-in fade-in space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
         <h2 className="text-xl font-bold text-[#081a39] flex items-center gap-2"><BookOpen className="text-[#d4af37]"/> รายวิชา <span className="text-sm font-normal text-slate-500 ml-2">(ภาคเรียนที่ {schoolSettings.semester})</span></h2>
-        <button onClick={() => {setForm({id:'', name:'', abbr:'', periodsPerWeek: 1, term: schoolSettings.semester, periodBlock: 1, preferredTime: 'any'}); setIsEditing(false); setIsModalOpen(true);}} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มรายวิชา</button>
+        <button onClick={() => {setForm({id:'', name:'', abbr:'', periodsPerWeek: 1, term: schoolSettings.semester, periodBlock: 1, preferredTime: 'any'}); setIsEditing(false); setOriginalSubjectId(''); setIsModalOpen(true);}} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มรายวิชา</button>
       </div>
       <div className="flex flex-wrap items-center gap-3 bg-white border border-slate-100 rounded-xl px-4 py-3">
         <button type="button" onClick={toggleAllSubjects} disabled={deletableIds.length === 0} className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold text-[#081a39] disabled:opacity-40 hover:bg-slate-50">{allSelected ? 'ยกเลิกเลือกทั้งหมด' : 'เลือกทั้งหมดที่ลบได้'}</button>
@@ -991,7 +1013,7 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
               <tr key={d.id} className={`border-b border-slate-50 hover:bg-[#081a39]/5 ${selectedValidIds.includes(d.id) ? 'bg-amber-50/40' : ''}`}>
                 <td className="p-4 text-center"><input type="checkbox" aria-label={`เลือกรายวิชา ${d.name} (${d.id})`} title={deletableSet.has(d.id) ? 'เลือกเพื่อลบ' : 'วิชานี้ถูกใช้งานอยู่ ไม่สามารถลบได้'} checked={selectedValidIds.includes(d.id)} disabled={!deletableSet.has(d.id)} onChange={() => toggleSubject(d.id)} className="w-4 h-4 accent-[#081a39] cursor-pointer disabled:cursor-not-allowed" /></td>
                 <td className="p-4 text-slate-500 font-mono text-sm">{d.id}</td><td className="p-4 font-medium text-[#081a39]">{d.name} <span className="text-xs text-slate-400">({d.abbr})</span>{!deletableSet.has(d.id) && <span className="ml-2 text-xs text-amber-700">(ถูกใช้งานอยู่)</span>}</td><td className="p-4 text-center font-bold text-[#d4af37]">{d.periodsPerWeek}</td>
-                <td className="p-4 text-center"><button onClick={() => { setForm({periodBlock: 1, preferredTime: 'any', ...d}); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39]"><Edit size={18}/></button><button onClick={() => handleRequestDelete('subject', d)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td>
+                <td className="p-4 text-center"><button onClick={() => { setForm({periodBlock: 1, preferredTime: 'any', ...d}); setOriginalSubjectId(d.id); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39]"><Edit size={18}/></button><button onClick={() => handleRequestDelete('subject', d)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td>
               </tr>
             ))}
           </tbody>
@@ -999,7 +1021,8 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
       </div>
       <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={isEditing ? 'แก้ไขรายวิชา' : 'เพิ่มรายวิชา'}>
         <div className="space-y-4">
-          <div><label className="block text-sm font-bold text-[#081a39] mb-1">รหัสวิชา</label><input value={form.id} onChange={e => setForm({...form, id: e.target.value})} disabled={isEditing} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50" /></div>
+          <div><label className="block text-sm font-bold text-[#081a39] mb-1">รหัสวิชา</label><input value={form.id} onChange={e => setForm({...form, id: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50" /></div>
+          {isEditing && originalSubjectId !== String(form.id || '').trim() && <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3">การเปลี่ยนรหัสวิชาจะขอยืนยันก่อน และอัปเดตภาระสอน ตารางสอน และกิจกรรมล็อกของทุกภาคเรียนพร้อมกัน หากตรวจข้อมูลข้ามภาคเรียนไม่ได้ ระบบจะไม่แก้รหัส</p>}
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">ชื่อวิชา</label><input value={form.name} onChange={e => setForm({...form, name: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50" /></div>
           <div className="grid grid-cols-2 gap-4">
             <div><label className="block text-sm font-bold mb-1">ชื่อย่อ</label><input value={form.abbr} onChange={e => setForm({...form, abbr: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50" /></div>
@@ -1351,10 +1374,16 @@ const ConstraintsView = ({ unavailabilities, classroomUnavailabilities, fixedSch
     } else if (type === 'fixed') {
       if (!fForm.subjectId || !fForm.classroomId) return showToast("กรุณาเลือกวิชาและห้อง", "error");
       const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods);
-      const valid = canPlaceSchedule(fForm.teacherId, fForm.classroomId, fForm.day, fForm.periodId, maps, false);
-      if (!valid.ok) {
-        const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้" };
-        return showToast(reasons[valid.reason] || "ไม่สามารถล็อกตารางในเวลานี้ได้", "error");
+      const targetRooms = fForm.classroomId === ALL_CLASSROOMS_ID ? classrooms : classrooms.filter(c => c.id === fForm.classroomId);
+      if (targetRooms.length === 0) return showToast("ยังไม่มีห้องเรียนให้ล็อกกิจกรรม", "error");
+      const selectedPeriod = periods.find(p => p.id === fForm.periodId);
+      if (!selectedPeriod || selectedPeriod.isBreak) return showToast("ไม่สามารถล็อกกิจกรรมในคาบพักหรือคาบที่ไม่มีอยู่", "error");
+      for (const room of targetRooms) {
+        const valid = canPlaceSchedule(fForm.teacherId, room.id, fForm.day, fForm.periodId, maps, false);
+        if (!valid.ok) {
+          const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้" };
+          return showToast(`${room.name}: ${reasons[valid.reason] || "ไม่สามารถล็อกตารางในเวลานี้ได้"}`, "error");
+        }
       }
       const id = `F_${Date.now()}`;
       const ok = await dbAction('fixedSchedules', id, { ...fForm, id });
@@ -1390,7 +1419,8 @@ const ConstraintsView = ({ unavailabilities, classroomUnavailabilities, fixedSch
           {activeSubTab === 'fixed' && (
             <div className="space-y-4">
               <select value={fForm.subjectId} onChange={e => setFForm({...fForm, subjectId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกวิชา / กิจกรรม --</option>{activeSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
-              <select value={fForm.classroomId} onChange={e => setFForm({...fForm, classroomId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
+              <select value={fForm.classroomId} onChange={e => setFForm({...fForm, classroomId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกห้องเรียน --</option><option value={ALL_CLASSROOMS_ID}>ทุกห้องเรียน</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
+              {fForm.classroomId === ALL_CLASSROOMS_ID && <p className="text-xs text-amber-700">กิจกรรมนี้จะปรากฏในตารางทุกห้อง หากห้องใดมีคาบอื่นอยู่แล้ว ระบบจะไม่บันทึก</p>}
               <select value={fForm.teacherId} onChange={e => setFForm({...fForm, teacherId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- ครูที่ดูแล (ไม่ระบุได้) --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
               <div className="grid grid-cols-2 gap-3"><select value={fForm.day} onChange={e => setFForm({...fForm, day: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50">{DAYS.map(d => <option key={d} value={d}>{d}</option>)}</select><select value={fForm.periodId} onChange={e => setFForm({...fForm, periodId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50">{periods.filter(p=>!p.isBreak).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
               <button onClick={() => handleAdd('fixed')} className="w-full bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึก</button>
@@ -1555,7 +1585,7 @@ const ScheduleView = ({ schedules, teachingLoads, classrooms, teachers, activeSu
   const getCellContent = (day, periodId) => {
      if (!selectedId) return null;
      const cellSch = schedules.filter(s => viewMode === 'room' ? s.classroomId === selectedId && s.day === day && s.periodId === periodId : s.teacherId === selectedId && s.day === day && s.periodId === periodId);
-     const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? f.classroomId === selectedId && f.day === day && f.periodId === periodId : f.teacherId === selectedId && f.day === day && f.periodId === periodId);
+     const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? fixedAppliesToClassroom(f, selectedId) && f.day === day && f.periodId === periodId : f.teacherId === selectedId && f.day === day && f.periodId === periodId);
      if (cellSch.length === 0 && cellFix.length === 0) return null;
      const isConflict = cellSch.length + cellFix.length > 1;
 
@@ -1654,7 +1684,7 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
              const row = [day, c.name];
              activePs.forEach(p => {
                const sch = schedules.filter(s => s.classroomId === c.id && s.day === day && s.periodId === p.id);
-               const fixed = fixedSchedules.filter(f => f.classroomId === c.id && f.day === day && f.periodId === p.id);
+               const fixed = fixedSchedules.filter(f => fixedAppliesToClassroom(f, c.id) && f.day === day && f.periodId === p.id);
                const combined = [...fixed, ...sch];
                row.push(combined.map(s => getSubject(s.subjectId).name).join(' + '));
              });
@@ -1758,7 +1788,7 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
                        <td className="p-2 border font-bold text-center bg-slate-50">{c.name}</td>
                        {periods.filter(p=>!p.isBreak).map(p => {
                          const sch = schedules.filter(s => s.classroomId === c.id && s.day === day && s.periodId === p.id);
-                         const fixed = fixedSchedules.filter(f => f.classroomId === c.id && f.day === day && f.periodId === p.id);
+                         const fixed = fixedSchedules.filter(f => fixedAppliesToClassroom(f, c.id) && f.day === day && f.periodId === p.id);
                          const combined = [...fixed, ...sch];
                          return <td key={p.id} className="p-1 border text-center h-12">{combined.map(s => <div key={s.id} className="font-bold truncate">{getSubject(s.subjectId).name}</div>)}</td>
                        })}
@@ -1780,7 +1810,7 @@ const PrintView = ({ schedules, classrooms, teachers, periods, schoolSettings, g
 
   const getCellContent = (targetId, day, periodId, vMode) => {
     const cellSchedules = schedules.filter(s => vMode === 'room' ? s.classroomId === targetId && s.day === day && s.periodId === periodId : s.teacherId === targetId && s.day === day && s.periodId === periodId);
-    const cellFixed = fixedSchedules.filter(f => vMode === 'room' ? f.classroomId === targetId && f.day === day && f.periodId === periodId : f.teacherId === targetId && f.day === day && f.periodId === periodId);
+    const cellFixed = fixedSchedules.filter(f => vMode === 'room' ? fixedAppliesToClassroom(f, targetId) && f.day === day && f.periodId === periodId : f.teacherId === targetId && f.day === day && f.periodId === periodId);
     const combined = [...cellFixed, ...cellSchedules];
     if (combined.length === 0) return null;
     return (
@@ -1920,6 +1950,96 @@ export default function App() {
       else if (action === 'delete') await deleteDoc(doc(db, `${basePath}/${collectionName}`, id));
       return true;
     } catch (e) { showToast("บันทึกไม่สำเร็จ", 'error'); return false; }
+  };
+
+  // STEP 09: Safely migrate a subject document ID and every term's live references.
+  // Fail CLOSED if cross-term collection-group queries or permissions are missing.
+  // Historical scheduleVersions / downloaded JSON backups are intentionally immutable.
+  const renameSubjectId = async (oldId, nextSubject, onSuccess) => {
+    const nextId = String(nextSubject?.id || '').trim();
+    if (!user) return showToast('กรุณาเข้าสู่ระบบก่อน', 'error');
+    if (!oldId || !nextId || oldId === nextId || nextId.includes('/') || nextId === '.' || nextId === '..') {
+      return showToast('รหัสวิชาใหม่ไม่ถูกต้อง', 'error');
+    }
+    const basePath = `school_data/${appId}`;
+    const oldRef = doc(db, `${basePath}/subjects`, oldId);
+    const nextRef = doc(db, `${basePath}/subjects`, nextId);
+    const referencedCollections = ['teachingLoads', 'schedules', 'fixedSchedules'];
+    const matchingTermPath = ref => {
+      const path = String(ref?.path || '');
+      const parts = path.split('/');
+      return parts.length === 6 && parts[0] === 'school_data' && parts[1] === appId &&
+        parts[2] === 'terms' && /^\d{4}-[12]$/.test(parts[3]) && referencedCollections.includes(parts[4]);
+    };
+    const readCrossTermReferences = async () => {
+      const snapshots = await Promise.all(referencedCollections.map(name =>
+        getDocsFromServer(query(collectionGroup(db, name), where('subjectId', '==', oldId)))
+      ));
+      const result = snapshots.flatMap(snap => snap.docs.filter(d => matchingTermPath(d.ref))
+        .map(d => ({ ref: d.ref, data: d.data() })));
+      return result.sort((a, b) => a.ref.path.localeCompare(b.ref.path));
+    };
+    const sameReferences = (a, b) => a.length === b.length && a.every((item, i) =>
+      item.ref.path === b[i].ref.path && areFirestoreRecordsEqual(item.data, b[i].data)
+    );
+    const explainError = error => {
+      if (error?.code === 'permission-denied' || error?.code === 'failed-precondition') {
+        return 'ยังตรวจภาระสอนทุกภาคเรียนไม่ได้ (สิทธิ์หรือดัชนี Collection Group) จึงไม่เปลี่ยนรหัสวิชา';
+      }
+      if (error?.message === 'SUBJECT_ID_TAKEN') return 'รหัสวิชาใหม่นี้มีอยู่แล้ว ไม่สามารถเปลี่ยนได้';
+      if (error?.message === 'SUBJECT_DATA_CHANGED' || error?.message === 'SUBJECT_REFS_CHANGED') return 'มีผู้แก้ข้อมูลรายวิชาหรือภาระสอนระหว่างดำเนินการ กรุณาตรวจสอบแล้วลองใหม่';
+      if (error?.code === 'ATOMIC_LIMIT' || error?.code === 'ATOMIC_SIZE') return error.message;
+      return 'เปลี่ยนรหัสวิชาไม่สำเร็จ ข้อมูลเดิมยังไม่ได้ถูกเปลี่ยน';
+    };
+    try {
+      const [oldSnap, nextSnap, initialRefs] = await Promise.all([
+        getDocFromServer(oldRef), getDocFromServer(nextRef), readCrossTermReferences(),
+      ]);
+      if (!oldSnap.exists()) throw new Error('SUBJECT_DATA_CHANGED');
+      if (nextSnap.exists()) throw new Error('SUBJECT_ID_TAKEN');
+      const originalData = oldSnap.data();
+      const countByCollection = name => initialRefs.filter(x => x.ref.path.split('/')[4] === name).length;
+      setConfirmData({
+        type: 'restore', title: 'ยืนยันเปลี่ยนรหัสวิชา', confirmText: 'ยืนยันเปลี่ยนรหัส',
+        message: `เปลี่ยนรหัส ${oldId} เป็น ${nextId} ใช่หรือไม่?\nภาระสอน ${countByCollection('teachingLoads')} รายการ / ตารางสอน ${countByCollection('schedules')} รายการ / กิจกรรมล็อก ${countByCollection('fixedSchedules')} รายการ (รวมทุกภาคเรียน)\nระบบจะเปลี่ยนข้อมูลเหล่านี้พร้อมกัน หากล้มเหลวจะไม่เปลี่ยนบางส่วน`,
+        action: async () => {
+          setConfirmData(prev => ({ ...prev, isLoading: true }));
+          try {
+            const liveRefs = await readCrossTermReferences();
+            if (!sameReferences(initialRefs, liveRefs)) throw new Error('SUBJECT_REFS_CHANGED');
+            const planned = [
+              { type: 'set', ref: nextRef, data: { ...nextSubject, id: nextId } },
+              { type: 'delete', ref: oldRef },
+              ...liveRefs.map(item => ({ type: 'set', ref: item.ref, data: { ...item.data, subjectId: nextId } })),
+            ];
+            assertAtomicWriteCapacity(planned);
+            await runTransaction(db, async transaction => {
+              // Read all target documents before starting any writes.
+              const [liveOld, liveNew, ...currentRefs] = await Promise.all([
+                transaction.get(oldRef), transaction.get(nextRef),
+                ...liveRefs.map(item => transaction.get(item.ref)),
+              ]);
+              if (!liveOld.exists() || !areFirestoreRecordsEqual(originalData, liveOld.data())) throw new Error('SUBJECT_DATA_CHANGED');
+              if (liveNew.exists()) throw new Error('SUBJECT_ID_TAKEN');
+              if (currentRefs.some((snap, i) => !snap.exists() || !areFirestoreRecordsEqual(snap.data(), liveRefs[i].data))) throw new Error('SUBJECT_REFS_CHANGED');
+              transaction.set(nextRef, { ...nextSubject, id: nextId });
+              liveRefs.forEach(item => transaction.update(item.ref, { subjectId: nextId }));
+              transaction.delete(oldRef);
+            });
+            setConfirmData(null);
+            onSuccess?.();
+            showToast(`เปลี่ยนรหัสวิชา ${oldId} → ${nextId} สำเร็จ`);
+          } catch (error) {
+            console.error('Rename subject ID failed', error);
+            showToast(explainError(error), 'error');
+            setConfirmData(prev => ({ ...prev, isLoading: false }));
+          }
+        }
+      });
+    } catch (error) {
+      console.error('Prepare subject ID rename failed', error);
+      showToast(explainError(error), 'error');
+    }
   };
 
   // STEP 08: Bulk subject delete uses the same reference guard as single delete,
@@ -2610,7 +2730,7 @@ export default function App() {
   const classroomLookup = useMemo(() => new Map(classrooms.map(c => [c.id, c])), [classrooms]);
   const getTeacher = (id) => teacherLookup.get(id) || { name: 'ไม่ทราบ' };
   const getSubject = (id) => subjectLookup.get(id) || { name: 'ไม่ทราบ', abbr: '-' };
-  const getClassroom = (id) => classroomLookup.get(id) || { name: 'ไม่ทราบ' };
+  const getClassroom = (id) => id === ALL_CLASSROOMS_ID ? { id, name: 'ทุกห้องเรียน' } : (classroomLookup.get(id) || { name: 'ไม่ทราบ' });
   const activeSubjects = useMemo(() => subjects.filter(s => !s.term || s.term === 'all' || s.term === schoolSettings.semester), [subjects, schoolSettings.semester]);
   const autoGenerateClassrooms = async () => {
     const existingIds = new Set(classrooms.map(c => c.id));
@@ -2643,7 +2763,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, bulkDeleteSubjects, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, bulkDeleteSubjects, renameSubjectId, showToast, handleRequestDelete, saveScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
