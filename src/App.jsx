@@ -159,7 +159,7 @@ const blocksCustomRule = (rules, item) => (rules || []).some(r => r.mode === 'bl
 const customRulePreferenceScore = (rules, item) => (rules || []).reduce((score, r) =>
   score + (r.mode === 'prefer' && customRuleMatches(r, item) ? 18 : 0), 0);
 
-const SCHEDULER_CONFIG = { candidateCount: 50, maxConsecutiveTeacherPeriods: 3, maxTeacherPeriodsPerDay: 5, candidateChoicePool: 4, placementJitter: 2.5, yieldEveryCandidates: 5 };
+const SCHEDULER_CONFIG = { candidateCount: 50, maxConsecutiveTeacherPeriods: 2, maxTeacherPeriodsPerDay: 4, candidateChoicePool: 4, placementJitter: 2.5, yieldEveryCandidates: 5 };
 const SCHEDULE_VERSION_LIMIT = 10;
 const SCHEDULER_CANDIDATE_KEEP = 3;
 const WEIGHTS = { BASE_SCORE: 10000, SUBJECT_SAME_DAY: -25, TEACHER_CONSECUTIVE: -35, TEACHER_GAP: -8, TEACHER_OVERLOAD: -40, WRONG_TIME_PREFERENCE: -8, DAILY_IMBALANCE: -4, GOOD_SPREAD: +12, NO_GAP: +4 };
@@ -708,7 +708,7 @@ const describeUnassignedReasons = ({ load, schedules, fixedSchedules, periods,
     BREAK_PERIOD: 'คาบพักกลางวัน', ROOM_UNAVAILABLE: 'ห้องเรียนไม่ว่างตามข้อจำกัด',
     TEACHER_UNAVAILABLE: 'ครูไม่สะดวกในคาบนี้', FIXED_SCHEDULE_CONFLICT: 'มีกิจกรรมล็อกคาบนี้',
     ROOM_CONFLICT: 'ห้องมีวิชาอื่นแล้ว', TEACHER_CONFLICT: 'ครูมีสอนอีกห้องในคาบนี้',
-    TEACHER_DAILY_LIMIT: 'ครูครบ 5 คาบต่อวัน', TEACHER_CONSECUTIVE_LIMIT: 'ครูติดกันเกิน 3 คาบ',
+    TEACHER_DAILY_LIMIT: 'ครูครบ 4 คาบต่อวัน', TEACHER_CONSECUTIVE_LIMIT: 'ครูติดกันเกิน 2 คาบ',
     SUBJECT_DAILY_LIMIT: 'วิชาเกินเพดานคาบต่อวัน', CUSTOM_RULE_BLOCKED: 'ขัดกับข้อบังคับเพิ่มเติม',
   };
   const hints = {
@@ -1733,7 +1733,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
       for (const room of targetRooms) {
         const valid = canPlaceSchedule(fForm.teacherId, room.id, fForm.day, fForm.periodId, maps, false, fForm.subjectId);
         if (!valid.ok) {
-          const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้", "CUSTOM_RULE_BLOCKED": "ขัดกับเงื่อนไขห้ามจัดที่ตั้งไว้", "SUBJECT_DAILY_LIMIT": "วิชานี้เต็มจำนวนคาบสูงสุดต่อวันของห้องแล้ว" };
+          const reasons = { "ROOM_UNAVAILABLE": "ห้องไม่ว่างในเวลานี้", "TEACHER_UNAVAILABLE": "ครูไม่สะดวกในเวลานี้", "FIXED_SCHEDULE_CONFLICT": "ห้องนี้มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีตารางอยู่แล้ว", "TEACHER_CONFLICT": "ครูมีตารางอยู่แล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 4 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 2 คาบติดต่อกันไม่ได้", "CUSTOM_RULE_BLOCKED": "ขัดกับเงื่อนไขห้ามจัดที่ตั้งไว้", "SUBJECT_DAILY_LIMIT": "วิชานี้เต็มจำนวนคาบสูงสุดต่อวันของห้องแล้ว" };
           return showToast(`${room.name}: ${reasons[valid.reason] || "ไม่สามารถล็อกตารางในเวลานี้ได้"}`, "error");
         }
       }
@@ -1842,7 +1842,7 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
       <div className="bg-white rounded-2xl border border-slate-100 p-6 max-w-4xl">
         <h2 className="text-xl font-bold text-[#081a39] mb-2">เงื่อนไขการจัดตารางเพิ่มเติม</h2>
         {!rulesReady && <p role="alert" className="text-rose-700 mb-3">กำลังโหลดเงื่อนไขจาก Firebase หรือไม่มีสิทธิ์อ่านข้อมูล กรุณาตรวจการเชื่อมต่อก่อนแก้ไข</p>}
-        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ข้อบังคับครูไม่เกิน 5 คาบ/วัน และ 3 คาบติดกันยังคงเดิม</p>
+        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ข้อบังคับครูไม่เกิน 4 คาบ/วัน และไม่เกิน 2 คาบติดกัน</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="text-sm font-bold">ประเภทข้อมูล<select className="w-full border rounded-xl p-3 mt-1" value={form.targetType} onChange={e => setForm(prev => ({ ...prev, targetType: e.target.value, targetId: '' }))}><option value="teacher">ครู</option><option value="subject">รายวิชา</option><option value="classroom">ห้องเรียน</option></select></label>
           <label className="text-sm font-bold">เลือกบุคคล/รายการ<select className="w-full border rounded-xl p-3 mt-1" value={form.targetId} onChange={e => setForm(prev => ({ ...prev, targetId: e.target.value }))}><option value="">-- เลือก --</option>{targets.map(x => <option key={x.id} value={x.id}>{x.name} ({x.id})</option>)}</select></label>
@@ -1894,7 +1894,7 @@ const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teacher
         return showToast('ครูติดเงื่อนไขห้ามจัดในช่วงเวลานี้','error');
       const extended=[...other,{teacherId:form.teacherId,day:root.day,periodId:root.periodId}];
       if(findTeacherTeachingLimitConflicts(extended,periods,teachers).length)
-        return showToast('เกินข้อบังคับ 5 คาบต่อวันหรือ 3 คาบติดกัน','error');
+        return showToast('เกินข้อบังคับ 4 คาบต่อวันหรือ 2 คาบติดกัน','error');
     }
     setBusy(true);
     try {
@@ -1994,7 +1994,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods, customRules, activityGroups);
     const selectedValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, addForm.periodId, maps, false, addForm.subjectId);
     if (!selectedValid.ok) {
-      const reasons = { "BREAK_PERIOD": "จัดลงคาบพักเที่ยงไม่ได้", "ROOM_UNAVAILABLE": "ห้องไม่สะดวก", "TEACHER_UNAVAILABLE": "ครูไม่สะดวก", "FIXED_SCHEDULE_CONFLICT": "มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีวิชาอื่นแล้ว", "TEACHER_CONFLICT": "ครูมีสอนแล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 5 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 3 คาบติดต่อกันไม่ได้", "CUSTOM_RULE_BLOCKED": "ขัดกับเงื่อนไขห้ามจัดที่ตั้งไว้", "SUBJECT_DAILY_LIMIT": "วิชานี้เต็มจำนวนคาบสูงสุดต่อวันของห้องแล้ว" };
+      const reasons = { "BREAK_PERIOD": "จัดลงคาบพักเที่ยงไม่ได้", "ROOM_UNAVAILABLE": "ห้องไม่สะดวก", "TEACHER_UNAVAILABLE": "ครูไม่สะดวก", "FIXED_SCHEDULE_CONFLICT": "มีกิจกรรมล็อกแล้ว", "ROOM_CONFLICT": "ห้องมีวิชาอื่นแล้ว", "TEACHER_CONFLICT": "ครูมีสอนแล้ว", "TEACHER_DAILY_LIMIT": "ครูสอนเกิน 4 คาบต่อวันไม่ได้", "TEACHER_CONSECUTIVE_LIMIT": "ครูสอนเกิน 2 คาบติดต่อกันไม่ได้", "CUSTOM_RULE_BLOCKED": "ขัดกับเงื่อนไขห้ามจัดที่ตั้งไว้", "SUBJECT_DAILY_LIMIT": "วิชานี้เต็มจำนวนคาบสูงสุดต่อวันของห้องแล้ว" };
       return showToast(reasons[selectedValid.reason] || "ติดเงื่อนไขจัดไม่ได้", "error");
     }
 
@@ -2047,7 +2047,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     if (!subjectLimit.ok) return showToast('วิชาเดียวกันเกินจำนวนคาบสูงสุดต่อวันของห้องนี้', 'error');
     const teacherLimit = canPlaceTeacherEntries(addForm.teacherId, plannedEntries, maps);
     if (!teacherLimit.ok) return showToast(teacherLimit.reason === 'TEACHER_DAILY_LIMIT'
-      ? 'ครูสอนเกิน 5 คาบต่อวันไม่ได้' : 'ครูสอนเกิน 3 คาบติดต่อกันไม่ได้', 'error');
+      ? 'ครูสอนเกิน 4 คาบต่อวันไม่ได้' : 'ครูสอนเกิน 2 คาบติดต่อกันไม่ได้', 'error');
 
     try {
       if (saveScheduleVersion) await saveScheduleVersion('before_manual_add');
