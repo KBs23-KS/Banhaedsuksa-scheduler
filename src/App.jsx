@@ -1367,7 +1367,8 @@ const buildDashboardOverview = ({ teachers = [], activeSubjects = [], classrooms
   classroomUnavailabilities = [], periods = [], health = {} }) => {
   const byRoom = new Map(classrooms.map(room => [room.id, {
     id: room.id, name: room.name || room.id, required: 0, scheduled: 0,
-    missing: 0, overScheduled: 0, activities: 0, blockedSlots: 0, status: 'unset'
+    missing: 0, overScheduled: 0, activities: 0, blockedSlots: 0,
+    availableSlots: 0, filledSlots: 0, unfilledSlots: 0, status: 'unset'
   }]));
   const keyOf = item => JSON.stringify([String(item.teacherId || ''), String(item.subjectId || ''), String(item.classroomId || '')]);
   const loadMap = new Map();
@@ -1411,9 +1412,21 @@ const buildDashboardOverview = ({ teachers = [], activeSubjects = [], classrooms
     if (!blockedByRoom.has(entry.classroomId)) blockedByRoom.set(entry.classroomId, new Set());
     blockedByRoom.get(entry.classroomId).add(JSON.stringify([entry.day, String(entry.periodId)]));
   });
+  const activeSlots=DAYS.flatMap(day=>periods.filter(p=>!p.isBreak).map(p=>JSON.stringify([day,String(p.id)])));
+  const slotsByRoom=new Map();
+  schedules.forEach(item=>{
+    if(!slotsByRoom.has(item.classroomId))slotsByRoom.set(item.classroomId,new Set());
+    slotsByRoom.get(item.classroomId).add(JSON.stringify([item.day,String(item.periodId)]));
+  });
   const rooms = [...byRoom.values()].map(room => {
     room.activities = activitiesByRoom.get(room.id)?.size || 0;
     room.blockedSlots = blockedByRoom.get(room.id)?.size || 0;
+    const blocked=blockedByRoom.get(room.id)||new Set();
+    const lessons=slotsByRoom.get(room.id)||new Set();
+    const activities=activitiesByRoom.get(room.id)||new Set();
+    room.availableSlots=activeSlots.filter(key=>!blocked.has(key)).length;
+    room.filledSlots=activeSlots.filter(key=>!blocked.has(key)&&(lessons.has(key)||activities.has(key))).length;
+    room.unfilledSlots=room.availableSlots-room.filledSlots;
     room.status = room.required === 0 ? 'unset' : room.missing === 0 && room.overScheduled === 0 ? 'complete' : 'incomplete';
     return room;
   }).sort((a, b) => a.name.localeCompare(b.name, 'th', { numeric: true }));
@@ -1444,6 +1457,7 @@ const buildDashboardOverview = ({ teachers = [], activeSubjects = [], classrooms
   const conflictCount = hardConflictKeys.reduce((sum, key) => sum + (health[key]?.length || 0), 0);
   return {
     rooms, fiveDays, heavyPatterns, conflictCount,
+    roomsWithOpenSlots:rooms.filter(room=>room.unfilledSlots>0).length,
     completeRooms: rooms.filter(room => room.status === 'complete').length,
     incompleteRooms: rooms.filter(room => room.status === 'incomplete').length,
     unsetRooms: rooms.filter(room => room.status === 'unset').length,
@@ -1497,6 +1511,11 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
         </div>
       </div>
 
+      {activeSubjects.some(subject=>subject.needsScheduleReview && teachingLoads.some(load=>load.subjectId===subject.id)) && <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+        <AlertTriangle size={18} className="text-amber-700"/>
+        <span className="text-sm text-amber-900 flex-1">มีรายวิชาใหม่จาก Excel ที่ยังไม่ได้ตรวจคาบเดี่ยว/คาบคู่และช่วงเวลาที่เหมาะสม ต้องตรวจในเมนูรายวิชาก่อนจัดอัตโนมัติ</span>
+        <button onClick={()=>onNavigate('basicData')} className="px-3 py-2 rounded-lg bg-amber-700 text-white text-sm font-bold">เปิดข้อมูลพื้นฐาน</button>
+      </div>}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         {[
           {label:'ครูทั้งหมด', count: summary.teacherCount, unit:'คน', icon: Users},
@@ -1518,6 +1537,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
             <div><h2 className="text-xl font-bold text-[#081a39]">สถานะการจัดตารางรายห้อง</h2><p className="text-xs text-slate-500 mt-1">นับเฉพาะภาระสอนรายวิชาที่กำหนดให้ห้อง ไม่ใช้เป้าหมาย 35 คาบเท่ากันทุกห้อง</p></div>
             <button onClick={() => onNavigate('schedule')} className="text-sm font-bold text-blue-700 hover:underline">ไปหน้าจัดตาราง →</button>
           </div>
+          <p className="text-xs text-blue-800 bg-blue-50 border border-blue-100 rounded-xl px-3 py-2 mb-3">แยก 2 สถานะ: <strong>ภาระวิชาจัดครบ</strong> กับ <strong>ช่องในตารางเรียนยังว่าง</strong> · ช่องว่างอาจตั้งใจเว้นไว้ได้ ไม่ถือว่าผิดโดยอัตโนมัติ</p>
           <div className="grid grid-cols-3 gap-2 mb-4 text-center">
             <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3"><p className="font-bold text-2xl text-emerald-700">{summary.completeRooms}</p><p className="text-xs text-emerald-800">ภาระครบ</p></div>
             <div className="bg-amber-50 border border-amber-100 rounded-xl p-3"><p className="font-bold text-2xl text-amber-700">{summary.incompleteRooms}</p><p className="text-xs text-amber-800">ยังไม่ครบ</p></div>
@@ -1539,7 +1559,8 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
                   <div className="flex items-center gap-2"><span className={`text-xs font-semibold px-2 py-1 rounded-full ${room.status==='complete'?'bg-emerald-100 text-emerald-700':room.status==='incomplete'?'bg-amber-100 text-amber-800':'bg-slate-200 text-slate-600'}`}>{room.status==='complete'?'ภาระครบ':room.status==='incomplete'?(room.missing > 0 ? `ขาด ${room.missing} คาบ` : 'จัดเกินภาระ'):'ยังไม่กำหนดภาระ'}</span><span className="text-sm text-blue-600">↗</span></div>
                 </div>
                 <div className="flex items-center gap-3 mt-2"><div className="flex-1 bg-slate-200 h-2 rounded-full overflow-hidden"><div className={`h-full rounded-full ${room.status==='complete'?'bg-emerald-500':'bg-amber-500'}`} style={{width:`${Math.min(100,percent)}%`}}></div></div><span className="text-xs text-slate-600 font-medium whitespace-nowrap">{room.scheduled}/{room.required} คาบ</span></div>
-                {(room.activities > 0 || room.blockedSlots > 0 || room.overScheduled > 0) && <p className="text-xs text-slate-500 mt-1.5">{[room.activities > 0 ? `กิจกรรมล็อก ${room.activities} คาบ` : '',room.blockedSlots > 0 ? `ปิดเวลา ${room.blockedSlots} คาบ` : '',room.overScheduled > 0 ? `จัดเกินภาระ ${room.overScheduled} คาบ` : ''].filter(Boolean).join(' · ')}</p>}
+                <p className="text-xs text-slate-600 mt-1.5">ตารางเรียน: ใช้แล้ว {room.filledSlots}/{room.availableSlots} ช่อง (ไม่รวมเวลาปิดเรียน){room.unfilledSlots>0?` · เหลือ ${room.unfilledSlots} ช่องให้ตรวจ`: ' · ไม่มีช่องว่าง'}</p>
+                {(room.activities > 0 || room.blockedSlots > 0 || room.overScheduled > 0) && <p className="text-xs text-slate-500 mt-1">{[room.activities > 0 ? `กิจกรรมล็อก ${room.activities} คาบ` : '',room.blockedSlots > 0 ? `ปิดเวลา ${room.blockedSlots} คาบ` : '',room.overScheduled > 0 ? `จัดเกินภาระ ${room.overScheduled} คาบ` : ''].filter(Boolean).join(' · ')}</p>}
               </button>;
             })}
           </div>
@@ -1772,7 +1793,8 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
     if (nextId.includes('/') || nextId === '.' || nextId === '..') return showToast("รหัสวิชาไม่สามารถมี / หรือเป็น . หรือ .. ได้", "error");
     if (!Number.isInteger(periodsPerWeek) || periodsPerWeek < 1) return showToast("จำนวนคาบ/สัปดาห์ต้องเป็นจำนวนเต็มบวก", "error");
     if (subjects.some(s => s.id === nextId && (!isEditing || s.id !== originalSubjectId))) return showToast("รหัสวิชานี้มีอยู่แล้ว", "error");
-    const updated = { ...form, id: nextId, name: form.name.trim(), periodsPerWeek, periodBlock: Number(form.periodBlock) };
+    const updated = { ...form, id: nextId, name: form.name.trim(), periodsPerWeek, periodBlock: Number(form.periodBlock),
+      needsScheduleReview: false }; // saving the subject editor confirms Block/preferred time
     if (isEditing && originalSubjectId !== nextId) {
       // Changing a subject code is a document-ID migration, not a simple field update.
       // Only close this editor after the confirmed atomic migration succeeds.
@@ -1809,7 +1831,7 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
             {sortedSubjects.map(d => (
               <tr key={d.id} className={`border-b border-slate-50 hover:bg-[#081a39]/5 ${selectedValidIds.includes(d.id) ? 'bg-amber-50/40' : ''}`}>
                 <td className="p-4 text-center"><input type="checkbox" aria-label={`เลือกรายวิชา ${d.name} (${d.id})`} title={deletableSet.has(d.id) ? 'เลือกเพื่อลบ' : 'วิชานี้ถูกใช้งานอยู่ ไม่สามารถลบได้'} checked={selectedValidIds.includes(d.id)} disabled={!deletableSet.has(d.id)} onChange={() => toggleSubject(d.id)} className="w-4 h-4 accent-[#081a39] cursor-pointer disabled:cursor-not-allowed" /></td>
-                <td className="p-4 text-slate-500 font-mono text-sm">{d.id}</td><td className="p-4 font-medium text-[#081a39]">{d.name} <span className="text-xs text-slate-400">({d.abbr})</span>{!deletableSet.has(d.id) && <span className="ml-2 text-xs text-amber-700">(ถูกใช้งานอยู่)</span>}</td><td className="p-4 text-center font-bold text-[#d4af37]">{d.periodsPerWeek}</td>
+                <td className="p-4 text-slate-500 font-mono text-sm">{d.id}</td><td className="p-4 font-medium text-[#081a39]">{d.name} <span className="text-xs text-slate-400">({d.abbr})</span>{d.needsScheduleReview&&<span className="ml-2 bg-amber-100 text-amber-800 rounded px-2 py-1 text-xs">ตรวจ Block และช่วงเวลา ก่อน Auto</span>}{!deletableSet.has(d.id) && <span className="ml-2 text-xs text-amber-700">(ถูกใช้งานอยู่)</span>}</td><td className="p-4 text-center font-bold text-[#d4af37]">{d.periodsPerWeek}</td>
                 <td className="p-4 text-center"><button onClick={() => { setForm({periodBlock: 1, preferredTime: 'any', ...d}); setOriginalSubjectId(d.id); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39]"><Edit size={18}/></button><button onClick={() => handleRequestDelete('subject', d)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td>
               </tr>
             ))}
@@ -1894,7 +1916,7 @@ const LOAD_IMPORT_HEADERS = ['รหัสครู', 'ชื่อครู', '
 const normalizeExcelText = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
 const validSubjectCode = id => !!id && id !== '.' && id !== '..' && !id.includes('/');
 const isSubjectActiveInTerm = (subject, semester) => !!subject && (!subject.term || subject.term === 'all' || String(subject.term) === String(semester));
-const defaultImportedSubject = ({ id, name, periods, semester, periodBlock = 1, preferredTime = 'any', abbr = '' }) => ({
+const defaultImportedSubject = ({ id, name, periods, semester, periodBlock = 1, preferredTime = 'any', abbr = '', needsScheduleReview = false }) => ({
   id: normalizeExcelText(id),
   name: normalizeExcelText(name),
   abbr: normalizeExcelText(abbr) || normalizeExcelText(name),
@@ -1902,6 +1924,7 @@ const defaultImportedSubject = ({ id, name, periods, semester, periodBlock = 1, 
   term: String(semester),
   periodBlock: Number(periodBlock),
   preferredTime,
+  needsScheduleReview, // Excel-created subjects must be reviewed before Auto
 });
 const classifySubjectRows = (rows, subjects, semester) => {
   const known = new Map(subjects.map(s => [normalizeExcelText(s.id), s]));
@@ -1919,7 +1942,7 @@ const classifySubjectRows = (rows, subjects, semester) => {
     } else {
       const value = Number(periods);
       if (!Number.isInteger(value) || value < 1) errors.push(`${label}: จำนวนคาบ/สัปดาห์ไม่ถูกต้อง`);
-      else created.set(id, defaultImportedSubject({ id, name, periods: value, semester }));
+      else created.set(id, defaultImportedSubject({ id, name, periods: value, semester, needsScheduleReview:true }));
     }
   });
   return { subjectsToCreate: [...created.values()], errors };
@@ -2176,7 +2199,7 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
       const moreNames = newSubjects.length > 8 ? `\n...และอีก ${newSubjects.length - 8} วิชา` : '';
       setConfirmData({
         type: 'restore', title: 'ตรวจสอบก่อนนำเข้า Excel', confirmText: 'ยืนยันนำเข้า',
-        message: `Excel ${files.length} ไฟล์ รวม ${importedItems.length} ภาระสอน\nเพิ่มภาระสอน ${createCount} / อัปเดต ${updateCount}\nสร้างรายวิชาใหม่ ${newSubjects.length} วิชา\n${sampleNames}${moreNames}\n\nวิชาใหม่จะตั้งต้นเป็นคาบเดี่ยวและเลือกเวลาใดก็ได้ ตรวจและแก้คุณสมบัติในเมนูรายวิชาภายหลัง`,
+        message: `Excel ${files.length} ไฟล์ รวม ${importedItems.length} ภาระสอน\nเพิ่มภาระสอน ${createCount} / อัปเดต ${updateCount}\nสร้างรายวิชาใหม่ ${newSubjects.length} วิชา\n${sampleNames}${moreNames}\n\nวิชาใหม่ตั้งต้นเป็นคาบเดี่ยวและเวลาใดก็ได้ และจะถูกทำเครื่องหมาย "รอตรวจ" กรุณาเปิดข้อมูลพื้นฐาน > รายวิชา ตรวจ Block และช่วงเวลา แล้วบันทึกวิชาใหม่แต่ละรายการก่อนจัด Auto`,
         action: async () => {
           setConfirmData(prev => ({ ...prev, isLoading: true }));
           const names = Object.fromEntries(subjectRows.map(row => [row.subjectId, row.subjectName]));
@@ -3024,15 +3047,38 @@ const ScheduleHistoryView = ({ db, appId, schoolSettings, getTermKey, getSubject
   </div>;
 };
 
-const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSettings,
+const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draftSubjects,
+  classrooms:draftClassrooms, periods:draftPeriods, schoolSettings:draftSettings,
+  teachingLoads, unavailabilities, classroomUnavailabilities, customRules,
   schedules:draftSchedules, fixedSchedules:draftFixedSchedules, activityGroups:draftGroups,
-  publishedSnapshot, getSubject, getTeacher, getClassroom }) => {
+  publishedSnapshot, getSubject:lookupSubject, getTeacher:lookupTeacher, getClassroom:lookupClassroom }) => {
   const [activeSubTab, setActiveSubTab] = useState('health');
   const [reportMode,setReportMode]=useState('draft');
   const showingPublished=reportMode==='published'&&!!publishedSnapshot;
   const schedules=showingPublished?publishedSnapshot.schedules:draftSchedules;
   const fixedSchedules=showingPublished?publishedSnapshot.fixedSchedules:draftFixedSchedules;
   const activityGroups=showingPublished?publishedSnapshot.activityGroups:draftGroups;
+  const referenceData=showingPublished?publishedSnapshot.referenceData:null;
+  const teachers=referenceData?.teachers||draftTeachers;
+  const subjects=referenceData?.subjects||draftSubjects;
+  const classrooms=referenceData?.classrooms||draftClassrooms;
+  const periods=referenceData?.periods||draftPeriods;
+  const schoolSettings=referenceData?.schoolSettings||draftSettings;
+  const publishedTeacherMap=useMemo(()=>new Map((referenceData?.teachers||[]).map(x=>[x.id,x])),[referenceData]);
+  const publishedSubjectMap=useMemo(()=>new Map((referenceData?.subjects||[]).map(x=>[x.id,x])),[referenceData]);
+  const publishedClassMap=useMemo(()=>new Map((referenceData?.classrooms||[]).map(x=>[x.id,x])),[referenceData]);
+  const getTeacher=id=>publishedTeacherMap.get(id)||lookupTeacher(id);
+  const getSubject=id=>publishedSubjectMap.get(id)||lookupSubject(id);
+  const getClassroom=id=>publishedClassMap.get(id)||lookupClassroom(id);
+  const health=useMemo(()=>{
+    if(!showingPublished)return draftHealth;
+    const context=referenceData;
+    return calculateScheduleHealth(schedules, context?.teachingLoads||teachingLoads,
+      context?.unavailabilities||unavailabilities,
+      context?.classroomUnavailabilities||classroomUnavailabilities,
+      fixedSchedules,teachers,subjects,classrooms,periods,context?.scheduleRules||customRules,activityGroups);
+  },[showingPublished,referenceData,schedules,fixedSchedules,activityGroups,teachers,subjects,classrooms,periods,
+      teachingLoads,unavailabilities,classroomUnavailabilities,customRules,draftHealth]);
   const [filterLvl, setFilterLvl] = useState('all');
 
   const filteredMissing = useMemo(() => {
@@ -3135,8 +3181,10 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
         <button onClick={() => setActiveSubTab('grid')} className={`px-4 py-2 rounded-lg font-bold text-sm transition-all ${activeSubTab === 'grid' ? 'bg-[#081a39] text-[#d4af37] shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}>ตารางรวมโรงเรียน</button>
       </div>
 
-      <div className="bg-slate-50 p-3 rounded-lg text-xs text-slate-700">รายงานตรวจสอบคาบและภาระสอน ใช้ข้อมูล <strong>ฉบับร่าง</strong> เสมอ ส่วนตารางรวมและ Excel เลือกฉบับได้</div>
-      {activeSubTab === 'grid' && <div className="bg-white border rounded-xl p-3 flex gap-3 items-center flex-wrap">
+      <div className="bg-blue-50 p-3 rounded-lg text-xs text-blue-900">ผลตรวจสุขภาพ ภาระที่ขาด และรายงานทั้งหมดใช้ข้อมูลฉบับที่เลือกด้านล่างตรงกัน
+        {showingPublished&&!referenceData&&<strong className="block text-amber-800 mt-1">ฉบับประกาศเก่าไม่มีข้อมูลอ้างอิง ณ วันที่ประกาศ ผลตรวจและชื่อครู/วิชาอาจอิงข้อมูลปัจจุบัน โปรดประกาศใหม่เมื่อตรวจร่างครบแล้ว</strong>}
+      </div>
+      {<div className="bg-white border rounded-xl p-3 flex gap-3 items-center flex-wrap">
         <label className="font-bold text-sm">แสดงตารางจาก</label>
         <select className="border rounded-lg p-2" value={reportMode} onChange={e=>setReportMode(e.target.value)}>
           <option value="draft">ฉบับร่าง (ล่าสุด)</option>
@@ -3207,8 +3255,7 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
                     <td className="p-3 text-center font-bold">{st.totalWeeklyPeriods||0}</td>
                     <td className="p-3 text-center">{st.heavyDays||0}{st.fiveDays?.length ? ` (5 คาบ: ${st.fiveDays.join(', ')})` : ''}</td>
                     <td className="p-3 text-center">{st.sch < st.req ? <span className="text-amber-600 bg-amber-50 px-2 py-1 rounded text-xs">ขาด {st.req - st.sch}</span> : st.sch > st.req ? <span className="text-rose-600 bg-rose-50 px-2 py-1 rounded text-xs">เกิน {st.sch - st.req}</span> : <span className="text-emerald-600 text-xs">ครบ</span>}</td>
-                    <td className="p-3 text-center">{st.gaps}</td>                    <td className="p-3 text-center">{st.maxConsec}</td>
-<td className="p-3 text-center">{st.maxConsec}</td><td className="p-3 text-center text-xs">{DAYS.map(d=>st.dailyCounts?.[d]||0).join(' / ')}</td>
+                    <td className="p-3 text-center">{st.gaps}</td><td className="p-3 text-center">{st.maxConsec}</td><td className="p-3 text-center text-xs">{DAYS.map(d=>st.dailyCounts?.[d]||0).join(' / ')}</td>
                   </tr>
                 );
               })}
@@ -3250,14 +3297,26 @@ const ReportsView = ({ health, teachers, subjects, classrooms, periods, schoolSe
 };
 
 const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
-  classrooms, teachers, periods, schoolSettings, publishedSnapshot,
-  getSubject, getShortTeacherName, getClassroom, getTeacher, fixedSchedules:draftFixed }) => {
+  classrooms:draftClassrooms, teachers:draftTeachers, periods:draftPeriods,
+  schoolSettings:draftSettings, publishedSnapshot,
+  getSubject:lookupSubject, getShortTeacherName, getClassroom:lookupClassroom,
+  getTeacher:lookupTeacher, fixedSchedules:draftFixed }) => {
   const [viewMode, setViewMode] = useState('room');
   const [printMode,setPrintMode]=useState('draft');
   const showingPublished=printMode==='published'&&!!publishedSnapshot;
   const schedules=showingPublished?publishedSnapshot.schedules:draftSchedules;
   const fixedSchedules=showingPublished?publishedSnapshot.fixedSchedules:draftFixed;
   const activityGroups=showingPublished?publishedSnapshot.activityGroups:draftGroups;
+  const references=showingPublished?publishedSnapshot.referenceData:null;
+  const classrooms=references?.classrooms||draftClassrooms;
+  const teachers=references?.teachers||draftTeachers;
+  const periods=references?.periods||draftPeriods;
+  const schoolSettings=references?.schoolSettings||draftSettings;
+  const getSubject=id=>references?.subjects?.find(x=>x.id===id)||lookupSubject(id);
+  const getTeacher=id=>teachers.find(x=>x.id===id)||lookupTeacher(id);
+  const getClassroom=id=>id===ALL_CLASSROOMS_ID?{id,name:'ทุกห้องเรียน'}:(classrooms.find(x=>x.id===id)||lookupClassroom(id));
+  // If publication becomes available, print the official copy by default.
+  useEffect(()=>{setPrintMode(publishedSnapshot?'published':'draft');},[publishedSnapshot?.versionId]);
   const [selectedId, setSelectedId] = useState('');
 
   const getCellContent = (targetId, day, periodId, vMode) => {
@@ -3288,7 +3347,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
     <div className="bg-white p-10 rounded-xl border border-slate-200 text-black shadow-sm print-page mb-6">
       <div className="text-center mb-8 print-header">
         <h1 className="text-3xl font-bold mb-2">{String(schoolSettings?.schoolName || 'โรงเรียน')}</h1>
-        <div className="text-sm font-bold mb-2">{showingPublished?'ฉบับประกาศใช้':'ฉบับร่าง (ยังไม่ประกาศ)'}</div>
+        <div className="text-sm font-bold mb-2">{showingPublished?`ฉบับประกาศใช้ · ${publishedSnapshot.versionId} · วันที่ ${new Date(publishedSnapshot.publishedAt).toLocaleDateString('th-TH')}`:'ฉบับร่าง (ยังไม่ประกาศ)'}</div>
         <h2 className="text-xl mb-1">ตาราง{mode === 'room' ? 'เรียน' : 'สอน'} ภาคเรียนที่ {String(schoolSettings?.semester || '1')} ปีการศึกษา {String(schoolSettings?.academicYear || '2569')}</h2>
         <h3 className="text-lg font-bold">{mode === 'room' ? `ชั้น ${getClassroom(id).name}` : `ชื่อครูผู้สอน: ${getTeacher(id).name}`}</h3>
       </div>
@@ -3316,11 +3375,12 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
           <option value="">-- เลือกเพื่อดูตัวอย่างพิมพ์ --</option><option value="ALL_PRINT" className="font-bold text-[#081a39]">-- พิมพ์ทั้งหมด --</option>
           {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
         </select>
-        <select value={printMode} onChange={e=>setPrintMode(e.target.value)} className="border rounded-xl p-3 font-bold">
+        <select value={printMode} onChange={e=>{setPrintMode(e.target.value);setSelectedId('');}} className="border rounded-xl p-3 font-bold">
           <option value="draft">พิมพ์ฉบับร่าง</option>{publishedSnapshot&&<option value="published">พิมพ์ฉบับประกาศใช้</option>}
         </select>
         <button onClick={() => window.print()} disabled={!selectedId} className="px-8 py-3 bg-[#081a39] text-white rounded-xl shadow-md font-bold disabled:opacity-50 ml-auto hover:bg-[#122b5e]">พิมพ์เอกสาร</button>
       </div>
+      {showingPublished&&!references&&<p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">หมายเหตุ: ฉบับประกาศเก่าไม่มีข้อมูลอ้างอิง ณ วันที่ประกาศ ชื่อครู/วิชาอาจแสดงตามข้อมูลปัจจุบัน</p>}
       <div id="print-area">{selectedId === 'ALL_PRINT' ? (viewMode === 'room' ? classrooms : teachers).map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />) : (selectedId && <PrintPage id={selectedId} mode={viewMode} />)}</div>
     </div>
   );
@@ -3859,6 +3919,35 @@ export default function App() {
     return snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
   };
 
+  // STAGE 17.1: a published timetable freezes the *display and validation* references.
+  // Use small separate documents; never place a potentially large school-wide map
+  // in the manifest or a single Firestore document.
+  const PUBLISHED_REF_CHARS = 30000;
+  const snapshotTextHash = value => {
+    let h=2166136261;
+    for(let i=0;i<value.length;i++) h=Math.imul(h ^ value.charCodeAt(i),16777619)>>>0;
+    return `${value.length}:${h.toString(16)}`;
+  };
+  const readPublishedReferences = async (versionPath,manifest) => {
+    if(!manifest.referencePartCount) return null; // legacy publications are still readable
+    if(!Number.isInteger(manifest.referencePartCount)||manifest.referencePartCount<1||manifest.referencePartCount>1000)
+      throw new Error('จำนวนส่วนข้อมูลอ้างอิงฉบับประกาศไม่ถูกต้อง');
+    const snapshot=await getDocsFromServer(collection(db,`${versionPath}/references`));
+    if(snapshot.docs.length!==manifest.referencePartCount)throw new Error('ข้อมูลชื่อครู/วิชาของฉบับประกาศไม่ครบ');
+    const parts=new Map(snapshot.docs.map(d=>[d.id,d.data()]));
+    let serialized='';
+    for(let i=0;i<manifest.referencePartCount;i++){
+      const part=parts.get(`ref_${String(i).padStart(5,'0')}`);
+      if(typeof part?.text!=='string')throw new Error('ข้อมูลอ้างอิงฉบับประกาศเสียหาย');
+      serialized+=part.text;
+    }
+    if(snapshotTextHash(serialized)!==manifest.referenceFingerprint)throw new Error('ข้อมูลอ้างอิงฉบับประกาศไม่ตรงฉบับที่บันทึก');
+    const data=JSON.parse(serialized);
+    const required=['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules'];
+    if(required.some(name=>!Array.isArray(data[name]))||!data.schoolSettings)throw new Error('ข้อมูลอ้างอิงฉบับประกาศไม่ครบ');
+    return data;
+  };
+
   // STAGE 5B: history manifests point to bounded-size documents. The manifest is
   // committed LAST, so incomplete chunk uploads are not advertised as restorable.
   const readScheduleVersion = async (termKey, versionId) => {
@@ -3871,6 +3960,7 @@ export default function App() {
       fixedSchedules:data.fixedSchedules.map(cleanScheduleSnapshotItem),
       activityGroups:Array.isArray(data.activityGroups) ? data.activityGroups.map(cleanScheduleSnapshotItem) : null,
       includesActivityGroups:Array.isArray(data.activityGroups),
+      referenceData:await readPublishedReferences(versionPath,data),
     }; // preserve legacy format; do not erase live groups if absent
     if (![2,3].includes(data.formatVersion) || data.state !== 'ready' || !Number.isInteger(data.chunkCount) ||
       data.chunkCount < 0 || data.chunkCount > 1000) throw new Error('รูปแบบประวัติไม่ถูกต้องหรือยังบันทึกไม่สำเร็จ');
@@ -3896,6 +3986,7 @@ export default function App() {
       throw new Error('ข้อมูลประวัติไม่ตรงกับรายการที่บันทึกไว้');
     return { ...data, id:versionId, ...result,
       includesActivityGroups:data.formatVersion===3,
+      referenceData:await readPublishedReferences(versionPath,data),
       activityGroups:data.formatVersion===3 ? result.activityGroups : null };
   };
   // STAGE 15: published data is an IMMUTABLE history snapshot, never the live
@@ -3904,21 +3995,24 @@ export default function App() {
     if(!user) {setPublishedSnapshot(null);return;}
     const termKey=getTermKey(schoolSettings);
     let alive=true;
+    let requestSerial=0;
     const ref=doc(db,`school_data/${appId}/terms/${termKey}/config/publishedTimetable`);
     setPublishedSnapshot(null);setPublishedError('');setPublishedLoading(true);
     const unsubscribe=onSnapshot(ref,async snap=>{
+      const requestId=++requestSerial;
       if(!alive)return;
       if(!snap.exists()||!snap.data().versionId){setPublishedSnapshot(null);setPublishedLoading(false);return;}
       const meta=snap.data();
       try{
         const version=await readScheduleVersion(termKey,meta.versionId);
         if(!version.includesActivityGroups) throw new Error('ฉบับประกาศไม่มีข้อมูลกิจกรรมกลุ่มครบ');
-        if(alive)setPublishedSnapshot({termKey,versionId:meta.versionId,publishedAt:meta.publishedAt,
-          schedules:version.schedules,fixedSchedules:version.fixedSchedules,activityGroups:version.activityGroups});
-        if(alive)setPublishedError('');
+        if(alive&&requestId===requestSerial)setPublishedSnapshot({termKey,versionId:meta.versionId,publishedAt:meta.publishedAt,
+          schedules:version.schedules,fixedSchedules:version.fixedSchedules,activityGroups:version.activityGroups,
+          referenceData:version.referenceData});
+        if(alive&&requestId===requestSerial)setPublishedError('');
       }catch(error){console.error('Cannot load published timetable',error);
-        if(alive){setPublishedSnapshot(null);setPublishedError('โหลดตารางฉบับประกาศไม่ได้ กรุณาตรวจประวัติและการเชื่อมต่อ');}}
-      finally{if(alive)setPublishedLoading(false);}
+        if(alive&&requestId===requestSerial){setPublishedSnapshot(null);setPublishedError('โหลดตารางฉบับประกาศไม่ได้ กรุณาตรวจประวัติและการเชื่อมต่อ');}}
+      finally{if(alive&&requestId===requestSerial)setPublishedLoading(false);}
     },error=>{console.error(error);if(alive){setPublishedError('อ่านสถานะประกาศใช้ไม่ได้');setPublishedLoading(false);}});
     return()=>{alive=false;unsubscribe();};
   },[user,schoolSettings.academicYear,schoolSettings.semester]);
@@ -3935,11 +4029,13 @@ export default function App() {
         // Delete child documents first; deleting a Firestore parent does not delete children.
         const children=await getDocsFromServer(collection(db, `${item.ref.path}/chunks`));
         for(const part of children.docs) await deleteDoc(part.ref);
+        const references=await getDocsFromServer(collection(db,`${item.ref.path}/references`));
+        for(const part of references.docs) await deleteDoc(part.ref);
         await deleteDoc(item.ref);
       }
     } catch(error) { console.error('Prune schedule versions failed; old history retained',error); }
   };
-  const saveScheduleVersion = async (reason = 'manual_snapshot', scheduleItems = schedules, fixedItems = fixedSchedules, explicitTermKey = null, groupItems = activityGroups) => {
+  const saveScheduleVersion = async (reason = 'manual_snapshot', scheduleItems = schedules, fixedItems = fixedSchedules, explicitTermKey = null, groupItems = activityGroups, referenceData = null) => {
     if (!user) return null;
     const termKey=explicitTermKey || getTermKey(schoolSettings);
     if (!/^\d{4}-[12]$/.test(termKey)) return null;
@@ -3949,16 +4045,23 @@ export default function App() {
     const fixed=(Array.isArray(fixedItems)?fixedItems:[]).map(cleanScheduleSnapshotItem);
     const groups=(Array.isArray(groupItems)?groupItems:[]).map(cleanScheduleSnapshotItem);
     const chunks=makeScheduleSnapshotChunks(regular,fixed,groups);
+    const referenceText=referenceData ? JSON.stringify(referenceData) : '';
+    const referenceParts=referenceData ? (referenceText.match(/[\s\S]{1,30000}/g)||[]) : [];
     const saved=[];
     try {
       for(let i=0;i<chunks.length;i++) {
         const partRef=doc(db, `${versionRef.path}/chunks/part_${String(i).padStart(5,'0')}`);
         await setDoc(partRef,chunks[i]);saved.push(partRef);
       }
+      for(let i=0;i<referenceParts.length;i++) {
+        const partRef=doc(db,`${versionRef.path}/references/ref_${String(i).padStart(5,'0')}`);
+        await setDoc(partRef,{text:referenceParts[i]});saved.push(partRef);
+      }
       await setDoc(versionRef, { id:versionRef.id, formatVersion:3,state:'ready',createdAt:Date.now(),
         reason:String(reason || 'manual_snapshot'),scheduleCount:regular.length,fixedScheduleCount:fixed.length,
         activityGroupCount:groups.length,chunkCount:chunks.length,scheduleFingerprint:fingerprintScheduleRows(regular),
-        fixedFingerprint:fingerprintScheduleRows(fixed),activityGroupFingerprint:fingerprintScheduleRows(groups) });
+        fixedFingerprint:fingerprintScheduleRows(fixed),activityGroupFingerprint:fingerprintScheduleRows(groups),
+        referencePartCount:referenceParts.length,referenceFingerprint:referenceData?snapshotTextHash(referenceText):null });
     } catch(error) {
       console.error('Save schedule version failed; no ready manifest created',error);
       for(const part of saved) try { await deleteDoc(part); } catch(cleanupError) { console.error('Orphan history chunk',cleanupError); }
@@ -4099,6 +4202,10 @@ export default function App() {
   const runSmartSchedule = async () => {
     if (isScheduling) return;
     if (!rulesReady) return showToast('ยังโหลดเงื่อนไขเพิ่มเติมไม่สำเร็จ จึงไม่เริ่มจัดตาราง', 'error');
+    // STAGE 17.4: never assume an imported subject is single period without review.
+    const pendingSubjects=subjects.filter(s=>s.needsScheduleReview &&
+      teachingLoads.some(load=>load.subjectId===s.id));
+    if(pendingSubjects.length)return showToast(`มีรายวิชาที่ Excel สร้างไว้รอตรวจ Block/ช่วงเวลา ${pendingSubjects.length} วิชา: ${pendingSubjects.slice(0,3).map(s=>s.id).join(', ')} กรุณาแก้ในข้อมูลพื้นฐาน > รายวิชา ก่อนจัด Auto`, 'error');
     // STEP 04: แจ้งรายการที่ต้องแก้ก่อนขอล็อกหรือเริ่มสร้างตาราง
     const issues = validateAutoScheduleInputs({
       teachingLoads, teachers, subjects, classrooms, periods, schedules, fixedSchedules,
@@ -4213,9 +4320,10 @@ export default function App() {
         // หากยังขาด จึงลองรอบสำรอง 5 คาบ โดยให้คะแนนรูปแบบ 5 คาบต่ำมาก
         for (const dayLimit of [SCHEDULER_CONFIG.maxTeacherPeriodsPerDay, SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay]) {
         if (dayLimit > SCHEDULER_CONFIG.maxTeacherPeriodsPerDay && candidatePool.some(x => x.missingCount === 0)) break;
-        // Give the 4-period search extra chances before considering exceptional fifth periods.
+        // Stage 17.5: search the four-period space more thoroughly before trying fifth periods.
+        // This is heuristic optimization, not a mathematical proof that four periods is impossible.
         const attempts = dayLimit === SCHEDULER_CONFIG.maxTeacherPeriodsPerDay
-          ? SCHEDULER_CONFIG.candidateCount * 2 : SCHEDULER_CONFIG.candidateCount;
+          ? SCHEDULER_CONFIG.candidateCount * 4 : SCHEDULER_CONFIG.candidateCount;
         for (let c = 0; c < attempts; c++) {
           const random = createSeededRandom((runSeed + Math.imul(c + 1, 2246822519) + Math.imul(dayLimit, 3266489917)) >>> 0);
           const generatedSchedule = [];
@@ -4336,6 +4444,10 @@ export default function App() {
             });
           }
 
+          // Stop early only after gathering three different complete 4-period choices;
+          // otherwise search the extended 4-period space before allowing five periods.
+          if(dayLimit===SCHEDULER_CONFIG.maxTeacherPeriodsPerDay && c>=69 &&
+            candidatePool.filter(x=>x.maxDailyLimitUsed===dayLimit && x.missingCount===0).length>=3) break;
           // คืนเวลาให้ browser เป็นช่วง ๆ เพื่อให้ spinner/การโต้ตอบไม่ค้างระหว่างคำนวณหลาย candidate
           if ((c + 1) % SCHEDULER_CONFIG.yieldEveryCandidates === 0 && c + 1 < attempts) {
             // Renew only if needed, to avoid adding a network round trip on every candidate.
@@ -4352,6 +4464,7 @@ export default function App() {
         if (!(await renewSchedulerLock(lockRef, lockOwnerId))) throw new Error('SCHEDULER_LOCK_LOST');
         const fourPeriodAttempts = candidatePool.filter(x=>x.maxDailyLimitUsed===SCHEDULER_CONFIG.maxTeacherPeriodsPerDay);
         const bestFourPeriodMissing = fourPeriodAttempts.length ? Math.min(...fourPeriodAttempts.map(x=>x.missingCount)) : null;
+        const fourPeriodCandidatesTried=fourPeriodAttempts.length;
         candidatePool.sort((a, b) => {
           if (a.missingCount !== b.missingCount) return a.missingCount - b.missingCount;
           if (a.fivePeriodCount !== b.fivePeriodCount) return a.fivePeriodCount - b.fivePeriodCount;
@@ -4374,6 +4487,7 @@ export default function App() {
           ...bestCandidate,
           fivePeriodDays,
           bestFourPeriodMissing,
+          fourPeriodCandidatesTried,
           weeklyLoadSummary:[...summarizeTeacherWeek(buildTeacherOccupancy(bestCandidate.schedule,fixedSchedules,activityGroups),periods)]
             .map(([teacherId,stat])=>({teacherId,teacherName:teachers.find(t=>t.id===teacherId)?.name||teacherId,...stat}))
             .sort((a,b)=>b.total-a.total),
@@ -4414,6 +4528,7 @@ export default function App() {
       const totalReq=teachingLoads.reduce((a,x)=>a+(Number(x.periods)||0),0);
       return {...previous,...candidate,candidates:previous.candidates,candidateIndex:index,
         previewSource:previous.previewSource,bestFourPeriodMissing:previous.bestFourPeriodMissing,
+        fourPeriodCandidatesTried:previous.fourPeriodCandidatesTried,
         fivePeriodDays:findTeacherFifthPeriodDays(allOccupied,periods,teachers),
         weeklyLoadSummary:[...summarizeTeacherWeek(allOccupied,periods)].map(([teacherId,stat])=>
           ({teacherId,teacherName:teachers.find(t=>t.id===teacherId)?.name||teacherId,...stat})),
@@ -4426,7 +4541,7 @@ export default function App() {
     if (!scheduleResult) return;
     setConfirmData({
       type: 'restore', title: 'ยืนยันการใช้ตารางใหม่',
-      message: `ตารางเดิมในเทอมนี้จะถูกแทนที่ ยืนยันหรือไม่?${scheduleResult.fivePeriodDays?.length ? `\n\nอนุมัติข้อยกเว้น 5 คาบ/วัน: ${scheduleResult.fivePeriodDays.map(x=>`ครู ${x.teacherName} วัน${x.day}`).join(', ')}\nระบบลองจัดด้วยเพดาน 4 คาบก่อนแล้ว แต่การค้นหานี้ไม่ยืนยันว่าไม่มีทางอื่นที่จัดได้` : ''}`,
+      message: `ตารางเดิมในเทอมนี้จะถูกแทนที่ ยืนยันหรือไม่?${scheduleResult.fivePeriodDays?.length ? `\n\nอนุมัติข้อยกเว้น 5 คาบ/วัน: ${scheduleResult.fivePeriodDays.map(x=>`ครู ${x.teacherName} วัน${x.day}`).join(', ')}\nระบบลองค้นหาแบบ 4 คาบ ${scheduleResult.fourPeriodCandidatesTried||0} ตัวเลือกแล้ว แต่ยังไม่พบผลครบ การค้นหาไม่ใช่หลักฐานว่าไม่มีตารางแบบ 4 คาบ` : ''}`,
       confirmText: 'บันทึกตาราง',
       action: async () => {
         setConfirmData(prev => ({...prev, isLoading: true}));
@@ -4515,7 +4630,21 @@ export default function App() {
             fingerprintScheduleRows(fromServer[1])!==fingerprintScheduleRows(fixedSchedules)||
             fingerprintScheduleRows(fromServer[2])!==fingerprintScheduleRows(activityGroups))
             throw new Error('ข้อมูลเปลี่ยนจากเครื่องอื่น กรุณาตรวจตารางและประกาศใหม่');
-          const versionId=await saveScheduleVersion('published',fromServer[0],fromServer[1],termKey,fromServer[2]);
+          const masterBase=`school_data/${appId}`;
+          const refNames=['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules'];
+          const refs=await Promise.all(refNames.map(name=>getDocsFromServer(collection(db,
+            ['teachers','subjects','classrooms','periods'].includes(name)?`${masterBase}/${name}`:`${path}/${name}`))));
+          const frozen=Object.fromEntries(refNames.map((name,i)=>[name,refs[i].docs.map(d=>({...d.data(),id:d.id}))]));
+          if(!frozen.periods.length)frozen.periods=DEFAULT_PERIODS;
+          frozen.schoolSettings={...schoolSettings};
+          // The displayed catalog must match the catalog used to approve this publication.
+          for(const name of ['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules']) {
+            const local={teachers,subjects,classrooms,periods,teachingLoads,unavailabilities,
+              classroomUnavailabilities,scheduleRules:customRules}[name];
+            if(fingerprintScheduleRows(frozen[name])!==fingerprintScheduleRows(local))
+              throw new Error('ข้อมูลพื้นฐานหรือเงื่อนไขเปลี่ยนขณะประกาศ กรุณาตรวจข้อมูลใหม่');
+          }
+          const versionId=await saveScheduleVersion('published',fromServer[0],fromServer[1],termKey,fromServer[2],frozen);
           if(!versionId)throw new Error('สร้างฉบับประกาศไม่สำเร็จ');
           await setDoc(doc(db,`${path}/config/publishedTimetable`),{
             versionId,publishedAt:Date.now(),termKey});
