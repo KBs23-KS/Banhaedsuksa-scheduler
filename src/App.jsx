@@ -229,6 +229,10 @@ const isValidCustomRule = (rule, teachers, subjects, classrooms, periods) => {
   if (rule.mode === 'dailyLimit') return rule.targetType === 'subject' &&
     Number.isInteger(Number(rule.maxPerDay)) && Number(rule.maxPerDay) >= 1 &&
     Number(rule.maxPerDay) <= periods.filter(p => !p.isBreak).length;
+  // Stage 22: subject-wide morning/afternoon condition, across all weekdays.
+  if (rule.mode === 'timeWindow') return rule.targetType === 'subject' &&
+    ['morning','afternoon'].includes(rule.timeWindow) &&
+    ['required','preferred'].includes(rule.strictness);
   return ['block', 'prefer'].includes(rule.mode) && DAYS.includes(rule.day) &&
     periods.some(p => !p.isBreak && String(p.id) === String(rule.periodId));
 };
@@ -237,9 +241,28 @@ const customRuleMatches = (rule, item) => !!(rule && item && rule.day === item.d
   (rule.targetType === 'teacher' ? !!item.teacherId && rule.targetId === item.teacherId :
    rule.targetType === 'subject' ? !!item.subjectId && rule.targetId === item.subjectId :
    rule.targetType === 'classroom' ? (rule.targetId === item.classroomId || (item.classroomId === ALL_CLASSROOMS_ID && fixedAppliesToClassroom(item,rule.targetId))) : false));
-const blocksCustomRule = (rules, item) => (rules || []).some(r => r.mode === 'block' && customRuleMatches(r, item));
-const customRulePreferenceScore = (rules, item) => (rules || []).reduce((score, r) =>
-  score + (r.mode === 'prefer' && customRuleMatches(r, item) ? 18 : 0), 0);
+// A time window is based on the actual break position, not the internal period ID.
+// With default periods, morning = learning periods 1–4 and afternoon = 5–7.
+const isSubjectInTimeWindow = (periodId, windowName, periodsOrContext = DEFAULT_PERIODS) => {
+  const context = getPeriodContext(periodsOrContext);
+  const found = context.activePeriods.find(p => String(p.id) === String(periodId));
+  if (!found) return false;
+  const morning = [...context.morningIds].some(id => String(id) === String(found.id));
+  return windowName === 'morning' ? morning : !morning;
+};
+const blocksCustomRule = (rules, item, periodsOrContext = DEFAULT_PERIODS) => (rules || []).some(r =>
+  (r.mode === 'block' && customRuleMatches(r, item)) ||
+  (r.mode === 'timeWindow' && r.strictness === 'required' &&
+    r.targetType === 'subject' && !!item?.subjectId && String(r.targetId) === String(item.subjectId) &&
+    !isSubjectInTimeWindow(item.periodId, r.timeWindow, periodsOrContext)));
+const customRulePreferenceScore = (rules, item, periodsOrContext = DEFAULT_PERIODS) => (rules || []).reduce((score, r) => {
+  if (r.mode === 'prefer' && customRuleMatches(r, item)) return score + 18;
+  if (r.mode === 'timeWindow' && r.strictness === 'preferred' &&
+      r.targetType === 'subject' && !!item?.subjectId && String(r.targetId) === String(item.subjectId)) {
+    return score + (isSubjectInTimeWindow(item.periodId, r.timeWindow, periodsOrContext) ? 24 : -24);
+  }
+  return score;
+}, 0);
 
 const SCHEDULER_CONFIG = { candidateCount: 50, maxConsecutiveTeacherPeriods: 2, maxTeacherPeriodsPerDay: 4, absoluteMaxTeacherPeriodsPerDay: 5, candidateChoicePool: 4, placementJitter: 2.5, yieldEveryCandidates: 5 };
 // STAGE 09: รูปแบบครูที่มีสอน 4 คาบ/วัน ตามเกณฑ์ที่โรงเรียนยืนยัน (15 แนะนำ, 8 สำรอง, 12 ห้าม)
@@ -737,7 +760,7 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
     stat.maxConsec = ws?.longestConsecutive || 0;
   });
   health.subjectDailyConflicts = findSubjectDailyLimitConflicts([...schedules, ...fixed], classrooms, customRules);
-  health.customRuleConflicts = [...schedules, ...fixed].filter(item => blocksCustomRule(customRules, item)).map(item =>
+  health.customRuleConflicts = [...schedules, ...fixed].filter(item => blocksCustomRule(customRules, item, periods)).map(item =>
     `ข้อบังคับที่ตั้งเอง: ${item.subjectId || '-'} / วัน${item.day} ${getPeriodDisplayName(periods, item.periodId)} ไม่สามารถจัดได้`);
   health.teacherLimitConflicts = findTeacherTeachingLimitConflicts(occupied, periods, teachers);
   health.teacherFivePeriodWarnings = findTeacherFifthPeriodDays([...schedules, ...fixed, ...groupTeacherItems], periods, teachers)
@@ -820,7 +843,7 @@ const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = 
 
 const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak, subjectId = '') => {
   if (isBreak) return { ok: false, reason: "BREAK_PERIOD" };
-  if (blocksCustomRule(maps.customRules, { teacherId, classroomId, subjectId, day, periodId })) return { ok: false, reason: 'CUSTOM_RULE_BLOCKED' };
+  if (blocksCustomRule(maps.customRules, { teacherId, classroomId, subjectId, day, periodId }, maps.periodContext)) return { ok: false, reason: 'CUSTOM_RULE_BLOCKED' };
   if (maps.cUnavailMap.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_UNAVAILABLE" };
   if (teacherId && maps.tUnavailMap.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_UNAVAILABLE" };
   if (maps.fixedMap.has(`${day}_${periodId}_${classroomId}`) || maps.fixedMap.has(`${day}_${periodId}_${ALL_CLASSROOMS_ID}`) ||
@@ -931,7 +954,7 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
     }
   });
   findSubjectDailyLimitConflicts(anchors, classrooms, customRules).forEach(addProblem);
-  anchors.filter(item => blocksCustomRule(customRules, item)).forEach(item =>
+  anchors.filter(item => blocksCustomRule(customRules, item, periods)).forEach(item =>
     addProblem(`ตารางเดิม/กิจกรรมล็อกฝ่าฝืนข้อบังคับเพิ่มเติม: วัน${item.day} คาบ ${item.periodId}`));
   const groupTeachers=activityTeacherEntries(activityGroups,fixedSchedules);
   activityGroups.forEach(g=>{
@@ -981,7 +1004,7 @@ const analyzeScheduleFeasibility = ({ teachingLoads, teachers, subjects, classro
     DAYS.forEach(day => {
       const slots = active.filter(p =>
         !unavailabilities.some(u => u.teacherId === teacherId && u.day === day && String(u.periodId) === String(p.id)) &&
-        !blocksCustomRule(customRules, {teacherId, day, periodId:p.id, classroomId:'', subjectId:''})
+        !blocksCustomRule(customRules, {teacherId, day, periodId:p.id, classroomId:'', subjectId:''}, periods)
       ).length;
       upper += Math.min(SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay, slots);
     });
@@ -1285,7 +1308,7 @@ const scorePlacementOption = (entries, load, state, periodsOrContext, getSubject
     }
   });
 
-  entries.forEach(entry => { score += customRulePreferenceScore(customRules, { ...load, ...entry }); });
+  entries.forEach(entry => { score += customRulePreferenceScore(customRules, { ...load, ...entry }, periodContext); });
   return score;
 };
 
@@ -1344,7 +1367,7 @@ const calculateScheduleScore = (schedules, teachers, subjects, periodsOrContext,
   const morningPeriods = periodContext.morningIds;
 
   schedules.forEach(sch => {
-    score += customRulePreferenceScore(customRules, sch);
+    score += customRulePreferenceScore(customRules, sch, periodContext);
     if (sch.teacherId) {
       if (!teacherStats[sch.teacherId]) teacherStats[sch.teacherId] = { days: {} };
       if (!teacherStats[sch.teacherId].days[sch.day]) teacherStats[sch.teacherId].days[sch.day] = [];
@@ -2487,11 +2510,15 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
 };
 
 // STAGE 1: ผู้ดูแลเพิ่มเงื่อนไขรายวัน/คาบ โดยไม่เปลี่ยนข้อบังคับครู 5/3
-const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, periods, schedules, fixedSchedules, dbAction, showToast, rulesReady }) => {
+const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, periods, schedules, fixedSchedules, dbAction, showToast, rulesReady, saveSubjectTimeWindows }) => {
   const [form, setForm] = useState({ targetType: 'teacher', targetId: '', day: 'จันทร์', periodId: '', mode: 'block' });
   const [saving, setSaving] = useState(false);
   const [dailySubjectId, setDailySubjectId] = useState('');
   const [dailyMax, setDailyMax] = useState('2');
+  const [timeSubjectIds, setTimeSubjectIds] = useState([]);
+  const [timeSearch, setTimeSearch] = useState('');
+  const [timeWindow, setTimeWindow] = useState('morning');
+  const [timeStrictness, setTimeStrictness] = useState('required');
   const targets = form.targetType === 'teacher' ? teachers : form.targetType === 'subject' ? activeSubjects : classrooms;
   const listForRule = r => r.targetType === 'teacher' ? teachers : r.targetType === 'subject' ? activeSubjects : classrooms;
   const labelForRule = r => listForRule(r).find(x => x.id === r.targetId)?.name || r.targetId;
@@ -2510,6 +2537,21 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
       if (ok) { setForm(prev => ({ ...prev, targetId: '' })); showToast('เพิ่มเงื่อนไขสำเร็จ'); }
     } finally { setSaving(false); }
   };
+  const handleAddTimeWindow = async () => {
+    if (saving) return;
+    if (!timeSubjectIds.length) return showToast('กรุณาเลือกอย่างน้อย 1 รายวิชา', 'error');
+    setSaving(true);
+    try {
+      const ok = await saveSubjectTimeWindows(timeSubjectIds, timeWindow, timeStrictness);
+      if (ok) setTimeSubjectIds([]);
+    } finally { setSaving(false); }
+  };
+  const subjectsMatchingSearch = activeSubjects.filter(s =>
+    `${s.id} ${s.name}`.toLowerCase().includes(timeSearch.trim().toLowerCase()));
+  const subjectsWithTimeRules = new Set(customRules.filter(r => r.mode === 'timeWindow').map(r => String(r.targetId)));
+  const selectableSubjects = subjectsMatchingSearch.filter(s => !subjectsWithTimeRules.has(String(s.id)));
+  const toggleTimeSubject = (id, checked) => setTimeSubjectIds(prev =>
+    checked ? [...new Set([...prev, id])] : prev.filter(x => x !== id));
   const handleAddDailyLimit = async () => {
     if (!rulesReady || saving) return showToast('ยังไม่พร้อมบันทึกเงื่อนไข', 'error');
     const rule = { targetType: 'subject', targetId: dailySubjectId, mode: 'dailyLimit', maxPerDay: Number(dailyMax) };
@@ -2528,7 +2570,7 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
       <div className="bg-white rounded-2xl border border-slate-100 p-6 max-w-4xl">
         <h2 className="text-xl font-bold text-[#081a39] mb-2">เงื่อนไขการจัดตารางเพิ่มเติม</h2>
         {!rulesReady && <p role="alert" className="text-rose-700 mb-3">กำลังโหลดเงื่อนไขจาก Firebase หรือไม่มีสิทธิ์อ่านข้อมูล กรุณาตรวจการเชื่อมต่อก่อนแก้ไข</p>}
-        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ข้อบังคับครูไม่เกิน 4 คาบ/วัน และไม่เกิน 2 คาบติดกัน</p>
+        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ครูเป้าหมาย 4 คาบ/วัน (5 คาบเมื่อจำเป็นและมีการยืนยัน) และไม่เกิน 2 คาบติดกันในช่วงเดียวกัน</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="text-sm font-bold">ประเภทข้อมูล<select className="w-full border rounded-xl p-3 mt-1" value={form.targetType} onChange={e => setForm(prev => ({ ...prev, targetType: e.target.value, targetId: '' }))}><option value="teacher">ครู</option><option value="subject">รายวิชา</option><option value="classroom">ห้องเรียน</option></select></label>
           <label className="text-sm font-bold">เลือกบุคคล/รายการ<select className="w-full border rounded-xl p-3 mt-1" value={form.targetId} onChange={e => setForm(prev => ({ ...prev, targetId: e.target.value }))}><option value="">-- เลือก --</option>{targets.map(x => <option key={x.id} value={x.id}>{x.name} ({x.id})</option>)}</select></label>
@@ -2537,6 +2579,46 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
           <label className="text-sm font-bold sm:col-span-2">เงื่อนไข<select className="w-full border rounded-xl p-3 mt-1" value={form.mode} onChange={e => setForm(prev => ({ ...prev, mode: e.target.value }))}><option value="block">ข้อบังคับ: ห้ามจัดในคาบนี้</option><option value="prefer">ข้อแนะนำ: พยายามจัดในคาบนี้</option></select></label>
         </div>
         <button disabled={saving || !rulesReady || !form.targetId || !form.periodId} onClick={handleAdd} className="mt-4 px-6 py-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">{saving ? 'กำลังบันทึก...' : 'เพิ่มเงื่อนไข'}</button>
+      </div>
+      <div className="bg-white border rounded-2xl p-6 max-w-4xl">
+        <h3 className="font-bold text-lg mb-2">กำหนดช่วงเวลาเรียนรายวิชา (เช้า / บ่าย)</h3>
+        <p className="text-slate-600 text-sm mb-4">เลือกหลายรหัสวิชาพร้อมกันได้ เช่น คณิตศาสตร์พื้นฐานและคณิตศาสตร์เพิ่มเติม กฎจะใช้ทุกวันในภาคเรียนนี้ โดยอ้างอิงคาบพักเที่ยงที่ตั้งค่าไว้</p>
+        <label className="block text-sm font-bold mb-2">ค้นหารายวิชา
+          <input value={timeSearch} onChange={e => setTimeSearch(e.target.value)} placeholder="ค้นหารหัสวิชา หรือชื่อวิชา"
+            className="w-full border rounded-xl p-3 mt-1 font-normal" />
+        </label>
+        <div className="border rounded-xl max-h-56 overflow-y-auto p-3 space-y-2 mb-3">
+          {!subjectsMatchingSearch.length && <p className="text-slate-500 text-sm">ไม่พบรายวิชาในภาคเรียนนี้</p>}
+          {subjectsMatchingSearch.map(s => <label key={s.id} className={`flex items-center gap-2 p-2 rounded-lg text-sm ${subjectsWithTimeRules.has(String(s.id)) ? 'text-slate-400 bg-slate-50' : 'hover:bg-slate-50'}`}>
+            <input type="checkbox" disabled={saving || subjectsWithTimeRules.has(String(s.id))} checked={timeSubjectIds.includes(String(s.id))}
+              onChange={e => toggleTimeSubject(String(s.id), e.target.checked)} />
+            <span>{s.name} ({s.id}) {subjectsWithTimeRules.has(String(s.id)) ? '— มีกฎอยู่แล้ว' : ''}</span>
+          </label>)}
+        </div>
+        <div className="flex flex-wrap justify-between items-center gap-2 mb-4">
+          <span className="text-sm text-slate-600">เลือก {timeSubjectIds.length} วิชา</span>
+          <div className="flex gap-3 text-sm">
+            <button type="button" className="text-blue-700 underline" onClick={() => setTimeSubjectIds(prev => [...new Set([...prev, ...selectableSubjects.map(s => String(s.id))])])}>เลือกที่ค้นหาทั้งหมด</button>
+            <button type="button" className="text-slate-600 underline" onClick={() => setTimeSubjectIds([])}>ล้างที่เลือก</button>
+          </div>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <label className="text-sm font-bold">ช่วงเวลาที่ต้องการ
+            <select value={timeWindow} onChange={e => setTimeWindow(e.target.value)} className="w-full border rounded-xl p-3 mt-1">
+              <option value="morning">ช่วงเช้า (ก่อนพักเที่ยง)</option><option value="afternoon">ช่วงบ่าย (หลังพักเที่ยง)</option>
+            </select>
+          </label>
+          <label className="text-sm font-bold">ระดับเงื่อนไข
+            <select value={timeStrictness} onChange={e => setTimeStrictness(e.target.value)} className="w-full border rounded-xl p-3 mt-1">
+              <option value="required">ข้อบังคับ — ห้ามจัดนอกช่วงนี้</option><option value="preferred">ข้อแนะนำ — พยายามจัดช่วงนี้</option>
+            </select>
+          </label>
+        </div>
+        <p className="text-xs text-slate-500 mt-3">ข้อบังคับจะตรวจทั้ง Auto เพิ่มด้วยมือ และย้ายคาบ หากคาบเดิมขัดกับกฎใหม่ ระบบจะไม่บันทึกกฎนี้ ส่วนข้อแนะนำใช้จัดอันดับตัวเลือก Auto เท่านั้น</p>
+        <button disabled={saving || !rulesReady || !timeSubjectIds.length} onClick={handleAddTimeWindow}
+          className="mt-4 px-6 py-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">
+          {saving ? 'กำลังบันทึก...' : `บันทึกช่วงเวลา ${timeSubjectIds.length} รายวิชา`}
+        </button>
       </div>
       <div className="bg-white border rounded-2xl p-6 max-w-4xl">
         <h3 className="font-bold text-lg mb-3">จำกัดจำนวนคาบวิชาเดียวกันต่อวัน (แต่ละห้องเรียน)</h3>
@@ -2550,7 +2632,7 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
       <div className="bg-white border rounded-2xl p-6 max-w-4xl">
         <h3 className="font-bold text-lg mb-3">รายการเงื่อนไข ({customRules.length})</h3>
         {!customRules.length && <p className="text-slate-500 text-sm">ยังไม่มีเงื่อนไขเพิ่มเติม</p>}
-        <div className="space-y-2">{customRules.map(rule => <div key={rule.id} className="flex flex-wrap gap-2 items-center justify-between border rounded-xl p-3"><div className="text-sm"><span className="font-bold">{labelForRule(rule)}</span> · {rule.mode === 'dailyLimit' ? `ไม่เกิน ${rule.maxPerDay} คาบต่อวัน/ห้อง` : `วัน${rule.day} · ${getPeriodDisplayName(periods, rule.periodId)}`} <span className={rule.mode === 'block' ? 'text-rose-700' : 'text-emerald-700'}>({rule.mode === 'dailyLimit' ? 'ข้อบังคับจำนวนคาบ' : rule.mode === 'block' ? 'ห้ามจัด' : 'ควรจัด'})</span></div><button className="text-rose-700 border border-rose-200 px-3 py-2 rounded-lg" onClick={async () => { if (window.confirm('ยืนยันลบเงื่อนไขนี้?')) await dbAction('scheduleRules', rule.id, null, 'delete'); }}>ลบ</button></div>)}</div>
+        <div className="space-y-2">{customRules.map(rule => <div key={rule.id} className="flex flex-wrap gap-2 items-center justify-between border rounded-xl p-3"><div className="text-sm"><span className="font-bold">{labelForRule(rule)}</span> · {rule.mode === 'dailyLimit' ? `ไม่เกิน ${rule.maxPerDay} คาบต่อวัน/ห้อง` : rule.mode === 'timeWindow' ? `ทุกวัน · ช่วง${rule.timeWindow === 'morning' ? 'เช้า' : 'บ่าย'}` : `วัน${rule.day} · ${getPeriodDisplayName(periods, rule.periodId)}`} <span className={rule.mode === 'block' || (rule.mode === 'timeWindow' && rule.strictness === 'required') ? 'text-rose-700' : 'text-emerald-700'}>({rule.mode === 'dailyLimit' ? 'ข้อบังคับจำนวนคาบ' : rule.mode === 'timeWindow' ? (rule.strictness === 'required' ? 'บังคับช่วงเวลา' : 'แนะนำช่วงเวลา') : rule.mode === 'block' ? 'ห้ามจัด' : 'ควรจัด'})</span></div><button className="text-rose-700 border border-rose-200 px-3 py-2 rounded-lg" onClick={async () => { if (window.confirm('ยืนยันลบเงื่อนไขนี้?')) await dbAction('scheduleRules', rule.id, null, 'delete'); }}>ลบ</button></div>)}</div>
       </div>
     </div>
   );
@@ -3709,6 +3791,56 @@ export default function App() {
       else if (action === 'delete') await deleteDoc(doc(db, `${basePath}/${collectionName}`, id));
       return true;
     } catch (e) { showToast("บันทึกไม่สำเร็จ", 'error'); return false; }
+  };
+
+  // Stage 22: save multiple subject time-window rules as one atomic operation.
+  // Recheck server-side rules and existing lessons before saving; existing subject settings stay untouched.
+  const saveSubjectTimeWindows = async (subjectIds, timeWindow, strictness) => {
+    if (!user || !rulesReady) { showToast('ยังไม่พร้อมบันทึกเงื่อนไข กรุณารอโหลดข้อมูลก่อน', 'error'); return false; }
+    const ids = [...new Set((subjectIds || []).map(String))];
+    if (!ids.length || !['morning','afternoon'].includes(timeWindow) ||
+        !['required','preferred'].includes(strictness) ||
+        ids.some(id => !activeSubjects.some(s => String(s.id) === id))) {
+      showToast('กรุณาเลือกรายวิชาและเงื่อนไขให้ถูกต้อง', 'error'); return false;
+    }
+    const termPath = `school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
+    const rulesPath = `${termPath}/scheduleRules`;
+    try {
+      const [ruleSnapshot, scheduleSnapshot, fixedSnapshot] = await Promise.all([
+        getDocsFromServer(collection(db, rulesPath)),
+        getDocsFromServer(collection(db, `${termPath}/schedules`)),
+        getDocsFromServer(collection(db, `${termPath}/fixedSchedules`)),
+      ]);
+      const liveRules = ruleSnapshot.docs.map(d => d.data());
+      if (liveRules.some(r => r.mode === 'timeWindow' && ids.includes(String(r.targetId)))) {
+        showToast('บางวิชามีเงื่อนไขช่วงเวลาแล้ว กรุณาลบรายการเดิมก่อน', 'error'); return false;
+      }
+      const newRules = ids.map(targetId => ({
+        id: `TW_${encodeURIComponent(targetId)}`, mode: 'timeWindow',
+        targetType: 'subject', targetId, timeWindow, strictness,
+      }));
+      if (strictness === 'required') {
+        const liveItems = [...scheduleSnapshot.docs, ...fixedSnapshot.docs].map(d => d.data());
+        const conflicts = liveItems.filter(item => blocksCustomRule(newRules, item, periods));
+        if (conflicts.length) {
+          showToast(`มีตารางเดิม ${conflicts.length} คาบอยู่นอกช่วงเวลาที่จะบังคับ กรุณาปรับตารางก่อน`, 'error');
+          return false;
+        }
+      }
+      const refs = newRules.map(rule => doc(db, rulesPath, rule.id));
+      await runTransaction(db, async tx => {
+        const existing = await Promise.all(refs.map(ref => tx.get(ref)));
+        if (existing.some(snap => snap.exists())) throw new Error('TIME_RULE_EXISTS');
+        newRules.forEach((rule, i) => tx.set(refs[i], rule));
+      });
+      showToast(`เพิ่มเงื่อนไขช่วงเวลา ${newRules.length} รายวิชาสำเร็จ`);
+      return true;
+    } catch (error) {
+      console.error('Save subject time windows failed', error);
+      showToast(error?.message === 'TIME_RULE_EXISTS' ? 'มีเงื่อนไขของวิชานี้แล้ว กรุณาตรวจสอบอีกครั้ง' :
+        'บันทึกเงื่อนไขรายวิชาไม่สำเร็จ ไม่มีการบันทึกบางส่วน', 'error');
+      return false;
+    }
   };
 
   // STEP 09: Safely migrate a subject document ID and every term's live references.
@@ -4964,7 +5096,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, renameSubjectId, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, activityGroups, plcSessions, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups, plcSessions } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, renameSubjectId, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, saveSubjectTimeWindows, activityGroups, plcSessions, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups, plcSessions } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
