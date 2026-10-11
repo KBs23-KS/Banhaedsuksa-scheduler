@@ -443,6 +443,21 @@ const fingerprintScheduleRows = rows => {
   for (let i=0;i<serialized.length;i++) hash = Math.imul(hash ^ serialized.charCodeAt(i), 16777619);
   return `${serialized.length}:${(hash >>> 0).toString(16)}`;
 };
+// STAGE 19: a stable print reference without changing the draft or publication data.
+// Published copies point to their stored Firestore version; drafts get a content-based
+// verification code that changes whenever schedule/fixed/activity rows change.
+const buildTimetablePrintCode = ({ academicYear, semester, versionId, schedules = [], fixedSchedules = [], activityGroups = [] }) => {
+  const prefix = `BHS-${String(academicYear || '----')}-${String(semester || '-')}`;
+  if (versionId) return `${prefix}-P-${String(versionId)}`;
+  const summary = [
+    { id: 'regular', fingerprint: fingerprintScheduleRows(schedules) },
+    { id: 'fixed', fingerprint: fingerprintScheduleRows(fixedSchedules) },
+    { id: 'groups', fingerprint: fingerprintScheduleRows(activityGroups) },
+  ];
+  const shortHash = fingerprintScheduleRows(summary).split(':')[1].toUpperCase().padStart(8, '0');
+  return `${prefix}-D-${shortHash}`;
+};
+
 const makeScheduleSnapshotChunks = (schedules, fixedSchedules, activityGroups = []) => {
   const empty = () => ({ schedules: [], fixedSchedules: [], activityGroups: [] });
   const chunks = []; let current = empty(); let byteSize=0;
@@ -3189,7 +3204,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
         <select className="border rounded-lg p-2" value={reportMode} onChange={e=>setReportMode(e.target.value)}>
           <option value="draft">ฉบับร่าง (ล่าสุด)</option>
           {publishedSnapshot&&<option value="published">ฉบับประกาศใช้</option>}
-        </select><span className="text-xs text-slate-500">{showingPublished?'ตารางที่ประกาศแล้ว (ไม่เปลี่ยนเมื่อแก้ฉบับร่าง)':'ตารางฉบับร่างที่กำลังแก้ไข'}</span>
+        </select><span className={`text-xs font-semibold px-2 py-1 rounded-full ${showingPublished?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}`}>{showingPublished?'ประกาศใช้แล้ว':'ฉบับร่าง'}</span><span className="text-xs text-slate-500">{showingPublished?`ประกาศเมื่อ ${new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH')} · ตารางที่ประกาศแล้วไม่เปลี่ยนเมื่อแก้ฉบับร่าง`:'ตารางฉบับร่างที่กำลังแก้ไข'}</span>
       </div>}
       {activeSubTab === 'health' && (
         <div className="grid grid-cols-2 gap-6">
@@ -3298,7 +3313,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
 
 const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   classrooms:draftClassrooms, teachers:draftTeachers, periods:draftPeriods,
-  schoolSettings:draftSettings, publishedSnapshot,
+  schoolSettings:draftSettings, publishedSnapshot, publishedLoading, publishedError,
   getSubject:lookupSubject, getShortTeacherName, getClassroom:lookupClassroom,
   getTeacher:lookupTeacher, fixedSchedules:draftFixed }) => {
   const [viewMode, setViewMode] = useState('room');
@@ -3312,12 +3327,25 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   const teachers=references?.teachers||draftTeachers;
   const periods=references?.periods||draftPeriods;
   const schoolSettings=references?.schoolSettings||draftSettings;
+  const printVersionCode=useMemo(()=>buildTimetablePrintCode({
+    academicYear:schoolSettings?.academicYear, semester:schoolSettings?.semester,
+    versionId:showingPublished?publishedSnapshot?.versionId:null,
+    schedules,fixedSchedules,activityGroups
+  }),[schoolSettings?.academicYear,schoolSettings?.semester,showingPublished,publishedSnapshot?.versionId,schedules,fixedSchedules,activityGroups]);
+  const publishedAtText=showingPublished&&publishedSnapshot?.publishedAt
+    ?new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH'):'-';
   const getSubject=id=>references?.subjects?.find(x=>x.id===id)||lookupSubject(id);
   const getTeacher=id=>teachers.find(x=>x.id===id)||lookupTeacher(id);
   const getClassroom=id=>id===ALL_CLASSROOMS_ID?{id,name:'ทุกห้องเรียน'}:(classrooms.find(x=>x.id===id)||lookupClassroom(id));
   // If publication becomes available, print the official copy by default.
   useEffect(()=>{setPrintMode(publishedSnapshot?'published':'draft');},[publishedSnapshot?.versionId]);
   const [selectedId, setSelectedId] = useState('');
+  const handlePrint=()=>{
+    if (!selectedId || publishedLoading) return;
+    // A confirmation is mandatory for the Print button when printing a draft.
+    if (!showingPublished && !window.confirm('คุณกำลังพิมพ์ตารางฉบับร่าง ซึ่งยังไม่ใช่ตารางทางการของโรงเรียน\n\nต้องการพิมพ์ฉบับร่างต่อหรือไม่?')) return;
+    window.print();
+  };
 
   const getCellContent = (targetId, day, periodId, vMode) => {
     const cellSchedules = schedules.filter(s => vMode === 'room' ? s.classroomId === targetId && s.day === day && s.periodId === periodId : s.teacherId === targetId && s.day === day && s.periodId === periodId);
@@ -3347,7 +3375,6 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
     <div className="bg-white p-10 rounded-xl border border-slate-200 text-black shadow-sm print-page mb-6">
       <div className="text-center mb-8 print-header">
         <h1 className="text-3xl font-bold mb-2">{String(schoolSettings?.schoolName || 'โรงเรียน')}</h1>
-        <div className="text-sm font-bold mb-2">{showingPublished?`ฉบับประกาศใช้ · ${publishedSnapshot.versionId} · วันที่ ${new Date(publishedSnapshot.publishedAt).toLocaleDateString('th-TH')}`:'ฉบับร่าง (ยังไม่ประกาศ)'}</div>
         <h2 className="text-xl mb-1">ตาราง{mode === 'room' ? 'เรียน' : 'สอน'} ภาคเรียนที่ {String(schoolSettings?.semester || '1')} ปีการศึกษา {String(schoolSettings?.academicYear || '2569')}</h2>
         <h3 className="text-lg font-bold">{mode === 'room' ? `ชั้น ${getClassroom(id).name}` : `ชื่อครูผู้สอน: ${getTeacher(id).name}`}</h3>
       </div>
@@ -3363,6 +3390,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.deputyName || '')})</p><p className="mt-1">รองผู้อำนวยการ</p></div>
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.directorName || '')})</p><p className="mt-1">ผู้อำนวยการโรงเรียน</p></div>
       </div>
+      <div className="print-version text-right text-[10px] text-slate-500 mt-3">รหัสตาราง: {printVersionCode}</div>
     </div>
   );
 
@@ -3378,8 +3406,17 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         <select value={printMode} onChange={e=>{setPrintMode(e.target.value);setSelectedId('');}} className="border rounded-xl p-3 font-bold">
           <option value="draft">พิมพ์ฉบับร่าง</option>{publishedSnapshot&&<option value="published">พิมพ์ฉบับประกาศใช้</option>}
         </select>
-        <button onClick={() => window.print()} disabled={!selectedId} className="px-8 py-3 bg-[#081a39] text-white rounded-xl shadow-md font-bold disabled:opacity-50 ml-auto hover:bg-[#122b5e]">พิมพ์เอกสาร</button>
+        <button onClick={handlePrint} disabled={!selectedId||publishedLoading} className="px-8 py-3 bg-[#081a39] text-white rounded-xl shadow-md font-bold disabled:opacity-50 ml-auto hover:bg-[#122b5e]">พิมพ์เอกสาร</button>
       </div>
+      <div className="no-print flex flex-wrap items-center gap-3 mb-4 rounded-xl border border-slate-200 bg-white p-3 text-sm">
+        <span className={`font-bold rounded-full px-3 py-1 ${showingPublished?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}`}>
+          {showingPublished?'ฉบับประกาศใช้แล้ว':'ฉบับร่าง (ยังไม่ประกาศ)'}
+        </span>
+        <span className="text-slate-700">{showingPublished?`วันที่ประกาศ: ${publishedAtText}`:'ยังแก้ไขได้ และต้องยืนยันก่อนพิมพ์'}</span>
+        <span className="text-slate-500 break-all">รหัสตาราง: {printVersionCode}</span>
+      </div>
+      {publishedLoading&&<p className="no-print mb-4 text-xs text-blue-800 bg-blue-50 p-3 rounded-lg">กำลังตรวจสอบฉบับประกาศใช้ กรุณารอสักครู่ก่อนพิมพ์</p>}
+      {publishedError&&<p className="no-print mb-4 text-xs text-rose-800 bg-rose-50 p-3 rounded-lg">{publishedError} · โปรดตรวจสอบสถานะก่อนเลือกพิมพ์</p>}
       {showingPublished&&!references&&<p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">หมายเหตุ: ฉบับประกาศเก่าไม่มีข้อมูลอ้างอิง ณ วันที่ประกาศ ชื่อครู/วิชาอาจแสดงตามข้อมูลปัจจุบัน</p>}
       <div id="print-area">{selectedId === 'ALL_PRINT' ? (viewMode === 'room' ? classrooms : teachers).map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />) : (selectedId && <PrintPage id={selectedId} mode={viewMode} />)}</div>
     </div>
@@ -4791,6 +4828,9 @@ export default function App() {
           }
           #print-area .print-signatures > div { width: 46%; }
           #print-area .print-signatures p { margin: 0 0 1.5mm !important; }
+          #print-area .print-version { margin-top: 3mm !important; text-align: right !important;
+            font-size: 7.5pt !important; line-height: 1.1 !important; color: #555 !important;
+            overflow-wrap: anywhere !important; }
         }
       `}</style>
       
