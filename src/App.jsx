@@ -3390,7 +3390,6 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.deputyName || '')})</p><p className="mt-1">รองผู้อำนวยการ</p></div>
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.directorName || '')})</p><p className="mt-1">ผู้อำนวยการโรงเรียน</p></div>
       </div>
-      <div className="print-version text-right text-[10px] text-slate-500 mt-3">รหัสตาราง: {printVersionCode}</div>
     </div>
   );
 
@@ -3413,7 +3412,6 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
           {showingPublished?'ฉบับประกาศใช้แล้ว':'ฉบับร่าง (ยังไม่ประกาศ)'}
         </span>
         <span className="text-slate-700">{showingPublished?`วันที่ประกาศ: ${publishedAtText}`:'ยังแก้ไขได้ และต้องยืนยันก่อนพิมพ์'}</span>
-        <span className="text-slate-500 break-all">รหัสตาราง: {printVersionCode}</span>
       </div>
       {publishedLoading&&<p className="no-print mb-4 text-xs text-blue-800 bg-blue-50 p-3 rounded-lg">กำลังตรวจสอบฉบับประกาศใช้ กรุณารอสักครู่ก่อนพิมพ์</p>}
       {publishedError&&<p className="no-print mb-4 text-xs text-rose-800 bg-rose-50 p-3 rounded-lg">{publishedError} · โปรดตรวจสอบสถานะก่อนเลือกพิมพ์</p>}
