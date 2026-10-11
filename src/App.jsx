@@ -1300,51 +1300,223 @@ const ConfirmModal = ({ confirmData, setConfirmData }) => {
   );
 };
 
-const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, health }) => {
-  const statusColor = health.status === 'ready' ? 'text-emerald-500' : health.status === 'warning' ? 'text-amber-500' : 'text-rose-500';
-  const statusBg = health.status === 'ready' ? 'bg-emerald-500' : health.status === 'warning' ? 'bg-amber-500' : health.status === 'empty' ? 'bg-slate-400' : 'bg-rose-500';
-  const statusText = health.status === 'ready' ? 'พร้อมใช้งาน' : health.status === 'warning' ? 'มีคำเตือน' : health.status === 'empty' ? 'ยังไม่มีข้อมูลภาระสอน' : 'มีข้อผิดพลาด (Conflict)';
+// STAGE 14: Dashboard derives class progress from the actual teaching loads,
+// not from a blanket 35 periods per classroom. Activity locks and college-day
+// closures are displayed separately and never counted as completed subject loads.
+const buildDashboardOverview = ({ teachers = [], activeSubjects = [], classrooms = [],
+  teachingLoads = [], schedules = [], fixedSchedules = [], activityGroups = [],
+  classroomUnavailabilities = [], periods = [], health = {} }) => {
+  const byRoom = new Map(classrooms.map(room => [room.id, {
+    id: room.id, name: room.name || room.id, required: 0, scheduled: 0,
+    missing: 0, overScheduled: 0, activities: 0, blockedSlots: 0, status: 'unset'
+  }]));
+  const keyOf = item => JSON.stringify([String(item.teacherId || ''), String(item.subjectId || ''), String(item.classroomId || '')]);
+  const loadMap = new Map();
+  teachingLoads.forEach(load => {
+    const key = keyOf(load);
+    const req = Number(load.periods);
+    if (!Number.isFinite(req) || req <= 0) return;
+    const prev = loadMap.get(key) || { required: 0, scheduled: 0, classroomId: load.classroomId };
+    prev.required += req;
+    loadMap.set(key, prev);
+    if (byRoom.has(load.classroomId)) byRoom.get(load.classroomId).required += req;
+  });
+  // Mirrors the health-check treatment of explicitly scheduled lessons and
+  // room-specific fixed lessons. All-room activities do not fulfill subject loads.
+  [...schedules, ...fixedSchedules.filter(item => item.classroomId !== ALL_CLASSROOMS_ID)]
+    .forEach(item => {
+      const load = loadMap.get(keyOf(item));
+      if (load) load.scheduled += 1;
+    });
+  loadMap.forEach(load => {
+    const room = byRoom.get(load.classroomId);
+    if (!room) return;
+    room.scheduled += Math.min(load.required, load.scheduled);
+    room.missing += Math.max(0, load.required - load.scheduled);
+    room.overScheduled += Math.max(0, load.scheduled - load.required);
+  });
+  const activitiesByRoom = new Map();
+  fixedSchedules.forEach(fixed => {
+    if (!DAYS.includes(fixed.day)) return;
+    const targets = fixed.classroomId === ALL_CLASSROOMS_ID
+      ? fixedTargetRoomIds(fixed, classrooms) : [fixed.classroomId];
+    targets.forEach(roomId => {
+      if (!byRoom.has(roomId)) return;
+      if (!activitiesByRoom.has(roomId)) activitiesByRoom.set(roomId, new Set());
+      activitiesByRoom.get(roomId).add(JSON.stringify([fixed.day, String(fixed.periodId)]));
+    });
+  });
+  const blockedByRoom = new Map();
+  classroomUnavailabilities.forEach(entry => {
+    if (!byRoom.has(entry.classroomId)) return;
+    if (!blockedByRoom.has(entry.classroomId)) blockedByRoom.set(entry.classroomId, new Set());
+    blockedByRoom.get(entry.classroomId).add(JSON.stringify([entry.day, String(entry.periodId)]));
+  });
+  const rooms = [...byRoom.values()].map(room => {
+    room.activities = activitiesByRoom.get(room.id)?.size || 0;
+    room.blockedSlots = blockedByRoom.get(room.id)?.size || 0;
+    room.status = room.required === 0 ? 'unset' : room.missing === 0 && room.overScheduled === 0 ? 'complete' : 'incomplete';
+    return room;
+  }).sort((a, b) => a.name.localeCompare(b.name, 'th', { numeric: true }));
+  const occupied = buildTeacherOccupancy(schedules, fixedSchedules, activityGroups);
+  const byTeacherDay = new Map();
+  occupied.forEach(item => {
+    if (!item.teacherId || !DAYS.includes(item.day)) return;
+    const key = JSON.stringify([item.teacherId, item.day]);
+    if (!byTeacherDay.has(key)) byTeacherDay.set(key, { teacherId: item.teacherId, day: item.day, periodIds: new Set() });
+    byTeacherDay.get(key).periodIds.add(String(item.periodId));
+  });
+  const names = new Map(teachers.map(t => [t.id, t.name || t.id]));
+  const fiveDays = [];
+  const heavyPatterns = [];
+  byTeacherDay.forEach(row => {
+    const count = row.periodIds.size;
+    const ids = [...row.periodIds];
+    const teacherName = names.get(row.teacherId) || row.teacherId;
+    if (count === 5) fiveDays.push({ ...row, teacherName, count });
+    const three = getThreePeriodTeachingPattern(ids, periods);
+    const four = getFourPeriodTeachingPattern(ids, periods);
+    if (three?.level === 'avoid') heavyPatterns.push({ teacherId: row.teacherId, teacherName, day: row.day, pattern: three.key });
+    if (four?.level === 'blocked') heavyPatterns.push({ teacherId: row.teacherId, teacherName, day: row.day, pattern: four.key });
+  });
+  const hardConflictKeys = ['teacherConflicts', 'roomConflicts', 'unavailConflicts',
+    'cUnavailConflicts', 'breakConflicts', 'blockConflicts', 'teacherLimitConflicts',
+    'customRuleConflicts', 'subjectDailyConflicts', 'orphans'];
+  const conflictCount = hardConflictKeys.reduce((sum, key) => sum + (health[key]?.length || 0), 0);
+  return {
+    rooms, fiveDays, heavyPatterns, conflictCount,
+    completeRooms: rooms.filter(room => room.status === 'complete').length,
+    incompleteRooms: rooms.filter(room => room.status === 'incomplete').length,
+    unsetRooms: rooms.filter(room => room.status === 'unset').length,
+    teacherCount: teachers.length, subjectCount: activeSubjects.length,
+    roomCount: classrooms.length, loadCount: teachingLoads.length,
+  };
+};
 
+const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teachingLoads,
+  schedules, fixedSchedules, activityGroups, classroomUnavailabilities, periods, health,
+  onNavigate, onOpenRoom }) => {
+  const [roomFilter, setRoomFilter] = useState('all');
+  const [roomSearch, setRoomSearch] = useState('');
+  const [showAllAlerts, setShowAllAlerts] = useState(false);
+  const summary = useMemo(() => buildDashboardOverview({ teachers, activeSubjects, classrooms,
+    teachingLoads, schedules, fixedSchedules, activityGroups, classroomUnavailabilities,
+    periods, health }), [teachers, activeSubjects, classrooms, teachingLoads, schedules,
+    fixedSchedules, activityGroups, classroomUnavailabilities, periods, health]);
+  const filteredRooms = summary.rooms.filter(room =>
+    (roomFilter === 'all' || room.status === roomFilter) &&
+    room.name.toLocaleLowerCase().includes(roomSearch.trim().toLocaleLowerCase()));
+  const statusLabels = {
+    ready: 'ภาระสอนครบ ไม่มีข้อขัดแย้ง', warning: 'มีรายการต้องตรวจสอบ',
+    empty: 'ยังไม่มีข้อมูลภาระสอน', error: 'พบข้อขัดแย้งของตาราง'
+  };
+  const currentStatus = health.status || 'empty';
+  const progress = Number(health.completionPercent) || 0;
+  const allAlerts = [
+    ...summary.fiveDays.map(item => ({ type: 'five', key: `five_${item.teacherId}_${item.day}`,
+      title: `${item.teacherName} · วัน${item.day}`, message: '5 คาบ/วัน — ข้อยกเว้นที่ควรตรวจสอบ' })),
+    ...summary.heavyPatterns.map(item => ({ type: 'heavy', key: `heavy_${item.teacherId}_${item.day}`,
+      title: `${item.teacherName} · วัน${item.day}`, message: `คาบ ${item.pattern.replaceAll(',', '–')} กระจุกตัว ควรปรับการกระจาย` }))
+  ];
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      <div className="bg-gradient-to-br from-[#081a39] via-[#122b5e] to-[#081a39] rounded-3xl p-8 text-white shadow-xl relative overflow-hidden border border-[#d4af37]/30">
-        <div className="absolute -top-20 -right-20 p-16 opacity-10 rotate-12 text-[#d4af37]"><Activity size={350} /></div>
-        <div className="relative z-10 flex flex-col md:flex-row justify-between md:items-end">
-          <div>
-            <h1 className="text-4xl font-bold mb-3 tracking-tight">ภาพรวมระบบ</h1>
-            <p className="text-[#d4af37] text-xl font-medium flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-[#d4af37]"></span>
-              {String(schoolSettings?.schoolName || 'โรงเรียน')} | ภาคเรียนที่ {String(schoolSettings?.semester || '1')}/{String(schoolSettings?.academicYear || '2569')}
-            </p>
+      <div className="bg-gradient-to-br from-[#081a39] via-[#122b5e] to-[#081a39] rounded-3xl p-6 sm:p-8 text-white shadow-xl border border-[#d4af37]/30">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-5">
+          <div className="space-y-2">
+            <h1 className="text-3xl sm:text-4xl font-bold">ภาพรวมการจัดตารางสอน</h1>
+            <p className="text-[#e6c55c] font-medium">{String(schoolSettings?.schoolName || 'โรงเรียน')} · ภาคเรียนที่ {String(schoolSettings?.semester || '1')}/{String(schoolSettings?.academicYear || '2569')}</p>
+            <p className="text-sm text-slate-200">ติดตามภาระสอนรายวิชา สถานะห้องเรียน และรายการที่ต้องตรวจสอบ</p>
           </div>
-          <div className="mt-6 md:mt-0 bg-white/10 backdrop-blur-md p-4 rounded-2xl border border-white/20 text-center min-w-[200px]">
-            <div className="text-sm font-bold text-white mb-1 flex justify-center items-center gap-2"><div className={`w-3 h-3 rounded-full ${statusBg} animate-pulse`}></div> สถานะ: {statusText}</div>
-            <div className="text-4xl font-bold text-[#d4af37]">{health.completionPercent}%</div>
-            <div className="text-xs mt-1 text-slate-300">จัดสำเร็จ {health.scheduledForLoads} / {health.totalRequired} คาบ</div>
+          <div className="bg-white/10 p-4 rounded-2xl border border-white/20 md:min-w-[215px]">
+            <p className="text-sm font-bold flex items-center gap-2"><span className={`w-2.5 h-2.5 rounded-full ${currentStatus === 'ready' ? 'bg-emerald-400' : currentStatus === 'empty' ? 'bg-slate-300' : 'bg-amber-400'}`}></span>{statusLabels[currentStatus] || 'กำลังตรวจสอบ'}</p>
+            <p className="text-4xl font-bold text-[#e6c55c] mt-2">{progress}%</p>
+            <p className="text-xs text-slate-200 mt-1">จัดภาระสอนรายวิชา {health.scheduledForLoads || 0} / {health.totalRequired || 0} คาบ</p>
           </div>
+        </div>
+        <div className="mt-5 h-2.5 rounded-full bg-white/15 overflow-hidden" role="progressbar" aria-label="ความคืบหน้าการจัดภาระสอน" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
+          <div className="h-full bg-[#d4af37] rounded-full transition-all" style={{ width: `${Math.max(0, Math.min(100, progress))}%` }}></div>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 flex flex-col justify-between">
-           <div className="text-slate-500 font-bold mb-2 flex items-center gap-2"><Briefcase size={18}/> ภาระสอนรวม</div>
-           <div className="text-3xl font-bold text-[#081a39]">{health.totalRequired} <span className="text-sm font-normal text-slate-500">คาบ</span></div>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        {[
+          {label:'ครูทั้งหมด', count: summary.teacherCount, unit:'คน', icon: Users},
+          {label:'ห้องเรียนทั้งหมด', count: summary.roomCount, unit:'ห้อง', icon: Home},
+          {label:'รายวิชาในภาคเรียน', count: summary.subjectCount, unit:'วิชา', icon: BookOpen},
+          {label:'คาบรายวิชาที่ยังไม่จัด', count: health.missing || 0, unit:'คาบ', icon: CalendarDays}
+        ].map(item => {
+          const Icon = item.icon;
+          return <div key={item.label} className="bg-white p-4 sm:p-5 rounded-2xl shadow-sm border border-slate-100">
+            <div className="flex items-center justify-between gap-2 text-xs sm:text-sm font-semibold text-slate-500"><span>{item.label}</span><Icon size={18}/></div>
+            <div className="text-3xl font-bold text-[#081a39] mt-3">{item.count} <span className="text-sm font-normal text-slate-500">{item.unit}</span></div>
+          </div>;
+        })}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 bg-white border border-slate-100 rounded-2xl p-5 sm:p-6 shadow-sm">
+          <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
+            <div><h2 className="text-xl font-bold text-[#081a39]">สถานะการจัดตารางรายห้อง</h2><p className="text-xs text-slate-500 mt-1">นับเฉพาะภาระสอนรายวิชาที่กำหนดให้ห้อง ไม่ใช้เป้าหมาย 35 คาบเท่ากันทุกห้อง</p></div>
+            <button onClick={() => onNavigate('schedule')} className="text-sm font-bold text-blue-700 hover:underline">ไปหน้าจัดตาราง →</button>
+          </div>
+          <div className="grid grid-cols-3 gap-2 mb-4 text-center">
+            <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3"><p className="font-bold text-2xl text-emerald-700">{summary.completeRooms}</p><p className="text-xs text-emerald-800">ภาระครบ</p></div>
+            <div className="bg-amber-50 border border-amber-100 rounded-xl p-3"><p className="font-bold text-2xl text-amber-700">{summary.incompleteRooms}</p><p className="text-xs text-amber-800">ยังไม่ครบ</p></div>
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3"><p className="font-bold text-2xl text-slate-700">{summary.unsetRooms}</p><p className="text-xs text-slate-600">ยังไม่กำหนด</p></div>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2 mb-3">
+            <select aria-label="กรองสถานะห้องเรียน" value={roomFilter} onChange={e => setRoomFilter(e.target.value)} className="border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white">
+              <option value="all">ทุกห้องเรียน</option><option value="incomplete">ยังไม่ครบ</option><option value="complete">ภาระครบ</option><option value="unset">ยังไม่กำหนด</option>
+            </select>
+            <label className="flex-1 flex items-center gap-2 px-3 border border-slate-200 rounded-xl"><Search size={17} className="text-slate-400"/><input aria-label="ค้นหาห้องเรียน" value={roomSearch} onChange={e => setRoomSearch(e.target.value)} className="w-full py-2 outline-none text-sm bg-transparent" placeholder="ค้นหา เช่น ม.4/3" /></label>
+          </div>
+          <div className="max-h-[410px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+            {filteredRooms.length === 0 && <p className="p-5 text-center text-slate-500 text-sm">ไม่พบห้องเรียนตามตัวกรอง</p>}
+            {filteredRooms.map(room => {
+              const percent = room.required ? Math.round(room.scheduled / room.required * 100) : 0;
+              return <button key={room.id} type="button" onClick={() => onOpenRoom(room.id)} className="w-full text-left border border-slate-100 bg-slate-50/60 hover:bg-blue-50 hover:border-blue-200 transition rounded-xl p-3 focus-visible:outline-2 focus-visible:outline-blue-600" aria-label={`เปิดตารางห้อง ${room.name}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-bold text-[#081a39] text-sm">{room.name}</div>
+                  <div className="flex items-center gap-2"><span className={`text-xs font-semibold px-2 py-1 rounded-full ${room.status==='complete'?'bg-emerald-100 text-emerald-700':room.status==='incomplete'?'bg-amber-100 text-amber-800':'bg-slate-200 text-slate-600'}`}>{room.status==='complete'?'ภาระครบ':room.status==='incomplete'?(room.missing > 0 ? `ขาด ${room.missing} คาบ` : 'จัดเกินภาระ'):'ยังไม่กำหนดภาระ'}</span><span className="text-sm text-blue-600">↗</span></div>
+                </div>
+                <div className="flex items-center gap-3 mt-2"><div className="flex-1 bg-slate-200 h-2 rounded-full overflow-hidden"><div className={`h-full rounded-full ${room.status==='complete'?'bg-emerald-500':'bg-amber-500'}`} style={{width:`${Math.min(100,percent)}%`}}></div></div><span className="text-xs text-slate-600 font-medium whitespace-nowrap">{room.scheduled}/{room.required} คาบ</span></div>
+                {(room.activities > 0 || room.blockedSlots > 0 || room.overScheduled > 0) && <p className="text-xs text-slate-500 mt-1.5">{[room.activities > 0 ? `กิจกรรมล็อก ${room.activities} คาบ` : '',room.blockedSlots > 0 ? `ปิดเวลา ${room.blockedSlots} คาบ` : '',room.overScheduled > 0 ? `จัดเกินภาระ ${room.overScheduled} คาบ` : ''].filter(Boolean).join(' · ')}</p>}
+              </button>;
+            })}
+          </div>
+          <p className="text-xs text-slate-500 mt-3">กดชื่อห้องเพื่อเปิดตารางเรียนของห้องนั้น · กิจกรรมและช่วงเวลาปิดห้องแยกจากภาระรายวิชา</p>
         </div>
-        <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 flex flex-col justify-between">
-           <div className="text-slate-500 font-bold mb-2 flex items-center gap-2"><CheckCircle2 size={18} className="text-emerald-500"/> จัดตารางแล้ว</div>
-           <div className="text-3xl font-bold text-emerald-700">{health.scheduledForLoads} <span className="text-sm font-normal opacity-70">คาบ</span></div>
-        </div>
-        <div className={`bg-white p-5 rounded-2xl shadow-sm border flex flex-col justify-between ${health.missing > 0 ? 'border-amber-200 bg-amber-50/30' : 'border-slate-100'}`}>
-           <div className={`font-bold mb-2 flex items-center gap-2 ${health.missing > 0 ? 'text-amber-600' : 'text-slate-500'}`}><AlertTriangle size={18}/> ยังจัดไม่ครบ</div>
-           <div className={`text-3xl font-bold ${health.missing > 0 ? 'text-amber-700' : 'text-[#081a39]'}`}>{health.missing} <span className="text-sm font-normal opacity-70">คาบ</span></div>
-        </div>
-        <div className={`bg-white p-5 rounded-2xl shadow-sm border flex flex-col justify-between ${health.status === 'error' ? 'border-rose-200 bg-rose-50/30' : 'border-slate-100'}`}>
-           <div className={`font-bold mb-2 flex items-center gap-2 ${health.status === 'error' ? 'text-rose-600' : 'text-slate-500'}`}><AlertCircle size={18}/> ข้อขัดแย้ง (Conflicts)</div>
-           <div className={`text-3xl font-bold ${health.status === 'error' ? 'text-rose-700' : 'text-[#081a39]'}`}>
-             {health.teacherConflicts.length + health.roomConflicts.length + health.unavailConflicts.length + health.cUnavailConflicts.length + health.breakConflicts.length + health.blockConflicts.length + health.teacherLimitConflicts.length + health.customRuleConflicts.length + health.subjectDailyConflicts.length + health.orphans.length}
-           </div>
+
+        <div className="space-y-4">
+          <div className="bg-white border border-slate-100 rounded-2xl p-5 shadow-sm">
+            <h2 className="font-bold text-lg text-[#081a39] flex gap-2 items-center"><AlertTriangle size={20} className={summary.conflictCount ? 'text-rose-500' : 'text-slate-400'}/>รายการที่ต้องตรวจสอบ</h2>
+            <div className="grid grid-cols-2 gap-2 mt-4">
+              <div className="bg-rose-50 rounded-xl p-3"><p className="text-2xl font-bold text-rose-700">{summary.conflictCount}</p><p className="text-xs text-rose-700">ข้อขัดแย้ง</p></div>
+              <div className="bg-amber-50 rounded-xl p-3"><p className="text-2xl font-bold text-amber-700">{summary.fiveDays.length}</p><p className="text-xs text-amber-700">วันครูสอน 5 คาบ</p></div>
+            </div>
+            {!!summary.heavyPatterns.length && <p className="text-sm text-amber-700 mt-3">พบรูปแบบคาบที่ควรกระจายใหม่ {summary.heavyPatterns.length} วัน-ครู</p>}
+            {summary.conflictCount === 0 && allAlerts.length === 0 && health.missing === 0 && teachingLoads.length > 0 && <p className="text-sm text-emerald-700 mt-3 flex gap-2 items-center"><CheckCircle2 size={17}/> ไม่พบรายการเตือนจากข้อมูลปัจจุบัน</p>}
+            {health.missing > 0 && <p className="text-sm text-amber-700 mt-3">ยังเหลือภาระสอน {health.missing} คาบที่ต้องจัด</p>}
+            <div className="space-y-2 mt-3">
+              {(showAllAlerts ? allAlerts : allAlerts.slice(0, 4)).map(alert => <div key={alert.key} className="border-l-2 border-amber-400 pl-3 py-1"><p className="text-sm font-semibold text-slate-800">{alert.title}</p><p className="text-xs text-slate-600">{alert.message}</p></div>)}
+              {allAlerts.length > 4 && <button onClick={() => setShowAllAlerts(s => !s)} className="text-sm text-blue-700 font-semibold hover:underline">{showAllAlerts ? 'แสดงน้อยลง' : `ดูทั้งหมด ${allAlerts.length} รายการ`}</button>}
+            </div>
+            <button onClick={() => onNavigate('reports')} className="w-full mt-4 border border-slate-200 hover:bg-slate-50 text-[#081a39] text-sm font-bold py-2.5 rounded-xl">เปิดรายงานตรวจตาราง →</button>
+          </div>
+          <div className="bg-white border border-slate-100 rounded-2xl p-5 shadow-sm">
+            <h2 className="font-bold text-lg text-[#081a39] mb-3">ทำงานต่ออย่างรวดเร็ว</h2>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                {id:'loads',label:'เพิ่มภาระสอน',icon: Briefcase},
+                {id:'schedule',label:'จัดตาราง',icon:CalendarDays},
+                {id:'reports',label:'ตรวจตาราง',icon:Activity},
+                {id:'print',label:'พิมพ์ตาราง',icon:Printer}
+              ].map(link => { const Icon=link.icon;return <button key={link.id} onClick={() => onNavigate(link.id)} className="flex flex-col items-start gap-2 p-3 text-left bg-slate-50 hover:bg-blue-50 border border-slate-100 rounded-xl text-[#081a39] font-semibold text-sm"><Icon size={20} className="text-blue-700"/>{link.label}</button>; })}
+            </div>
+          </div>
         </div>
       </div>
+      <p className="text-xs text-slate-500">สถานะ “ภาระครบ” หมายถึงจัดคาบรายวิชาตรงตามภาระสอนของห้อง ไม่ใช่การรับรองว่าไม่มีคาบชน กรุณาตรวจส่วนแจ้งเตือนประกอบ · ตัวเลขใช้ข้อมูลภาคเรียนที่เลือกในระบบ</p>
     </div>
   );
 };
@@ -2328,9 +2500,10 @@ const ConstraintsHub = ({ commonProps }) => {
   </div>;
 };
 
-const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, customRules, rulesReady, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion }) => {
+const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, customRules, rulesReady, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion, initialRoomId = '' }) => {
   const [viewMode, setViewMode] = useState('room');
-  const [selectedId, setSelectedId] = useState('');
+  const [selectedId, setSelectedId] = useState(initialRoomId);
+  useEffect(() => { if (initialRoomId) { setViewMode('room'); setSelectedId(initialRoomId); } }, [initialRoomId]);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [feasibility, setFeasibility] = useState(null);
   const [editingRows,setEditingRows] = useState(false);
@@ -2974,6 +3147,7 @@ const PrintView = ({ activityGroups, schedules, classrooms, teachers, periods, s
 export default function App() {
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [dashboardTargetRoom, setDashboardTargetRoom] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [toast, setToast] = useState(null);
   const [confirmData, setConfirmData] = useState(null);
@@ -4172,7 +4346,7 @@ export default function App() {
         <nav className="flex-1 overflow-y-auto py-6 custom-scrollbar space-y-1 px-3">
           {TABS.map(tab => {
             const IconComponent = tab.icon;
-            return <button key={tab.id} onClick={() => { setActiveTab(tab.id); setIsSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-medium ${activeTab === tab.id ? 'bg-gradient-to-r from-[#d4af37] to-[#e6c55c] text-[#081a39] shadow-md font-bold' : 'text-slate-300 hover:text-white hover:bg-white/10'}`}><IconComponent size={20} className={activeTab === tab.id ? "text-[#081a39]" : "opacity-80"} /> {tab.name}</button>;
+            return <button key={tab.id} onClick={() => { setDashboardTargetRoom(''); setActiveTab(tab.id); setIsSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-medium ${activeTab === tab.id ? 'bg-gradient-to-r from-[#d4af37] to-[#e6c55c] text-[#081a39] shadow-md font-bold' : 'text-slate-300 hover:text-white hover:bg-white/10'}`}><IconComponent size={20} className={activeTab === tab.id ? "text-[#081a39]" : "opacity-80"} /> {tab.name}</button>;
           })}
         </nav>
       </aside>
@@ -4182,12 +4356,12 @@ export default function App() {
           <button onClick={() => setIsSidebarOpen(true)} className="p-2 text-[#081a39] hover:bg-slate-100 rounded-lg flex items-center gap-2 font-bold transition-colors"><Menu size={24} /> เมนู</button>
         </header>
         <div className="flex-1 overflow-y-auto p-4 sm:p-8 custom-scrollbar">
-          {activeTab === 'dashboard' && <Dashboard {...commonProps} />}
+          {activeTab === 'dashboard' && <Dashboard {...commonProps} onNavigate={(tab) => { setDashboardTargetRoom(''); setActiveTab(tab); }} onOpenRoom={(roomId) => { setDashboardTargetRoom(roomId); setActiveTab('schedule'); }} />}
           {activeTab === 'settings' && <SettingsView {...commonProps} handleRestoreBackup={handleRestoreBackup} />}
           {activeTab === 'basicData' && <BasicDataHub commonProps={commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
           {activeTab === 'loads' && <LoadsView {...commonProps} />}
           {activeTab === 'constraintsHub' && <ConstraintsHub commonProps={commonProps} />}
-          {activeTab === 'schedule' && <ScheduleView {...commonProps} runSmartSchedule={runSmartSchedule} isScheduling={isScheduling} />}
+          {activeTab === 'schedule' && <ScheduleView {...commonProps} initialRoomId={dashboardTargetRoom} runSmartSchedule={runSmartSchedule} isScheduling={isScheduling} />}
           {activeTab === 'history' && <ScheduleHistoryView key={getTermKey(schoolSettings)} {...commonProps} />}
           {activeTab === 'reports' && <ReportsView {...commonProps} />}
           {activeTab === 'print' && <PrintView {...commonProps} />}
