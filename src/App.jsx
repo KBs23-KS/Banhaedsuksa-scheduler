@@ -2759,6 +2759,7 @@ const PLCView = ({teachers,plcSessions,periods,schedules,fixedSchedules,activity
   return <div className="space-y-5">
     <div className="bg-white border rounded-2xl p-5 space-y-4">
       <h3 className="font-bold text-lg">PLC กลุ่มสาระ — 1 คาบต่อสัปดาห์</h3>
+      <p className="text-sm text-slate-600">ขั้นตอนที่แนะนำ: กำหนด PLC ของแต่ละกลุ่มสาระให้เรียบร้อยก่อนลงวิชาหรือกดจัด Auto แล้วระบบจะกันคาบนี้ให้ครูทุกคนในกลุ่มโดยอัตโนมัติ</p>
       <p className="text-sm text-slate-600">PLC กันเวลาครู ไม่เป็นวิชาสอนและไม่ใช้ช่องตารางเรียนของนักเรียน สมาชิกครูอ้างอิงจากข้อมูลครู &gt; กลุ่มสาระ</p>
       <label className="block text-sm font-bold">กลุ่มสาระ</label>
       <select value={area} onChange={e=>setArea(e.target.value)} className="border rounded-xl p-3 w-full">
@@ -4575,6 +4576,11 @@ export default function App() {
   const runSmartSchedule = async () => {
     if (isScheduling) return;
     if (!rulesReady) return showToast('ยังโหลดเงื่อนไขเพิ่มเติมไม่สำเร็จ จึงไม่เริ่มจัดตาราง', 'error');
+    // Recommended workflow: reserve PLC before teaching. Still allow the editor to
+    // proceed deliberately when some groups do not need PLC in this term.
+    const activeAreas=[...new Set(teachers.map(t=>t.subjectArea).filter(a=>PLC_AREAS.includes(a)))];
+    const missingPLC=activeAreas.filter(a=>!plcSessions.some(p=>p.subjectArea===a));
+    if(missingPLC.length && !window.confirm(`ยังไม่ได้กำหนด PLC ให้กลุ่มสาระ: ${missingPLC.join(', ')}\n\nแนะนำให้เข้า “ข้อจำกัดและเงื่อนไข > PLC กลุ่มสาระ” แล้วจองคาบก่อนจัดวิชา เพื่อให้ Auto ไม่จัดวิชาทับ\n\nต้องการจัด Auto ต่อโดยยังไม่กำหนด PLC ให้กลุ่มเหล่านี้หรือไม่?`)) return;
     // STAGE 17.4: never assume an imported subject is single period without review.
     const pendingSubjects=subjects.filter(s=>s.needsScheduleReview &&
       teachingLoads.some(load=>load.subjectId===s.id));
@@ -4995,13 +5001,15 @@ export default function App() {
         setConfirmData(prev=>({...prev,isLoading:true}));
         try{
           const path=`school_data/${appId}/terms/${termKey}`;
-          const [ss,fs,gs]=await Promise.all(['schedules','fixedSchedules','activityGroups'].map(col=>
+          // Stage 23: PLC is part of the exact published timetable, not only a client-side check.
+          const [ss,fs,gs,ps]=await Promise.all(['schedules','fixedSchedules','activityGroups','plcSessions'].map(col=>
             getDocsFromServer(collection(db,`${path}/${col}`))));
-          const fromServer=[ss,fs,gs].map(snapshot=>snapshot.docs.map(x=>({...x.data(),id:x.id})));
+          const fromServer=[ss,fs,gs,ps].map(snapshot=>snapshot.docs.map(x=>({...x.data(),id:x.id})));
           if(getTermKey(schoolSettings)!==termKey||
             fingerprintScheduleRows(fromServer[0])!==fingerprintScheduleRows(schedules)||
             fingerprintScheduleRows(fromServer[1])!==fingerprintScheduleRows(fixedSchedules)||
-            fingerprintScheduleRows(fromServer[2])!==fingerprintScheduleRows(activityGroups))
+            fingerprintScheduleRows(fromServer[2])!==fingerprintScheduleRows(activityGroups)||
+            fingerprintScheduleRows(fromServer[3])!==fingerprintScheduleRows(plcSessions))
             throw new Error('ข้อมูลเปลี่ยนจากเครื่องอื่น กรุณาตรวจตารางและประกาศใหม่');
           const masterBase=`school_data/${appId}`;
           const refNames=['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules'];
@@ -5009,6 +5017,8 @@ export default function App() {
             ['teachers','subjects','classrooms','periods'].includes(name)?`${masterBase}/${name}`:`${path}/${name}`))));
           const frozen=Object.fromEntries(refNames.map((name,i)=>[name,refs[i].docs.map(d=>({...d.data(),id:d.id}))]));
           if(!frozen.periods.length)frozen.periods=DEFAULT_PERIODS;
+          // The publication reference includes the same PLC reservations as its history snapshot.
+          frozen.plcSessions=fromServer[3];
           frozen.schoolSettings={...schoolSettings};
           // The displayed catalog must match the catalog used to approve this publication.
           for(const name of ['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules','plcSessions']) {
@@ -5017,6 +5027,13 @@ export default function App() {
             if(fingerprintScheduleRows(frozen[name])!==fingerprintScheduleRows(local))
               throw new Error('ข้อมูลพื้นฐานหรือเงื่อนไขเปลี่ยนขณะประกาศ กรุณาตรวจข้อมูลใหม่');
           }
+          // Validate the frozen publication with the frozen PLC and all its teaching references.
+          const publishHealth=calculateScheduleHealth(fromServer[0],frozen.teachingLoads,
+            frozen.unavailabilities,frozen.classroomUnavailabilities,fromServer[1],
+            frozen.teachers,frozen.subjects,frozen.classrooms,frozen.periods,
+            frozen.scheduleRules,fromServer[2],frozen.plcSessions);
+          if(publishHealth.status==='error'||publishHealth.status==='empty'||publishHealth.missing>0||publishHealth.overScheduled>0)
+            throw new Error('ตารางหรือ PLC มีข้อขัดแย้ง กรุณาตรวจและจัดใหม่ก่อนประกาศ');
           const versionId=await saveScheduleVersion('published',fromServer[0],fromServer[1],termKey,fromServer[2],frozen,frozen.plcSessions);
           if(!versionId)throw new Error('สร้างฉบับประกาศไม่สำเร็จ');
           await setDoc(doc(db,`${path}/config/publishedTimetable`),{
@@ -5215,18 +5232,23 @@ export default function App() {
         {scheduleResult && (
           <div className="space-y-6">
             <div className="border border-indigo-200 rounded-xl p-4 space-y-3">
-              <h3 className="font-bold text-indigo-900">เปรียบเทียบตัวเลือก Auto (สูงสุด 3 แบบ)</h3>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                {(scheduleResult.candidates||[]).map((option,index)=><button key={index} type="button"
-                  onClick={()=>chooseScheduleCandidate(index)} className={`rounded-xl border p-3 text-left text-sm ${scheduleResult.candidateIndex===index?'border-indigo-600 bg-indigo-50':'border-slate-200 hover:bg-slate-50'}`}>
-                  <strong>แบบ {index+1}</strong><br/>ขาด {option.missingCount} คาบ<br/>
-                  วันสอน 5 คาบ {option.fivePeriodCount} วัน<br/>
-                  วันหนัก 4–5 คาบ {option.weeklyBalance?.heavyDays??'-'} วัน<br/>
-                  คาบว่างคั่น {option.weeklyBalance?.gaps??'-'} ช่อง
-                  <div className="text-xs text-slate-500 mt-1">คะแนนเทียบกัน {Number(option.score).toFixed(0)}</div>
-                </button>)}
-              </div>
-              {(scheduleResult.candidates||[]).length<3&&<p className="text-xs text-slate-500">ระบบพบผลที่ต่างกันเพียง {scheduleResult.candidates?.length||0} แบบ ไม่สร้างตัวเลือกเทียมให้ครบ 3</p>}
+              <h3 className="font-bold text-indigo-900">ระบบเลือกตารางที่เหมาะสมที่สุดที่ค้นพบให้แล้ว</h3>
+              <p className="text-sm text-slate-700">{scheduleResult.candidateIndex===0
+                ? 'กำลังแสดงแบบที่ระบบแนะนำ (แบบที่ 1) ตรวจผลด้านล่างแล้วกด “ใช้งานตารางนี้” ได้เลย'
+                : `คุณเลือกแบบที่ ${scheduleResult.candidateIndex+1} แทนแบบที่ระบบแนะนำ`}</p>
+              <p className="text-xs text-slate-500">ระบบจัดอันดับจากความครบของคาบ จำนวนวันที่สอน 5 คาบ และความสมดุลของภาระครู โดยยังให้ตรวจสอบก่อนบันทึกจริง</p>
+              {(scheduleResult.candidates||[]).length>1&&<details className="border border-indigo-100 rounded-lg p-3 bg-white">
+                <summary className="cursor-pointer font-bold text-sm text-indigo-800">ไม่พอใจแบบที่เลือก? ดูและเปลี่ยนตัวเลือกอื่น ({scheduleResult.candidates.length} แบบ)</summary>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3">
+                  {(scheduleResult.candidates||[]).map((option,index)=><button key={index} type="button"
+                    onClick={()=>chooseScheduleCandidate(index)} className={`rounded-xl border p-3 text-left text-sm ${scheduleResult.candidateIndex===index?'border-indigo-600 bg-indigo-50':'border-slate-200 hover:bg-slate-50'}`}>
+                    <strong>แบบ {index+1}{index===0?' (ระบบแนะนำ)':''}</strong><br/>ขาด {option.missingCount} คาบ<br/>
+                    วันสอน 5 คาบ {option.fivePeriodCount} วัน<br/>
+                    วันหนัก 4–5 คาบ {option.weeklyBalance?.heavyDays??'-'} วัน<br/>
+                    คาบว่างคั่น {option.weeklyBalance?.gaps??'-'} ช่อง
+                  </button>)}
+                </div>
+              </details>}
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-xl text-center"><div className="text-emerald-700 font-bold text-sm mb-1">จัดลงสำเร็จ</div><div className="text-2xl font-bold text-emerald-800">{scheduleResult.stats.scheduled} <span className="text-sm">/ {scheduleResult.stats.totalReq} คาบ</span></div></div>
