@@ -1661,23 +1661,84 @@ const ClassroomsView = ({ classrooms, dbAction, showToast, handleRequestDelete, 
 const LOAD_IMPORT_HEADERS = ['รหัสครู', 'ชื่อครู', 'รหัสวิชา', 'ชื่อวิชา', 'ชื่อห้อง', 'จำนวนคาบ/สัปดาห์'];
 
 const normalizeExcelText = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+const validSubjectCode = id => !!id && id !== '.' && id !== '..' && !id.includes('/');
+const isSubjectActiveInTerm = (subject, semester) => !!subject && (!subject.term || subject.term === 'all' || String(subject.term) === String(semester));
+const defaultImportedSubject = ({ id, name, periods, semester, periodBlock = 1, preferredTime = 'any', abbr = '' }) => ({
+  id: normalizeExcelText(id),
+  name: normalizeExcelText(name),
+  abbr: normalizeExcelText(abbr) || normalizeExcelText(name),
+  periodsPerWeek: Number(periods),
+  term: String(semester),
+  periodBlock: Number(periodBlock),
+  preferredTime,
+});
+const classifySubjectRows = (rows, subjects, semester) => {
+  const known = new Map(subjects.map(s => [normalizeExcelText(s.id), s]));
+  const created = new Map();
+  const errors = [];
+  rows.forEach(({ subjectId, subjectName, periods, prefix }) => {
+    const id = normalizeExcelText(subjectId);
+    const name = normalizeExcelText(subjectName);
+    const label = prefix || id;
+    if (!validSubjectCode(id) || !name) { errors.push(`${label}: รหัสวิชาหรือชื่อวิชาไม่ถูกต้อง`); return; }
+    const found = known.get(id) || created.get(id);
+    if (found) {
+      if (normalizeExcelText(found.name) !== name) errors.push(`${label}: รหัสวิชา ${id} มีชื่อไม่ตรงกัน (${found.name} / ${name})`);
+      else if (!isSubjectActiveInTerm(found, semester)) errors.push(`${label}: รหัส ${id} มีอยู่แล้วแต่ไม่เปิดใช้ในภาคเรียนนี้ กรุณาจัดการในเมนูรายวิชา`);
+    } else {
+      const value = Number(periods);
+      if (!Number.isInteger(value) || value < 1) errors.push(`${label}: จำนวนคาบ/สัปดาห์ไม่ถูกต้อง`);
+      else created.set(id, defaultImportedSubject({ id, name, periods: value, semester }));
+    }
+  });
+  return { subjectsToCreate: [...created.values()], errors };
+};
 
-const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbAction, bulkUpsertTeachingLoads, showToast, handleRequestDelete, schoolSettings, getTeacher, getSubject, getClassroom }) => {
+const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classrooms, saveTeachingLoadsWithSubjects, setConfirmData, showToast, handleRequestDelete, schoolSettings, getTeacher, getSubject, getClassroom }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [form, setForm] = useState({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 });
+  const [createNewSubject, setCreateNewSubject] = useState(false);
+  const [newSubject, setNewSubject] = useState({ id: '', name: '', abbr: '', periodBlock: 1, preferredTime: 'any' });
+  const [isSaving, setIsSaving] = useState(false);
+  const [originalLoad, setOriginalLoad] = useState(null);
+  const resetNewSubject = () => { setCreateNewSubject(false); setNewSubject({ id: '', name: '', abbr: '', periodBlock: 1, preferredTime: 'any' }); };
   const excelInputRef = useRef(null);
   
   const handleSave = async () => {
+    if (isSaving) return;
     const periodsValue = Number(form.periods);
-    if (!form.teacherId || !form.subjectId || !form.classroomId || !Number.isInteger(periodsValue) || periodsValue < 1) return showToast("กรุณากรอกข้อมูลให้ครบ และกำหนดจำนวนคาบเป็นจำนวนเต็มบวก", "error");
-    const isDuplicate = teachingLoads.some(l => l.teacherId === form.teacherId && l.subjectId === form.subjectId && l.classroomId === form.classroomId && l.id !== form.id );
-    if (isDuplicate) return showToast("มีภาระสอนรายการนี้อยู่แล้ว กรุณาแก้ไขจำนวนคาบจากรายการเดิม", "error");
-
-    const id = isEditing && form.id ? form.id : `L_${Date.now()}`;
-    const ok = await dbAction('teachingLoads', id, { ...form, periods: periodsValue, id });
-    if (ok) { setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 }); setIsModalOpen(false); showToast(isEditing ? "บันทึกการแก้ไขสำเร็จ" : "เพิ่มภาระสอนสำเร็จ"); }
+    const subjectId = createNewSubject ? normalizeExcelText(newSubject.id) : form.subjectId;
+    if (!form.teacherId || !subjectId || !form.classroomId || !Number.isInteger(periodsValue) || periodsValue < 1) return showToast('กรุณากรอกข้อมูลให้ครบ และกำหนดจำนวนคาบเป็นจำนวนเต็มบวก', 'error');
+    if (!validSubjectCode(subjectId)) return showToast('รหัสวิชาไม่ถูกต้อง (ห้าม / และรหัส . หรือ ..)', 'error');
+    let proposedSubjects = [];
+    if (createNewSubject) {
+      const subjectName = normalizeExcelText(newSubject.name);
+      if (!subjectName) return showToast('กรุณากรอกชื่อรายวิชาใหม่', 'error');
+      const result = classifySubjectRows([{ subjectId, subjectName, periods: periodsValue, prefix: 'วิชาใหม่' }], subjects, schoolSettings.semester);
+      if (result.errors.length) return showToast(result.errors[0], 'error');
+      // Explicitly choosing 'new' must not silently reuse an existing subject.
+      if (!result.subjectsToCreate.length) return showToast('รหัสวิชานี้มีอยู่แล้ว กรุณาเลือกจากรายวิชาเดิม', 'error');
+      proposedSubjects = [defaultImportedSubject({ id: subjectId, name: subjectName, abbr: newSubject.abbr,
+        periods: periodsValue, semester: schoolSettings.semester, periodBlock: newSubject.periodBlock, preferredTime: newSubject.preferredTime })];
+    }
+    const isDuplicate = teachingLoads.some(l => l.teacherId === form.teacherId && l.subjectId === subjectId && l.classroomId === form.classroomId && l.id !== form.id);
+    if (isDuplicate) return showToast('มีภาระสอนรายการนี้อยู่แล้ว กรุณาแก้ไขรายการเดิม', 'error');
+    const id = isEditing && form.id ? form.id : `L_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    setIsSaving(true);
+    try {
+      const item = { id, teacherId: form.teacherId, subjectId, classroomId: form.classroomId, periods: periodsValue,
+        expectedExisting: isEditing, expectedPreviousTriple: isEditing && originalLoad ? getTeachingLoadKey(originalLoad) : '',
+        expectedPreviousPeriods: isEditing && originalLoad ? Number(originalLoad.periods) : undefined };
+      const nameAssertions = !createNewSubject ? { [subjectId]: activeSubjects.find(s=>s.id===subjectId)?.name || '' } : {};
+      const ok = await saveTeachingLoadsWithSubjects([item], proposedSubjects, nameAssertions);
+      if (ok) {
+        setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 });
+        resetNewSubject(); setOriginalLoad(null); setIsModalOpen(false);
+        showToast(proposedSubjects.length ? 'สร้างรายวิชาและบันทึกภาระสอนสำเร็จ' : (isEditing ? 'บันทึกการแก้ไขสำเร็จ' : 'เพิ่มภาระสอนสำเร็จ'));
+      }
+    } finally { setIsSaving(false); }
   };
 
   const downloadExcelTemplate = () => {
@@ -1699,11 +1760,11 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
         ['1', 'กรอกข้อมูลในชีต "ภาระสอน" โดยห้ามเปลี่ยนชื่อหัวคอลัมน์'],
         ['2', '1 แถว = ครู 1 คน + วิชา 1 วิชา + ห้องเรียน 1 ห้อง'],
         ['3', 'รหัสครูและชื่อครูต้องตรงกับชีต "รายชื่อครู"'],
-        ['4', 'รหัสวิชาและชื่อวิชาต้องตรงกับชีต "รายวิชา" ของภาคเรียนปัจจุบัน'],
+        ['4', 'หากรหัสวิชาใหม่ ระบบจะสร้างรายวิชาให้อัตโนมัติ (รูปแบบคาบเดี่ยว เวลาใดก็ได้); หากรหัสเดิม ชื่อต้องตรงกัน'],
         ['5', 'ชื่อห้องต้องตรงกับชีต "ห้องเรียน" (ชื่อห้องในระบบต้องไม่ซ้ำกัน)'],
         ['6', 'จำนวนคาบ/สัปดาห์ต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป'],
         ['7', 'ห้ามมีครู+วิชา+ห้องซ้ำกันมากกว่า 1 แถวในไฟล์เดียว'],
-        ['8', 'ถ้ารายการมีอยู่แล้ว ระบบจะอัปเดตจำนวนคาบจาก Excel โดยไม่สร้างรายการซ้ำ'],
+        ['8', 'ระบบแสดงตัวอย่างจำนวนวิชาใหม่และภาระสอนก่อนยืนยัน; สามารถปรับคาบคู่/เวลาเหมาะสมที่เมนูรายวิชาภายหลัง'],
         [],
         ['ตัวอย่าง'],
         ['T001', 'นายตัวอย่าง ครูผู้สอน', 'ค21101', 'คณิตศาสตร์ 1', 'ม.1/1', '4']
@@ -1777,7 +1838,7 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
       }
 
       const teacherById = new Map(teachers.map(t => [normalizeExcelText(t.id), t]));
-      const subjectById = new Map(activeSubjects.map(s => [normalizeExcelText(s.id), s]));
+      const subjectById = new Map(subjects.map(s => [normalizeExcelText(s.id), s]));
       const roomsByName = new Map();
       classrooms.forEach(c => {
         const name = normalizeExcelText(c.name);
@@ -1788,6 +1849,7 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
       const seenKeys = new Map();
       const errors = [];
       const importedItems = [];
+      const subjectRows = [];
       let createCount = 0;
       let updateCount = 0;
       const importToken = Date.now();
@@ -1819,12 +1881,16 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
         }
 
         const subject = subjectById.get(subjectId);
-        if (!subject) {
-          errors.push(`${prefix}: ไม่พบรหัสวิชา ${subjectId} ในภาคเรียนนี้`);
+        if (subject && normalizeExcelText(subject.name) !== subjectName) {
+          errors.push(`${prefix}: ชื่อวิชาไม่ตรงกับรหัส ${subjectId} (${subject.name})`);
           return;
         }
-        if (normalizeExcelText(subject.name) !== subjectName) {
-          errors.push(`${prefix}: ชื่อวิชาไม่ตรงกับรหัส ${subjectId}`);
+        if (subject && !isSubjectActiveInTerm(subject, schoolSettings.semester)) {
+          errors.push(`${prefix}: รหัส ${subjectId} มีอยู่แล้วแต่ไม่เปิดใช้ในภาคเรียนนี้`);
+          return;
+        }
+        if (!validSubjectCode(subjectId)) {
+          errors.push(`${prefix}: รหัสวิชาไม่ถูกต้อง`);
           return;
         }
 
@@ -1854,7 +1920,10 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
 
         const existing = existingByKey.get(key);
         const id = existing?.id || `L_IMPORT_${importToken}_${index + 1}`;
-        importedItems.push({ id, teacherId, subjectId, classroomId, periods: periodsValue });
+        importedItems.push({ id, teacherId, subjectId, classroomId, periods: periodsValue,
+          expectedExisting: Boolean(existing), expectedPreviousTriple: existing ? getTeachingLoadKey(existing) : '',
+          expectedPreviousPeriods: existing ? Number(existing.periods) : undefined });
+        subjectRows.push({ subjectId, subjectName, periods: periodsValue, prefix });
         if (existing) updateCount += 1;
         else createCount += 1;
       });
@@ -1866,9 +1935,25 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
         return;
       }
 
-      const ok = await bulkUpsertTeachingLoads(importedItems);
-      if (!ok) return;
-      showToast(`นำเข้า Excel ${files.length} ไฟล์สำเร็จ ${importedItems.length} รายการ (เพิ่ม ${createCount}, อัปเดต ${updateCount})`);
+      const classification = classifySubjectRows(subjectRows, subjects, schoolSettings.semester);
+      if (classification.errors.length) {
+        showToast(`ตรวจรายวิชาไม่ผ่าน: ${classification.errors.slice(0, 3).join(' | ')}`, 'error');
+        return;
+      }
+      const newSubjects = classification.subjectsToCreate;
+      const sampleNames = newSubjects.slice(0, 8).map(s => `${s.id} ${s.name}`).join('\n');
+      const moreNames = newSubjects.length > 8 ? `\n...และอีก ${newSubjects.length - 8} วิชา` : '';
+      setConfirmData({
+        type: 'restore', title: 'ตรวจสอบก่อนนำเข้า Excel', confirmText: 'ยืนยันนำเข้า',
+        message: `Excel ${files.length} ไฟล์ รวม ${importedItems.length} ภาระสอน\nเพิ่มภาระสอน ${createCount} / อัปเดต ${updateCount}\nสร้างรายวิชาใหม่ ${newSubjects.length} วิชา\n${sampleNames}${moreNames}\n\nวิชาใหม่จะตั้งต้นเป็นคาบเดี่ยวและเลือกเวลาใดก็ได้ ตรวจและแก้คุณสมบัติในเมนูรายวิชาภายหลัง`,
+        action: async () => {
+          setConfirmData(prev => ({ ...prev, isLoading: true }));
+          const names = Object.fromEntries(subjectRows.map(row => [row.subjectId, row.subjectName]));
+          const ok = await saveTeachingLoadsWithSubjects(importedItems, newSubjects, names);
+          if (ok) { setConfirmData(null); showToast(`นำเข้าสำเร็จ ${importedItems.length} ภาระสอน และเพิ่มวิชา ${newSubjects.length} วิชา`); }
+          else setConfirmData(prev => ({ ...prev, isLoading: false }));
+        }
+      });
     } catch (error) {
       console.error(error);
       showToast(`อ่านไฟล์ Excel ไม่สำเร็จ: ${error?.message || 'ไฟล์ไม่ถูกต้อง'}`, 'error');
@@ -1885,7 +1970,7 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
           <button onClick={downloadExcelTemplate} className="flex items-center gap-2 px-4 py-2 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-medium shadow-sm transition-colors"><FileSpreadsheet size={18} className="text-emerald-600" /> ดาวน์โหลดแม่แบบ Excel</button>
           <button onClick={() => excelInputRef.current?.click()} disabled={isImporting} className="flex items-center gap-2 px-4 py-2 bg-slate-50 border border-slate-200 text-[#081a39] rounded-xl hover:bg-slate-100 font-medium shadow-sm transition-colors disabled:opacity-50"><UploadCloud size={18} className="text-amber-600" /> {isImporting ? 'กำลังนำเข้า...' : 'นำเข้า Excel'}</button>
           <input ref={excelInputRef} type="file" accept=".xlsx,.xls" multiple onChange={handleExcelImport} className="hidden" />
-          <button onClick={() => { setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 }); setIsEditing(false); setIsModalOpen(true); }} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มภาระสอน</button>
+          <button onClick={() => { setForm({ id: '', teacherId: '', subjectId: '', classroomId: '', periods: 1 }); resetNewSubject(); setOriginalLoad(null); setIsEditing(false); setIsModalOpen(true); }} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มภาระสอน</button>
         </div>
       </div>
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col">
@@ -1898,7 +1983,7 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
                 {teachingLoads.map(l => (
                   <tr key={l.id} className="border-b border-slate-50 hover:bg-[#081a39]/5">
                     <td className="p-4 font-medium text-[#081a39]">{getTeacher(l.teacherId).name}</td><td className="p-4 text-slate-600"><span className="text-xs font-mono bg-slate-100 text-slate-500 px-2 py-1 rounded mr-2">{l.subjectId}</span>{getSubject(l.subjectId).name}</td><td className="p-4 text-center font-bold text-[#d4af37]">{getClassroom(l.classroomId).name}</td><td className="p-4 text-center font-medium">{l.periods}</td>
-                    <td className="p-4 text-center"><div className="flex items-center justify-center gap-2"><button onClick={() => { setForm(l); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39] rounded-lg"><Edit size={18}/></button><button onClick={() => handleRequestDelete('load', l)} className="p-2 text-slate-400 hover:text-rose-500 rounded-lg"><Trash2 size={18}/></button></div></td>
+                    <td className="p-4 text-center"><div className="flex items-center justify-center gap-2"><button onClick={() => { setForm(l); resetNewSubject(); setOriginalLoad({...l}); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39] rounded-lg"><Edit size={18}/></button><button onClick={() => handleRequestDelete('load', l)} className="p-2 text-slate-400 hover:text-rose-500 rounded-lg"><Trash2 size={18}/></button></div></td>
                   </tr>
                 ))}
               </tbody>
@@ -1908,10 +1993,30 @@ const LoadsView = ({ teachingLoads, teachers, activeSubjects, classrooms, dbActi
       <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={isEditing ? "แก้ไขภาระการสอน" : "เพิ่มภาระการสอน"}>
         <div className="space-y-4">
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">ครูผู้สอน</label><select value={form.teacherId} onChange={e => setForm({...form, teacherId: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
-          <div><label className="block text-sm font-bold text-[#081a39] mb-1">รายวิชา</label><select value={form.subjectId} onChange={e => setForm({...form, subjectId: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50"><option value="">-- เลือกรายวิชา --</option>{activeSubjects.map(s => <option key={s.id} value={s.id}>{s.name} ({s.id})</option>)}</select></div>
+          <div><label className="block text-sm font-bold text-[#081a39] mb-1">รายวิชา</label>
+            <select value={createNewSubject ? '__CREATE_NEW_SUBJECT__' : form.subjectId} onChange={e => {
+              if (e.target.value === '__CREATE_NEW_SUBJECT__') { setCreateNewSubject(true); setForm(prev => ({ ...prev, subjectId: '' })); }
+              else { setCreateNewSubject(false); setForm(prev => ({ ...prev, subjectId: e.target.value })); }
+            }} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50">
+              <option value="">-- เลือกรายวิชา --</option>
+              {activeSubjects.map(s => <option key={s.id} value={s.id}>{s.name} ({s.id})</option>)}
+              <option value="__CREATE_NEW_SUBJECT__">+ เพิ่มรายวิชาใหม่พร้อมภาระสอน</option>
+            </select>
+            {createNewSubject && <div className="mt-3 space-y-3 bg-amber-50 border border-amber-200 rounded-xl p-3">
+              <p className="text-sm font-bold text-amber-900">สร้างรายวิชาอัตโนมัติพร้อมบันทึกภาระสอน</p>
+              <div><label className="block text-xs font-bold mb-1">รหัสวิชาใหม่</label><input value={newSubject.id} onChange={e=>setNewSubject(prev=>({...prev,id:e.target.value}))} className="w-full p-2 border rounded-lg" placeholder="เช่น ค21101" /></div>
+              <div><label className="block text-xs font-bold mb-1">ชื่อวิชา</label><input value={newSubject.name} onChange={e=>setNewSubject(prev=>({...prev,name:e.target.value}))} className="w-full p-2 border rounded-lg" placeholder="เช่น คณิตศาสตร์พื้นฐาน" /></div>
+              <div><label className="block text-xs font-bold mb-1">ชื่อย่อ (ไม่กรอกจะใช้ชื่อวิชา)</label><input value={newSubject.abbr} onChange={e=>setNewSubject(prev=>({...prev,abbr:e.target.value}))} className="w-full p-2 border rounded-lg" /></div>
+              <div className="grid grid-cols-2 gap-2">
+                <div><label className="block text-xs font-bold mb-1">คาบต่อเนื่อง</label><select value={newSubject.periodBlock} onChange={e=>setNewSubject(prev=>({...prev,periodBlock:Number(e.target.value)}))} className="w-full p-2 border rounded-lg"><option value={1}>คาบเดี่ยว</option><option value={2}>คาบคู่ (Block 2)</option></select></div>
+                <div><label className="block text-xs font-bold mb-1">ช่วงเวลาที่เหมาะสม</label><select value={newSubject.preferredTime} onChange={e=>setNewSubject(prev=>({...prev,preferredTime:e.target.value}))} className="w-full p-2 border rounded-lg"><option value="any">เวลาใดก็ได้</option><option value="morning">ช่วงเช้า</option><option value="afternoon">ช่วงบ่าย</option></select></div>
+              </div>
+              <p className="text-xs text-amber-800">จำนวนคาบรายวิชาเริ่มต้นจะเท่าภาระสอนรายการนี้ สามารถแก้ที่เมนูรายวิชาภายหลัง</p>
+            </div>}
+          </div>
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">ห้องเรียน</label><select value={form.classroomId} onChange={e => setForm({...form, classroomId: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50"><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">จำนวนคาบ/สัปดาห์</label><input type="number" min="1" value={form.periods} onChange={e => setForm({...form, periods: parseInt(e.target.value)})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50" /></div>
-          <button onClick={handleSave} className="w-full mt-2 bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึกภาระสอน</button>
+          <button onClick={handleSave} disabled={isSaving} className="w-full mt-2 bg-[#081a39] text-white py-3 rounded-xl font-bold disabled:opacity-50">{isSaving ? "กำลังบันทึก..." : (createNewSubject ? "สร้างวิชาและบันทึกภาระสอน" : "บันทึกภาระสอน")}</button>
         </div>
       </Modal>
     </div>
@@ -3132,6 +3237,103 @@ export default function App() {
   };
 
 
+  // STAGE 12: Save loads and any newly discovered subjects in one transaction.
+  // Read ALL referenced subject IDs from the server before any write. An existing
+  // subject with the same code but a different name/term is never overwritten.
+  const saveTeachingLoadsWithSubjects = async (items, proposedSubjects = [], subjectNameAssertions = {}) => {
+    if (!user || !Array.isArray(items) || !items.length || !Array.isArray(proposedSubjects)) return false;
+    try {
+      const semester = String(schoolSettings.semester);
+      const basePath = `school_data/${appId}`;
+      const termPath = `${basePath}/terms/${getTermKey(schoolSettings)}`;
+      const proposedById = new Map();
+      for (const proposed of proposedSubjects) {
+        const id = normalizeExcelText(proposed.id), name = normalizeExcelText(proposed.name);
+        const weekly = Number(proposed.periodsPerWeek);
+        if (!validSubjectCode(id) || !name || proposedById.has(id) || !Number.isInteger(weekly) || weekly < 1 ||
+          ![1,2].includes(Number(proposed.periodBlock)) || !['any','morning','afternoon'].includes(proposed.preferredTime)) throw new Error('ข้อมูลรายวิชาใหม่ไม่ถูกต้อง');
+        proposedById.set(id, { ...proposed, id, name, term: semester, periodsPerWeek: weekly });
+      }
+      const cleanItems = items.map(item => {
+        const id = String(item.id || '').trim();
+        const teacherId = String(item.teacherId || '').trim();
+        const subjectId = String(item.subjectId || '').trim();
+        const classroomId = String(item.classroomId || '').trim();
+        const periods = Number(item.periods);
+        if (!id || id.includes('/') || !teacherId || !validSubjectCode(subjectId) || !classroomId || !Number.isInteger(periods) || periods < 1) throw new Error('ข้อมูลภาระสอนไม่ถูกต้อง');
+        return { id, teacherId, subjectId, classroomId, periods,
+          expectedExisting: item.expectedExisting === true, expectedPreviousTriple: item.expectedPreviousTriple || '',
+          expectedPreviousPeriods: item.expectedPreviousPeriods }; 
+      });
+      const uniqueLoadIds = new Set(cleanItems.map(item => item.id));
+      const uniqueTriples = new Set(cleanItems.map(getTeachingLoadKey));
+      if (uniqueLoadIds.size !== cleanItems.length || uniqueTriples.size !== cleanItems.length) throw new Error('พบภาระสอนซ้ำในข้อมูลที่นำเข้า');
+      // The Firebase WEB SDK currently caps runTransaction at 500 writes.
+      // Preserve the existing bulk-import path for large files with NO new subjects.
+      // Mixed files above this threshold must be split to keep each subject/load pair atomic.
+      if (proposedById.size + cleanItems.length > 450) {
+        if (proposedById.size === 0) {
+          // Existing large-import behavior, but validate the live subject catalog first.
+          const serverSubjects = await getDocsFromServer(collection(db, `${basePath}/subjects`));
+          const available = new Map(serverSubjects.docs.map(snap => [snap.id, snap.data()]));
+          for (const item of cleanItems) {
+            const live = available.get(item.subjectId);
+            if (!live || !isSubjectActiveInTerm(live, semester) ||
+                (subjectNameAssertions[item.subjectId] && normalizeExcelText(live.name) !== normalizeExcelText(subjectNameAssertions[item.subjectId])))
+              throw new Error(`รายวิชา ${item.subjectId} มีข้อมูลไม่ตรงกับฐานข้อมูล กรุณาโหลดข้อมูลใหม่`);
+          }
+          return await bulkUpsertTeachingLoads(cleanItems);
+        }
+        throw new Error('มีรายวิชาใหม่และรายการรวมเกิน 450 รายการ กรุณาแบ่งไฟล์ Excel เป็นชุดย่อย');
+      }
+      const subjectIds = [...new Set(cleanItems.map(item => item.subjectId))];
+      for (const id of proposedById.keys()) if (!subjectIds.includes(id)) throw new Error(`รายวิชาใหม่ ${id} ไม่มีภาระสอนรองรับ`);
+      const subjectRefs = subjectIds.map(id => doc(db, `${basePath}/subjects`, id));
+      const loadRefs = cleanItems.map(item => doc(db, `${termPath}/teachingLoads`, item.id));
+      const currentLoadSnapshot = await getDocsFromServer(collection(db, `${termPath}/teachingLoads`));
+      const importedIds = new Set(cleanItems.map(i => i.id));
+      const existingOtherTriples = new Set(currentLoadSnapshot.docs
+        .filter(snap => !importedIds.has(snap.id)).map(snap => getTeachingLoadKey(snap.data())));
+      if (cleanItems.some(i => existingOtherTriples.has(getTeachingLoadKey(i)))) throw new Error('พบภาระสอนซ้ำกับรายการอื่นในระบบ กรุณาโหลดข้อมูลใหม่');
+      await runTransaction(db, async tx => {
+        // All reads precede writes, including current load versions.
+        const subjectSnaps = await Promise.all(subjectRefs.map(ref => tx.get(ref)));
+        const loadSnaps = await Promise.all(loadRefs.map(ref => tx.get(ref)));
+        for (let idx = 0; idx < subjectIds.length; idx++) {
+          const id = subjectIds[idx];
+          const live = subjectSnaps[idx].exists() ? subjectSnaps[idx].data() : null;
+          const proposed = proposedById.get(id);
+          if (!live && !proposed) throw new Error(`ไม่พบรายวิชา ${id} ในฐานข้อมูล กรุณาเพิ่มวิชาหรือโหลดข้อมูลใหม่`);
+          if (live && proposed) throw new Error(`รหัสวิชา ${id} มีอยู่แล้วในฐานข้อมูล กรุณาตรวจสอบชื่อวิชาและลองใหม่`);
+          if (live && !isSubjectActiveInTerm(live, semester)) throw new Error(`รายวิชา ${id} ไม่เปิดใช้ภาคเรียน ${semester}`);
+          if (live && subjectNameAssertions[id] && normalizeExcelText(live.name) !== normalizeExcelText(subjectNameAssertions[id]))
+            throw new Error(`ชื่อวิชา ${id} เปลี่ยนไปจากตอนตรวจสอบ กรุณาโหลดข้อมูลใหม่`);
+          if (live && !validSubjectCode(id)) throw new Error(`รหัสวิชา ${id} ไม่ถูกต้อง`);
+        }
+        for (let i = 0; i < cleanItems.length; i++) {
+          const live = loadSnaps[i].exists() ? loadSnaps[i].data() : null;
+          if (cleanItems[i].expectedExisting) {
+            if (!live || getTeachingLoadKey(live) !== cleanItems[i].expectedPreviousTriple ||
+                Number(live.periods) !== Number(cleanItems[i].expectedPreviousPeriods))
+              throw new Error(`รายการภาระสอน ${cleanItems[i].id} เปลี่ยนไปแล้ว กรุณาโหลดข้อมูลใหม่`);
+          } else if (live) {
+            throw new Error(`มีรหัสรายการภาระสอน ${cleanItems[i].id} อยู่แล้ว กรุณาลองอีกครั้ง`);
+          }
+        }
+        subjectIds.forEach((id, i) => {
+          const proposed = proposedById.get(id);
+          if (proposed) tx.set(subjectRefs[i], proposed);
+        });
+        cleanItems.forEach((item,i) => tx.set(loadRefs[i], { id:item.id, teacherId:item.teacherId, subjectId:item.subjectId, classroomId:item.classroomId, periods:item.periods }));
+      });
+      return true;
+    } catch (error) {
+      console.error('Save loads and new subjects failed', error);
+      showToast(`บันทึกไม่สำเร็จ: ${error?.message || 'กรุณาลองอีกครั้ง'} (ไม่มีการบันทึกเป็นบางส่วน)`, 'error');
+      return false;
+    }
+  };
+
   const bulkUpsertTeachingLoads = async (items) => {
     if (!user || !Array.isArray(items) || items.length === 0) return false;
     try {
@@ -3881,7 +4083,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, bulkDeleteSubjects, renameSubjectId, blockClassroomDay, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, activityGroups, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, renameSubjectId, blockClassroomDay, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, activityGroups, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
