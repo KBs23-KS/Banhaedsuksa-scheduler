@@ -2023,8 +2023,9 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
   );
 };
 
-const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, blockClassroomDay, showToast, handleRequestDelete, getTeacher, getClassroom, getSubject, customRules, rulesReady }) => {
-  const [activeSubTab, setActiveSubTab] = useState('teacher');
+const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, blockClassroomDay, showToast, handleRequestDelete, getTeacher, getClassroom, getSubject, customRules, rulesReady, mode = 'time' }) => {
+  // Stage 13: use the existing editor either for time restrictions or fixed activities.
+  const [activeSubTab, setActiveSubTab] = useState(mode === 'fixed' ? 'fixed' : 'teacher');
   const [tForm, setTForm] = useState({ teacherId: '', day: 'จันทร์', periodId: '1' });
   const [cForm, setCForm] = useState({ classroomId: '', day: 'จันทร์', periodId: '1', reason: '' });
   const [fForm, setFForm] = useState({ subjectId: '', classroomId: '', teacherId: '', day: 'จันทร์', periodId: '1',includedClassroomIds:[] });
@@ -2083,7 +2084,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
 
   return (
     <div className="animate-in fade-in space-y-6">
-      <div className="flex gap-3 bg-slate-50 p-2 rounded-xl w-fit border border-slate-200"><SubTabBtn id="teacher" label="เวลาที่ครูไม่สะดวก" icon={Users} /><SubTabBtn id="room" label="เวลาที่ห้องไม่ว่าง" icon={Home} /><SubTabBtn id="fixed" label="กิจกรรมล็อกตายตัว" icon={Pin} /></div>
+      {mode === 'time' && <div className="flex gap-3 flex-wrap bg-slate-50 p-2 rounded-xl w-fit border border-slate-200"><SubTabBtn id="teacher" label="เวลาที่ครูไม่สะดวก" icon={Users} /><SubTabBtn id="room" label="เวลาที่ห้องไม่ว่าง" icon={Home} /></div>}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-1 bg-white rounded-2xl shadow-sm border border-slate-100 p-6 h-fit sticky top-6">
           <h2 className="text-lg font-bold text-[#081a39] mb-4 flex items-center gap-2">เพิ่มข้อมูลใหม่</h2>
@@ -2265,6 +2266,65 @@ const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teacher
         <button onClick={async()=>{if(window.confirm('ยืนยันลบกิจกรรมกลุ่มนี้?')) await dbAction('activityGroups',g.id,null,'delete');}} className="text-rose-600 border rounded-lg p-2"><Trash2 size={16}/></button>
       </div>)}
     </div>
+  </div>;
+};
+
+
+// STAGE 13: navigation-only grouping. Existing editors retain their original data and write paths.
+const ManagementTabs = ({ title, tabs, value, onChange }) => (
+  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 no-print">
+    <h2 className="text-xl font-bold text-[#081a39] mb-4">{title}</h2>
+    <div role="tablist" aria-label={title} className="flex flex-wrap gap-2">
+      {tabs.map(item => {
+        const Icon = item.icon;
+        const selected = value === item.id;
+        return <button
+          key={item.id} type="button" role="tab" aria-selected={selected}
+          onClick={() => onChange(item.id)}
+          className={`inline-flex items-center gap-2 rounded-xl px-4 py-3 font-bold text-sm transition-colors ${selected ? 'bg-[#081a39] text-[#d4af37] shadow-md' : 'bg-slate-50 border border-slate-200 text-slate-700 hover:bg-slate-100'}`}>
+          <Icon size={17} />{item.name}
+        </button>;
+      })}
+    </div>
+  </div>
+);
+
+const BasicDataHub = ({ commonProps, autoGenerateClassrooms }) => {
+  const [section, setSection] = useState('teachers');
+  const tabs = [
+    { id: 'teachers', name: 'ข้อมูลครู', icon: Users },
+    { id: 'subjects', name: 'รายวิชา', icon: BookOpen },
+    { id: 'classrooms', name: 'ห้องเรียน', icon: Home },
+  ];
+  return <div className="space-y-6 animate-in fade-in">
+    <ManagementTabs title="ข้อมูลพื้นฐาน" tabs={tabs} value={section} onChange={setSection} />
+    {section === 'teachers' && <TeachersView {...commonProps} />}
+    {section === 'subjects' && <SubjectsView {...commonProps} importBasicSubjects={() => {}} />}
+    {section === 'classrooms' && <ClassroomsView {...commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
+  </div>;
+};
+
+const ConstraintsHub = ({ commonProps }) => {
+  const [section, setSection] = useState('time');
+  const tabs = [
+    { id: 'time', name: 'ข้อจำกัดเวลา', icon: Clock },
+    { id: 'rules', name: 'เงื่อนไขการจัดตาราง', icon: Filter },
+    { id: 'fixed', name: 'กิจกรรมล็อกตายตัว', icon: Pin },
+  ];
+  return <div className="space-y-6 animate-in fade-in">
+    <ManagementTabs title="ข้อจำกัดและเงื่อนไข" tabs={tabs} value={section} onChange={setSection} />
+    {section === 'time' && <ConstraintsView key="time-constraints" mode="time" {...commonProps} />}
+    {section === 'rules' && <CustomRulesView {...commonProps} />}
+    {section === 'fixed' && <>
+      <ConstraintsView key="fixed-activities" mode="fixed" {...commonProps} />
+      <details className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 shadow-sm">
+        <summary className="cursor-pointer font-bold text-[#081a39]">
+          กำหนดกิจกรรมพัฒนาผู้เรียนแยกตามห้อง (เฉพาะกรณีที่ต้องการ)
+        </summary>
+        <p className="text-sm text-slate-600 mt-3 mb-4">สร้างกิจกรรมหลักแบบทุกห้องหรือเลือกหลายห้องไว้ก่อน แล้วเปิดส่วนนี้เพื่อกำหนดชื่อกิจกรรมและครูรับผิดชอบรายห้อง</p>
+        <ActivityGroupsView {...commonProps} />
+      </details>
+    </>}
   </div>;
 };
 
@@ -4077,9 +4137,14 @@ export default function App() {
   };
 
   const TABS = [
-    { id: 'dashboard', name: 'หน้าแรก', icon: LayoutDashboard }, { id: 'teachers', name: 'ข้อมูลครู', icon: Users }, { id: 'subjects', name: 'รายวิชา', icon: BookOpen },
-    { id: 'classrooms', name: 'ห้องเรียน', icon: Home }, { id: 'loads', name: 'ภาระสอน', icon: Briefcase }, { id: 'constraints', name: 'ข้อจำกัดเวลา', icon: Clock },
-    { id: 'rules', name: 'เงื่อนไขเพิ่มเติม', icon: Filter }, { id:'activityGroups',name:'กิจกรรมกลุ่ม',icon:Users }, { id: 'schedule', name: 'จัดตารางสอน', icon: CalendarDays }, { id: 'history', name: 'ประวัติตาราง', icon: Clock }, { id: 'reports', name: 'รายงานและ Export', icon: Activity }, { id: 'print', name: 'พิมพ์ตาราง', icon: Printer },
+    { id: 'dashboard', name: 'หน้าแรก', icon: LayoutDashboard },
+    { id: 'basicData', name: 'ข้อมูลพื้นฐาน', icon: Users },
+    { id: 'loads', name: 'ภาระสอน', icon: Briefcase },
+    { id: 'constraintsHub', name: 'ข้อจำกัดและเงื่อนไข', icon: Clock },
+    { id: 'schedule', name: 'จัดตารางสอน', icon: CalendarDays },
+    { id: 'history', name: 'ประวัติตาราง', icon: Clock },
+    { id: 'reports', name: 'รายงานและ Export', icon: Activity },
+    { id: 'print', name: 'พิมพ์ตาราง', icon: Printer },
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
@@ -4119,13 +4184,9 @@ export default function App() {
         <div className="flex-1 overflow-y-auto p-4 sm:p-8 custom-scrollbar">
           {activeTab === 'dashboard' && <Dashboard {...commonProps} />}
           {activeTab === 'settings' && <SettingsView {...commonProps} handleRestoreBackup={handleRestoreBackup} />}
-          {activeTab === 'teachers' && <TeachersView {...commonProps} />}
-          {activeTab === 'subjects' && <SubjectsView {...commonProps} importBasicSubjects={()=>{}} />}
-          {activeTab === 'classrooms' && <ClassroomsView {...commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
+          {activeTab === 'basicData' && <BasicDataHub commonProps={commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
           {activeTab === 'loads' && <LoadsView {...commonProps} />}
-          {activeTab === 'constraints' && <ConstraintsView {...commonProps} />}
-          {activeTab === 'rules' && <CustomRulesView {...commonProps} />}
-          {activeTab === 'activityGroups' && <ActivityGroupsView {...commonProps} />}
+          {activeTab === 'constraintsHub' && <ConstraintsHub commonProps={commonProps} />}
           {activeTab === 'schedule' && <ScheduleView {...commonProps} runSmartSchedule={runSmartSchedule} isScheduling={isScheduling} />}
           {activeTab === 'history' && <ScheduleHistoryView key={getTermKey(schoolSettings)} {...commonProps} />}
           {activeTab === 'reports' && <ReportsView {...commonProps} />}
