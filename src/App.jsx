@@ -2872,7 +2872,6 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
           <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs text-indigo-700 font-medium">เป้าหมายครู 4 คาบ/วัน (5 คาบเฉพาะจำเป็นและต้องยืนยัน) · ลากคาบเรียนเพื่อย้ายได้ · คลิก 🔓 เพื่อเก็บไว้เมื่อจัดใหม่ · ล็อกไว้ {schedules.filter(s=>s.keepOnRegenerate).length} คาบ · จัดใหม่เฉพาะคาบ Auto ที่ไม่ล็อก</span>
           <button onClick={handleFeasibilityClick} disabled={isScheduling || !rulesReady} className="flex items-center gap-2 px-4 py-3 bg-slate-100 text-[#081a39] border border-slate-200 rounded-xl font-bold disabled:opacity-50"><Search size={17}/> ตรวจความเป็นไปได้</button>
         <button onClick={publishDraftSchedule} disabled={isScheduling||!rulesReady} className="flex items-center gap-2 px-4 py-3 bg-emerald-700 text-white rounded-xl font-bold disabled:opacity-50">ประกาศใช้ฉบับร่าง</button>
         <button onClick={runSmartSchedule} disabled={isScheduling} className={`flex items-center gap-2 px-6 py-3 text-white rounded-xl shadow-md font-bold transition-all ${isScheduling ? 'bg-slate-400 cursor-not-allowed' : 'bg-gradient-to-r from-[#d4af37] to-[#b8952b] hover:shadow-lg'}`}><RefreshCw size={18} className={isScheduling ? "animate-spin" : ""} /> {isScheduling ? "กำลังจัดตาราง (AI)..." : "จัดตารางอัตโนมัติ"}</button>
@@ -3287,7 +3286,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
 
   const PrintPage = ({ id, mode }) => (
     <div className="bg-white p-10 rounded-xl border border-slate-200 text-black shadow-sm print-page mb-6">
-      <div className="text-center mb-8">
+      <div className="text-center mb-8 print-header">
         <h1 className="text-3xl font-bold mb-2">{String(schoolSettings?.schoolName || 'โรงเรียน')}</h1>
         <div className="text-sm font-bold mb-2">{showingPublished?'ฉบับประกาศใช้':'ฉบับร่าง (ยังไม่ประกาศ)'}</div>
         <h2 className="text-xl mb-1">ตาราง{mode === 'room' ? 'เรียน' : 'สอน'} ภาคเรียนที่ {String(schoolSettings?.semester || '1')} ปีการศึกษา {String(schoolSettings?.academicYear || '2569')}</h2>
@@ -3301,7 +3300,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
           ))}
         </tbody>
       </table>
-      <div className="flex justify-between px-28 mt-24 text-sm font-medium">
+      <div className="flex justify-between px-28 mt-24 text-sm font-medium print-signatures">
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.deputyName || '')})</p><p className="mt-1">รองผู้อำนวยการ</p></div>
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.directorName || '')})</p><p className="mt-1">ผู้อำนวยการโรงเรียน</p></div>
       </div>
@@ -3309,7 +3308,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   );
 
   return (
-    <div className="animate-in fade-in">
+    <div className="animate-in fade-in bhs-print-view">
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 mb-6 flex flex-wrap items-center gap-4 no-print">
         <div className="p-3 bg-[#081a39] rounded-xl shadow-md"><Printer className="text-[#d4af37]" size={28} /></div>
         <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId('');}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">พิมพ์ตารางเรียน (รายห้อง)</option><option value="teacher">พิมพ์ตารางสอน (รายครู)</option></select>
@@ -4600,7 +4599,7 @@ export default function App() {
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
   return (
-    <div className="flex h-screen bg-[#f8fafc] font-sans text-slate-900 selection:bg-[#d4af37]/30">
+    <div className="flex h-screen bg-[#f8fafc] font-sans text-slate-900 selection:bg-[#d4af37]/30 bhs-app-shell">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap');
         .font-sans { font-family: 'Sarabun', sans-serif; }
@@ -4608,7 +4607,62 @@ export default function App() {
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #081a39; }
-        @media print { @page { size: A4 landscape; margin: 10mm; } body * { visibility: hidden; } #print-area, #print-area * { visibility: visible; } #print-area { position: absolute; left: 0; top: 0; width: 100%; } .no-print { display: none !important; } .print-table { -webkit-print-color-adjust: exact; print-color-adjust: exact; } .print-page { break-after: page; page-break-after: always; border: none !important; box-shadow: none !important; margin: 0 !important; padding: 0 !important;} }
+        /* Print only the timetable: let the page use the full A4 landscape width. */
+        @page { size: A4 landscape; margin: 8mm; }
+        @media print {
+          html, body, #root { width: 100% !important; height: auto !important; overflow: visible !important; margin: 0 !important; padding: 0 !important; background: white !important; }
+          .bhs-app-shell, .bhs-main, .bhs-scroll-content, .bhs-print-view {
+            display: block !important; position: static !important; width: 100% !important;
+            height: auto !important; max-width: none !important; min-height: 0 !important;
+            overflow: visible !important; margin: 0 !important; padding: 0 !important;
+            background: white !important; box-shadow: none !important;
+          }
+          .bhs-app-shell > aside, .bhs-main > header, .no-print { display: none !important; }
+          #print-area { display: block !important; position: static !important; left: auto !important; top: auto !important; width: 100% !important; max-width: none !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+          #print-area .print-page {
+            display: block !important; box-sizing: border-box !important; position: static !important;
+            width: 100% !important; height: auto !important; min-height: 0 !important;
+            padding: 0 !important; margin: 0 !important; border: 0 !important;
+            border-radius: 0 !important; box-shadow: none !important;
+            break-inside: avoid-page; page-break-inside: avoid;
+            break-after: page; page-break-after: always;
+          }
+          #print-area .print-page:last-child { break-after: auto !important; page-break-after: auto !important; }
+          #print-area .print-header { margin: 0 0 4mm !important; line-height: 1.2 !important; }
+          #print-area .print-header h1 { font-size: 17pt !important; margin: 0 0 1.5mm !important; }
+          #print-area .print-header h2 { font-size: 11.5pt !important; margin: 0 0 1mm !important; }
+          #print-area .print-header h3 { font-size: 11pt !important; margin: 0 !important; }
+          #print-area .print-header div { font-size: 9pt !important; margin: 0 0 1mm !important; }
+          #print-area .print-table {
+            width: 100% !important; max-width: 100% !important; table-layout: fixed !important;
+            border-collapse: collapse !important; margin: 0 !important;
+            -webkit-print-color-adjust: exact; print-color-adjust: exact;
+          }
+          #print-area .print-table th, #print-area .print-table td {
+            box-sizing: border-box !important; border: 1px solid #111 !important;
+            padding: 1.5mm 1mm !important; vertical-align: middle !important;
+            text-align: center !important; font-size: 9pt !important; line-height: 1.2 !important;
+            overflow-wrap: anywhere !important; word-break: break-word !important;
+            white-space: normal !important;
+          }
+          #print-area .print-table th:first-child { width: 19mm !important; }
+          #print-area .print-table thead th { height: 13mm !important; font-size: 9pt !important; }
+          #print-area .print-table thead th div { font-size: 8.5pt !important; line-height: 1.15 !important; }
+          #print-area .print-table tbody tr { height: 22mm !important; break-inside: avoid !important; page-break-inside: avoid !important; }
+          #print-area .print-table tbody td { height: 22mm !important; }
+          #print-area .print-table .truncate {
+            overflow: visible !important; text-overflow: clip !important; white-space: normal !important;
+          }
+          #print-area .print-table td div { max-width: 100% !important; overflow-wrap: anywhere !important; }
+          #print-area .print-signatures {
+            display: flex !important; justify-content: space-between !important;
+            margin: 8mm 0 0 !important; padding: 0 10mm !important;
+            font-size: 10pt !important; line-height: 1.25 !important;
+            break-inside: avoid !important;
+          }
+          #print-area .print-signatures > div { width: 46%; }
+          #print-area .print-signatures p { margin: 0 0 1.5mm !important; }
+        }
       `}</style>
       
       {isSidebarOpen && <div className="fixed inset-0 bg-slate-900/50 z-20 md:hidden backdrop-blur-sm" onClick={() => setIsSidebarOpen(false)} />}
@@ -4624,11 +4678,11 @@ export default function App() {
         </nav>
       </aside>
 
-      <main className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden relative bhs-main">
         <header className="md:hidden bg-white border-b border-[#081a39]/10 p-3 flex items-center shadow-sm z-10 no-print">
           <button onClick={() => setIsSidebarOpen(true)} className="p-2 text-[#081a39] hover:bg-slate-100 rounded-lg flex items-center gap-2 font-bold transition-colors"><Menu size={24} /> เมนู</button>
         </header>
-        <div className="flex-1 overflow-y-auto p-4 sm:p-8 custom-scrollbar">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-8 custom-scrollbar bhs-scroll-content">
           {activeTab === 'dashboard' && <Dashboard {...commonProps} onNavigate={(tab) => { setDashboardTargetRoom(''); setActiveTab(tab); }} onOpenRoom={(roomId) => { setDashboardTargetRoom(roomId); setActiveTab('schedule'); }} />}
           {activeTab === 'settings' && <SettingsView {...commonProps} handleRestoreBackup={handleRestoreBackup} />}
           {activeTab === 'basicData' && <BasicDataHub commonProps={commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
