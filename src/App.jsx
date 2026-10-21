@@ -3549,13 +3549,13 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
          {isConflict && <div className="absolute -top-2 -right-2 text-rose-500 bg-rose-100 rounded-full p-0.5 shadow-sm"><AlertCircle size={14}/></div>}
          {cellFix.map((f, idx) => (
            <div key={f.id} className={idx > 0 || cellSch.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
-             <div className="font-bold text-amber-700 flex items-center justify-center gap-1">{!isDevelopmentActivity(f) && <Pin size={10}/>} {viewMode==='room' && f.classroomId===ALL_CLASSROOMS_ID
+             <div className="font-bold text-amber-700 flex items-center justify-center gap-1">{viewMode==='room' && f.classroomId===ALL_CLASSROOMS_ID
                ? fixedActivityDisplayName(f,getSubject,activityGroups,selectedId)
                : fixedActivityDisplayName(f,getSubject)}</div>
              <button onClick={(e) => { e.stopPropagation(); handleRequestDelete('fixed', f); }} className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-rose-500 text-white rounded-full p-0.5 z-10"><X size={12}/></button>
            </div>
          ))}
-         {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{isDevelopmentActivity(g) ? g.name : `${g.name} · ${g.scopeLabel || getClassroom(g.classroomId).name}`}</div>)}
+         {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{g.name}</div>)}
          {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1">{plcDisplayName(item.subjectArea)}</div>)}
          {cellSch.map((sch, idx) => (
            <div key={sch.id} draggable={!isScheduling&&!editingRows} onDragStart={e=>{e.dataTransfer.setData('text/plain',sch.id);e.dataTransfer.effectAllowed='move';}}
@@ -3840,8 +3840,11 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
           if(x.__isPLC)return sanitizeExcelInput(plcDisplayName(x.subjectArea));
           const group=mode==='room'?activityGroups.find(g=>g.fixedId===x.id&&g.classroomId===item.id):
             activityGroups.find(g=>'activity_'+g.id===x.id);
-          const subject=x.__activityName||group?.name||(isDevelopmentActivity(x)?fixedActivityDisplayName(x,getSubject):getSubject(x.subjectId).name);
-          if(isDevelopmentActivity(x)) return sanitizeExcelInput(subject);
+          const isActivity=fixed.includes(x)||groups.includes(x);
+          const subject=isActivity
+            ? (x.__activityName||group?.name||fixedActivityDisplayName(x,getSubject,activityGroups,mode==='room'?item.id:''))
+            : (isDevelopmentActivity(x)?fixedActivityDisplayName(x,getSubject):getSubject(x.subjectId).name);
+          if(isActivity||isDevelopmentActivity(x)) return sanitizeExcelInput(subject);
           const other=mode==='room'?(x.teacherId?getTeacher(x.teacherId).name:(fixedActivityTeacherIds(x).length?`ครู ${fixedActivityTeacherIds(x).length} คน`:'ไม่ระบุครู')):
             (x.scopeLabel || getClassroom(x.classroomId).name);
           return sanitizeExcelInput(subject+' — '+other);
@@ -4074,7 +4077,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
       <div className="flex flex-col items-center justify-center text-[11px] text-center w-full h-full">
         {combined.map((sch, idx) => (
           sch.__isPLC ? <div key={sch.id} className="font-bold text-[10px] leading-tight break-words">{plcDisplayName(sch.subjectArea)}</div> : <div key={sch.id} className={`w-full ${idx > 0 ? 'mt-1 pt-1 border-t border-black/20' : ''}`}>
-            {isDevelopmentActivity(sch) ? <div className="font-bold text-[11px] leading-tight break-words">{sch.groupLabel || (vMode==='room' ? fixedActivityDisplayName(sch,getSubject,activityGroups,targetId) : fixedActivityDisplayName(sch,getSubject))}</div> : <>
+            {(cellFixed.includes(sch) || sch.__activityTeacherOnly || isDevelopmentActivity(sch)) ? <div className="font-bold text-[11px] leading-tight break-words">{sch.groupLabel || (vMode==='room' ? fixedActivityDisplayName(sch,getSubject,activityGroups,targetId) : fixedActivityDisplayName(sch,getSubject))}</div> : <>
             <div className={`font-bold truncate text-[11px] ${cellFixed.includes(sch) ? 'text-amber-800' : ''}`}>{sch.subjectId}</div>
             {vMode === 'room' ? (
                <><div className="truncate text-[11px]">{sch.teacherId ? getShortTeacherName(getTeacher(sch.teacherId).name) : (fixedActivityTeacherIds(sch).length ? `ครู ${fixedActivityTeacherIds(sch).length} คน` : '-')}</div><div className="text-[10px] truncate">{sch.groupLabel || (vMode==='room' && sch.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===sch.id&&g.classroomId===targetId)?.name : '') || getSubject(sch.subjectId).name}</div></>
