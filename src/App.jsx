@@ -2406,7 +2406,20 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
   );
 };
 
-const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, getTeacher, getClassroom, getSubject, customRules, rulesReady, plcSessions = [], mode = 'time' }) => {
+// STAGE 25: Plan fixed-activity bulk deletion without changing unrelated records.
+// Child activities cannot outlive their selected parent. Delete only children of
+// selected parents, together with parents, in one atomic Firestore operation.
+const planFixedActivityBulkDeletion = (selectedIds, fixedItems = [], groupItems = []) => {
+  const ids = [...new Set((Array.isArray(selectedIds) ? selectedIds : []).map(String))];
+  if (!ids.length || ids.some(id => !id || id.includes('/'))) throw new Error('FIXED_SELECTION_EMPTY');
+  const byId = new Map(fixedItems.map(item => [String(item.id), item]));
+  if (ids.some(id => !byId.has(id))) throw new Error('FIXED_SELECTION_CHANGED');
+  const idSet = new Set(ids);
+  return { ids, selected: ids.map(id => byId.get(id)),
+    linkedGroups: groupItems.filter(group => idSet.has(String(group.fixedId))) };
+};
+
+const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, bulkDeleteFixedSchedules, schoolSettings, getTeacher, getClassroom, getSubject, customRules, rulesReady, plcSessions = [], mode = 'time' }) => {
   // Stage 13: use the existing editor either for time restrictions or fixed activities.
   const [activeSubTab, setActiveSubTab] = useState(mode === 'fixed' ? 'fixed' : 'teacher');
   const [tForm, setTForm] = useState({ teacherId: '', day: 'จันทร์', periodId: '1' });
@@ -2417,6 +2430,20 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
   const [editingFixedTeachers,setEditingFixedTeachers] = useState('');
   const [fixedTeacherDraft,setFixedTeacherDraft] = useState([]);
   const [bulkClosedRoomIds,setBulkClosedRoomIds] = useState([]);
+  const [selectedFixedIds,setSelectedFixedIds] = useState([]);
+  const selectedFixedSet = useMemo(() => new Set(selectedFixedIds), [selectedFixedIds]);
+  const allFixedSelected = fixedSchedules.length > 0 && fixedSchedules.every(item => selectedFixedSet.has(String(item.id)));
+  const currentFixedTerm = `${schoolSettings?.academicYear || ''}-${schoolSettings?.semester || ''}`;
+  useEffect(() => { setSelectedFixedIds([]); }, [currentFixedTerm]);
+  useEffect(() => {
+    const available = new Set(fixedSchedules.map(item => String(item.id)));
+    setSelectedFixedIds(previous => previous.filter(id => available.has(id)));
+  }, [fixedSchedules]);
+  const toggleFixedSelected = (id, checked) => setSelectedFixedIds(previous => checked
+    ? [...new Set([...previous, String(id)])]
+    : previous.filter(itemId => itemId !== String(id)));
+  const toggleAllFixedSelected = checked => setSelectedFixedIds(checked ? fixedSchedules.map(item => String(item.id)) : []);
+
 
   const handleAdd = async (type) => {
     if (type === 'teacher') {
@@ -2581,8 +2608,20 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
           )}
         </div>
         <div className="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col min-h-[400px]">
+           {activeSubTab === 'fixed' && <div className="no-print flex flex-wrap justify-between items-center gap-3 px-4 py-3 bg-slate-50 border-b border-slate-200">
+             <div className="flex flex-wrap items-center gap-3 text-sm">
+               <label className="flex items-center gap-2 font-semibold text-[#081a39] cursor-pointer">
+                 <input type="checkbox" aria-label="เลือกกิจกรรมล็อกทั้งหมด" checked={allFixedSelected} onChange={e => toggleAllFixedSelected(e.target.checked)} disabled={!fixedSchedules.length}/>
+                 เลือกทั้งหมด ({fixedSchedules.length})
+               </label>
+               <span className="text-slate-500">เลือกแล้ว {selectedFixedIds.length} รายการ</span>
+               <button type="button" disabled={!selectedFixedIds.length} onClick={() => setSelectedFixedIds([])} className="text-indigo-700 underline disabled:text-slate-400 disabled:no-underline">ล้างการเลือก</button>
+             </div>
+             <button type="button" disabled={!selectedFixedIds.length || !rulesReady} onClick={() => bulkDeleteFixedSchedules(selectedFixedIds)} className="inline-flex items-center gap-2 px-3 py-2 bg-rose-600 hover:bg-rose-700 text-white text-sm font-bold rounded-lg disabled:opacity-40 disabled:cursor-not-allowed"><Trash2 size={16}/> ลบที่เลือก ({selectedFixedIds.length})</button>
+           </div>}
+           <div className="overflow-x-auto custom-scrollbar">
            <table className="w-full text-left border-collapse">
-              <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr><th className="p-4 font-bold">ข้อมูลรายการ</th><th className="p-4 font-bold text-center">วัน</th><th className="p-4 font-bold text-center">คาบที่</th><th className="p-4 font-bold text-center w-20">ลบ</th></tr></thead>
+              <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr>{activeSubTab === 'fixed' && <th className="p-4 text-center w-12"><input type="checkbox" aria-label="เลือกกิจกรรมล็อกทั้งหมดในตาราง" checked={allFixedSelected} disabled={!fixedSchedules.length} onChange={e => toggleAllFixedSelected(e.target.checked)}/></th>}<th className="p-4 font-bold">ข้อมูลรายการ</th><th className="p-4 font-bold text-center">วัน</th><th className="p-4 font-bold text-center">คาบที่</th><th className="p-4 font-bold text-center w-20">ลบ</th></tr></thead>
               <tbody>
                 {activeSubTab === 'teacher' && unavailabilities.map(u => (
                   <tr key={u.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 font-medium text-[#081a39]">{getTeacher(u.teacherId).name}</td><td className="p-4 text-center">{u.day}</td><td className="p-4 text-center font-bold text-rose-500">{getPeriodDisplayName(periods, u.periodId)}</td><td className="p-4 text-center"><button onClick={() => handleRequestDelete('unavail', u)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td></tr>
@@ -2591,7 +2630,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
                   <tr key={u.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 font-medium text-[#081a39]">{getClassroom(u.classroomId).name} <span className="text-xs text-slate-400 ml-2">{u.reason}</span></td><td className="p-4 text-center">{u.day}</td><td className="p-4 text-center font-bold text-rose-500">{getPeriodDisplayName(periods, u.periodId)}</td><td className="p-4 text-center"><button onClick={() => handleRequestDelete('cUnavail', u)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td></tr>
                 ))}
                 {activeSubTab === 'fixed' && fixedSchedules.map(f => (
-                  <tr key={f.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 font-medium text-[#081a39]"><span className="text-amber-600 font-bold">{getSubject(f.subjectId).name}</span> <span className="text-xs text-slate-500 ml-2">ห้อง: {f.scopeLabel || getClassroom(f.classroomId).name} · ครู {fixedActivityTeacherIds(f).length} คน</span>
+                  <tr key={f.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 text-center"><input type="checkbox" aria-label={`เลือกกิจกรรม ${getSubject(f.subjectId).name} วัน${f.day} คาบ ${getPeriodDisplayName(periods, f.periodId)}`} checked={selectedFixedSet.has(String(f.id))} onChange={e => toggleFixedSelected(f.id, e.target.checked)}/></td><td className="p-4 font-medium text-[#081a39]"><span className="text-amber-600 font-bold">{getSubject(f.subjectId).name}</span> <span className="text-xs text-slate-500 ml-2">ห้อง: {f.scopeLabel || getClassroom(f.classroomId).name} · ครู {fixedActivityTeacherIds(f).length} คน</span>
                     <button type="button" className="ml-2 underline text-indigo-700 text-xs" onClick={()=>{
                       setEditingFixedTeachers(editingFixedTeachers===f.id?'':f.id);
                       setFixedTeacherDraft(fixedActivityTeacherIds(f));
@@ -2607,6 +2646,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
                 ))}
               </tbody>
            </table>
+           </div>
         </div>
       </div>
     </div>
@@ -4097,6 +4137,77 @@ export default function App() {
     });
   };
 
+  // STAGE 25: Confirm bulk fixed-activity deletion, including ONLY child
+  // activity groups linked to the selected roots. Re-read all affected records
+  // from Firestore before deleting and keep a history snapshot for recovery.
+  const bulkDeleteFixedSchedules = (selectedIds) => {
+    if (!user || !rulesReady) return showToast('กรุณารอโหลดกิจกรรมและเงื่อนไขให้ครบก่อน', 'error');
+    let initial;
+    try { initial = planFixedActivityBulkDeletion(selectedIds, fixedSchedules, activityGroups); }
+    catch { return showToast('รายการกิจกรรมเปลี่ยนไป กรุณาเลือกใหม่', 'error'); }
+    const termKey = getTermKey(schoolSettings);
+    const selectedGroupSnapshot = initial.linkedGroups;
+    const previews = initial.selected.slice(0, 6).map(item =>
+      `• ${getSubject(item.subjectId).name} — ${item.day} ${getPeriodDisplayName(periods,item.periodId)}`).join('\n');
+    const noteGroups = selectedGroupSnapshot.length
+      ? `\nมีกิจกรรมย่อยรายห้องที่ผูกกับรายการเหล่านี้ ${selectedGroupSnapshot.length} รายการ ซึ่งจะถูกลบไปด้วย (ไม่ลบกิจกรรมย่อยของกิจกรรมอื่น)` : '';
+    setConfirmData({
+      type: 'delete', title: `ยืนยันลบ ${initial.ids.length} กิจกรรม`, confirmText: `ลบ ${initial.ids.length} รายการ`,
+      message: `ต้องการลบกิจกรรมล็อกที่เลือกออกจากตารางฉบับร่างใช่หรือไม่?\n${previews}${initial.ids.length > 6 ? `\n...และอีก ${initial.ids.length-6} รายการ` : ''}${noteGroups}\n\nคาบกิจกรรมจะหายจากตารางครูและนักเรียนในฉบับร่าง ส่วนตารางที่ประกาศใช้แล้วจะยังคงเดิมจนกว่าจะประกาศใหม่\nระบบจะเก็บประวัติก่อนลบเพื่อกู้คืนได้`,
+      action: async () => {
+        setConfirmData(prev => ({ ...prev, isLoading: true }));
+        try {
+          if (!user || getTermKey(schoolSettings) !== termKey) throw new Error('FIXED_TERM_CHANGED');
+          const termPath = `school_data/${appId}/terms/${termKey}`;
+          const [fixedSnap, groupSnap, schedulesSnap, plcSnap] = await Promise.all([
+            getDocsFromServer(collection(db, `${termPath}/fixedSchedules`)),
+            getDocsFromServer(collection(db, `${termPath}/activityGroups`)),
+            getDocsFromServer(collection(db, `${termPath}/schedules`)),
+            getDocsFromServer(collection(db, `${termPath}/plcSessions`)),
+          ]);
+          const liveFixed = fixedSnap.docs.map(d => ({ ...d.data(), id:d.id }));
+          const liveGroups = groupSnap.docs.map(d => ({ ...d.data(), id:d.id }));
+          const liveSchedules = schedulesSnap.docs.map(d => ({ ...d.data(), id:d.id }));
+          const livePLC = plcSnap.docs.map(d => ({ ...d.data(), id:d.id }));
+          const livePlan = planFixedActivityBulkDeletion(initial.ids, liveFixed, liveGroups);
+          // If any selected root or linked child was edited, added or removed
+          // since the confirmation, cancel the entire deletion for safety.
+          if (initial.selected.some(original => {
+            const current = livePlan.selected.find(item => String(item.id) === String(original.id));
+            return !current || !areFirestoreRecordsEqual(original,current);
+          }) || selectedGroupSnapshot.length !== livePlan.linkedGroups.length ||
+          selectedGroupSnapshot.some(original => {
+            const current = livePlan.linkedGroups.find(g => String(g.id)===String(original.id));
+            return !current || !areFirestoreRecordsEqual(original,current);
+          })) throw new Error('FIXED_DATA_CHANGED');
+          const operations = [
+            ...livePlan.linkedGroups.map(g => ({ type:'delete', ref:doc(db,`${termPath}/activityGroups`,String(g.id)) })),
+            ...livePlan.ids.map(id => ({ type:'delete', ref:doc(db,`${termPath}/fixedSchedules`,id) })),
+          ];
+          assertAtomicWriteCapacity(operations);
+          const historyId = await saveScheduleVersion('before_bulk_fixed_delete',liveSchedules,liveFixed,termKey,liveGroups,null,livePLC);
+          if (!historyId) throw new Error('FIXED_HISTORY_FAILED');
+          if (getTermKey(schoolSettings) !== termKey) throw new Error('FIXED_TERM_CHANGED');
+          await commitAtomicOperations(operations);
+          setConfirmData(null);
+          showToast(`ลบกิจกรรมล็อก ${livePlan.ids.length} รายการสำเร็จ${livePlan.linkedGroups.length ? ` (กิจกรรมย่อย ${livePlan.linkedGroups.length} รายการ)` : ''}`);
+        } catch(error) {
+          console.error('Bulk fixed activity deletion failed',error);
+          const messages = {
+            FIXED_TERM_CHANGED:'ภาคเรียนเปลี่ยนไป ยังไม่ได้ลบกิจกรรม กรุณาตรวจสอบใหม่',
+            FIXED_DATA_CHANGED:'ข้อมูลกิจกรรมเปลี่ยนจากตอนเลือก ยังไม่ได้ลบ กรุณาตรวจสอบใหม่',
+            FIXED_SELECTION_CHANGED:'มีรายการกิจกรรมถูกเปลี่ยนหรือลบไปแล้ว ยังไม่ได้ลบรายการอื่น',
+            FIXED_HISTORY_FAILED:'บันทึกประวัติก่อนลบไม่สำเร็จ จึงยังไม่ได้ลบกิจกรรม',
+          };
+          const errorMessage = messages[error.message] || (['ATOMIC_LIMIT','ATOMIC_SIZE'].includes(error.code)
+            ? error.message : 'ลบกิจกรรมหลายรายการไม่สำเร็จ ยังไม่ได้ลบเพียงบางส่วน');
+          showToast(errorMessage, 'error');
+          setConfirmData(prev => ({ ...prev, isLoading:false }));
+        }
+      },
+    });
+  };
+
   const handleRequestDelete = (type, item) => {
     if(type==='fixed' && activityGroups.some(g=>g.fixedId===item.id))
       return showToast('ต้องลบกิจกรรมย่อยของทุกห้องที่อ้างถึงกิจกรรมนี้ก่อน','error');
@@ -5222,7 +5333,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, renameSubjectId, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, saveSubjectTimeWindows, activityGroups, plcSessions, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups, plcSessions } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, bulkDeleteFixedSchedules, renameSubjectId, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, saveSubjectTimeWindows, activityGroups, plcSessions, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups, plcSessions } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
