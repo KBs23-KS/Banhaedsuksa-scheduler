@@ -155,6 +155,15 @@ const DEFAULT_PERIODS = [
 const DAYS = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์'];
 // STEP 10: กิจกรรมล็อกทุกห้องเก็บเป็นเอกสารเดียว (ครูผู้ดูแลไม่นับซ้ำหลายห้อง)
 const ALL_CLASSROOMS_ID = '__ALL_CLASSROOMS__';
+// Stage 30: saved in existing fixedSchedules collection, so backups, PLC, history and Auto
+// continue using their existing locking semantics. Old fixed rows remain 'general'.
+const isDevelopmentActivity = item => item?.activityType === 'development';
+const fixedActivityDisplayName = (item, getSubject, groups = [], roomId = '') => {
+  const local = roomId && (groups || []).find(g => g.fixedId === item?.id && g.classroomId === roomId);
+  return String(local?.name || item?.activityName || (item?.subjectId && getSubject(item.subjectId)?.name) || 'กิจกรรม').trim();
+};
+const plcDisplayName = subjectArea => `PLC กลุ่มสาระฯ ${subjectArea || '-'}`;
+
 // New activity support: one locked activity can reserve many teachers, without
 // making duplicate student lessons or counting the same teacher once per room.
 const fixedActivityTeacherIds = item => [...new Set([
@@ -166,15 +175,15 @@ const activityTeacherEntries = (activityGroups, fixedSchedules) => {
   const extraFixed = (fixedSchedules || []).flatMap(f => fixedActivityTeacherIds(f)
     .filter(id => id !== f.teacherId).map(id => ({
       id:`fixed_teacher_${f.id}_${id}`, teacherId:id, day:f.day, periodId:f.periodId,
-      subjectId:f.subjectId, classroomId:f.classroomId, scopeLabel:f.scopeLabel || '',
-      __activityTeacherOnly:true, __activityName:''
+      subjectId:f.subjectId, classroomId:f.classroomId, scopeLabel:f.scopeLabel || '',activityType:f.activityType,
+      __activityTeacherOnly:true, __activityName:f.activityName || ''
     })));
   const grouped = (activityGroups || []).filter(item => byId.has(item.fixedId) &&
     fixedAppliesToClassroom(byId.get(item.fixedId), item.classroomId)).flatMap(item => {
     const f = byId.get(item.fixedId);
     return fixedActivityTeacherIds(item).filter(id => !fixedActivityTeacherIds(f).includes(id)).map(id => ({
       id:`activity_${item.id}_${id}`, teacherId:id, day:f.day, periodId:f.periodId,
-      subjectId:f.subjectId, classroomId:item.classroomId, __activityTeacherOnly:true,
+      subjectId:f.subjectId, classroomId:item.classroomId, activityType:f.activityType, __activityTeacherOnly:true,
       __activityName:item.name
     }));
   });
@@ -788,7 +797,7 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   const checkPlacement = (sch, isFixed = false) => {
     const teacherExists = !sch.teacherId || teacherMap.has(sch.teacherId);
     const roomExists = roomMap.has(sch.classroomId) || (isFixed && sch.classroomId === ALL_CLASSROOMS_ID && classrooms.length > 0);
-    const subjectExists = subjectMap.has(sch.subjectId);
+    const subjectExists = subjectMap.has(sch.subjectId) || (isFixed && isDevelopmentActivity(sch) && Boolean(String(sch.activityName || '').trim()));
     const dayExists = DAYS.includes(sch.day);
     const periodExists = validPeriodIds.has(sch.periodId);
 
@@ -817,7 +826,7 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
 
     const hasCompleteTeachingRef = Boolean(sch.teacherId && sch.subjectId && sch.classroomId !== ALL_CLASSROOMS_ID && sch.classroomId);
     const lKey = hasCompleteTeachingRef ? `${sch.teacherId}_${sch.subjectId}_${sch.classroomId}` : '';
-    const matchedLoad = lKey ? loadTracker[lKey] : null;
+    const matchedLoad = !isFixed || !isDevelopmentActivity(sch) ? (lKey ? loadTracker[lKey] : null) : null;
 
     if (matchedLoad) {
       matchedLoad.scheduled += 1;
@@ -930,7 +939,7 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
       occupied.filter(item=>item.teacherId===t.id && item.day===d).map(item=>item.periodId),periods).gaps,0);
     stat.maxConsec = ws?.longestConsecutive || 0;
   });
-  health.subjectDailyConflicts = findSubjectDailyLimitConflicts([...schedules, ...fixed], classrooms, customRules);
+  health.subjectDailyConflicts = findSubjectDailyLimitConflicts([...schedules, ...fixed.filter(f => !isDevelopmentActivity(f))], classrooms, customRules);
   health.customRuleConflicts = [...schedules, ...fixed].filter(item => blocksCustomRule(customRules, item, periods)).map(item =>
     `ข้อบังคับที่ตั้งเอง: ${item.subjectId || '-'} / วัน${item.day} ${getPeriodDisplayName(periods, item.periodId)} ไม่สามารถจัดได้`);
   health.teacherLimitConflicts = findTeacherTeachingLimitConflicts(occupied, periods, teachers);
@@ -1002,10 +1011,10 @@ const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = 
     if (f.classroomId === ALL_CLASSROOMS_ID &&
         (Array.isArray(f.includedClassroomIds) || (f.excludedClassroomIds || []).length)) {
       fixedTargetRoomIds(f,classrooms).forEach(id => {
-        registerSubjectDayPeriod(maps, {...f,classroomId:id});
+        if (!isDevelopmentActivity(f)) registerSubjectDayPeriod(maps, {...f,classroomId:id});
         maps.fixedMap.add(`${f.day}_${f.periodId}_${id}`);
       });
-    } else registerSubjectDayPeriod(maps, f);
+    } else if (!isDevelopmentActivity(f)) registerSubjectDayPeriod(maps, f);
     maps.roomPlacements.add(`${f.classroomId}_${f.day}_${f.periodId}`);
   });
   activityTeacherEntries(activityGroups,fixedSch).forEach(item=>{
@@ -1092,7 +1101,7 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
   anchors.forEach((item, index) => {
     const label = `${item.__kind} รายการที่ ${index + 1}`;
     if (item.teacherId && !teacherIds.has(String(item.teacherId))) addProblem(`${label}: ไม่พบครู ${item.teacherId}`);
-    if (!validSubject(item.subjectId)) addProblem(`${label}: ไม่พบรายวิชา ${item.subjectId || '-'} ในภาคเรียนนี้`);
+    if (!(item.__kind === 'กิจกรรมล็อก' && isDevelopmentActivity(item) && String(item.activityName || '').trim()) && !validSubject(item.subjectId)) addProblem(`${label}: ไม่พบรายวิชา ${item.subjectId || '-'} ในภาคเรียนนี้`);
     const appliesToAll = item.__kind === 'กิจกรรมล็อก' && item.classroomId === ALL_CLASSROOMS_ID;
     if (appliesToAll ? fixedTargetRoomIds(item,classrooms).length === 0 : !classroomIds.has(String(item.classroomId))) {
       addProblem(`${label}: ไม่พบห้อง ${item.classroomId || '-'}`);
@@ -1114,7 +1123,7 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
       if (unavailableRooms.has(slotRoom) && !(item.__kind === 'ตารางที่จัดด้วยมือ' && item.source === 'manual' && item.manualRoomClosureOverride === true)) addProblem(`${label}: ห้อง ${roomId} ถูกจัดในเวลาที่ไม่ว่าง`);
     });
     if (item.__kind === 'ตารางที่จัดด้วยมือ' && !item.teacherId) addProblem(`${label}: ไม่ระบุครูผู้สอน`);
-    if (item.teacherId && !appliesToAll) {
+    if (item.teacherId && !appliesToAll && !isDevelopmentActivity(item)) {
       const key = loadKey(item);
       if (loadByKey.has(key)) anchorCounts.set(key, (anchorCounts.get(key) || 0) + 1);
       else if (item.__kind === 'ตารางที่จัดด้วยมือ') addProblem(`${label}: ไม่มีภาระสอนรองรับครู ${item.teacherId} วิชา ${item.subjectId} ห้อง ${item.classroomId}`);
@@ -1133,8 +1142,8 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
       addProblem(`เงื่อนไขเพิ่มเติมรายการที่ ${index + 1}: อ้างอิงข้อมูลไม่ถูกต้องหรือใช้กับวิชาคนละภาคเรียน`);
     }
   });
-  findSubjectDailyLimitConflicts(anchors, classrooms, customRules).forEach(addProblem);
-  findAutoSubjectDistributionConflicts(anchors, subjects, classrooms).forEach(addProblem);
+  findSubjectDailyLimitConflicts(anchors.filter(item => !isDevelopmentActivity(item)), classrooms, customRules).forEach(addProblem);
+  findAutoSubjectDistributionConflicts(anchors.filter(item => !isDevelopmentActivity(item)), subjects, classrooms).forEach(addProblem);
   anchors.filter(item => blocksCustomRule(customRules, item, periods)).forEach(item =>
     addProblem(`ตารางเดิม/กิจกรรมล็อกฝ่าฝืนข้อบังคับเพิ่มเติม: วัน${item.day} คาบ ${item.periodId}`));
   const groupTeachers=activityTeacherEntries(activityGroups,fixedSchedules);
@@ -2642,10 +2651,11 @@ const planFixedActivityBulkDeletion = (selectedIds, fixedItems = [], groupItems 
 
 const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, teachers, classrooms, activeSubjects, periods, dbAction, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, bulkDeleteFixedSchedules, schoolSettings, getTeacher, getClassroom, getSubject, customRules, rulesReady, plcSessions = [], mode = 'time' }) => {
   // Stage 13: use the existing editor either for time restrictions or fixed activities.
-  const [activeSubTab, setActiveSubTab] = useState(mode === 'fixed' ? 'fixed' : 'teacher');
+  const [activeSubTab, setActiveSubTab] = useState(mode === 'fixed' || mode === 'development' ? 'fixed' : 'teacher');
+  const isDevEditor = mode === 'development';
   const [tForm, setTForm] = useState({ teacherId: '', day: 'จันทร์', periodId: '1' });
   const [cForm, setCForm] = useState({ classroomId: '', day: 'จันทร์', periodId: '1', reason: '' });
-  const [fForm, setFForm] = useState({ subjectId: '', classroomId: '', teacherId: '', teacherIds: [], day: 'จันทร์', periodId: '1',includedClassroomIds:[] });
+  const [fForm, setFForm] = useState({ subjectId: '', classroomId: '', teacherId: '', teacherIds: [], day: 'จันทร์', periodId: '1',includedClassroomIds:[], activityName:'' });
   const [fixedRoomSubset,setFixedRoomSubset] = useState(false);
   const [activityGrade,setActivityGrade] = useState('');
   const [editingFixedTeachers,setEditingFixedTeachers] = useState('');
@@ -2653,17 +2663,19 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
   const [bulkClosedRoomIds,setBulkClosedRoomIds] = useState([]);
   const [selectedFixedIds,setSelectedFixedIds] = useState([]);
   const selectedFixedSet = useMemo(() => new Set(selectedFixedIds), [selectedFixedIds]);
-  const allFixedSelected = fixedSchedules.length > 0 && fixedSchedules.every(item => selectedFixedSet.has(String(item.id)));
+  const visibleFixedSchedules = useMemo(() => fixedSchedules.filter(f =>
+    isDevEditor ? isDevelopmentActivity(f) : !isDevelopmentActivity(f)), [fixedSchedules,isDevEditor]);
+  const allFixedSelected = visibleFixedSchedules.length > 0 && visibleFixedSchedules.every(item => selectedFixedSet.has(String(item.id)));
   const currentFixedTerm = `${schoolSettings?.academicYear || ''}-${schoolSettings?.semester || ''}`;
   useEffect(() => { setSelectedFixedIds([]); }, [currentFixedTerm]);
   useEffect(() => {
-    const available = new Set(fixedSchedules.map(item => String(item.id)));
+    const available = new Set(visibleFixedSchedules.map(item => String(item.id)));
     setSelectedFixedIds(previous => previous.filter(id => available.has(id)));
-  }, [fixedSchedules]);
+  }, [visibleFixedSchedules]);
   const toggleFixedSelected = (id, checked) => setSelectedFixedIds(previous => checked
     ? [...new Set([...previous, String(id)])]
     : previous.filter(itemId => itemId !== String(id)));
-  const toggleAllFixedSelected = checked => setSelectedFixedIds(checked ? fixedSchedules.map(item => String(item.id)) : []);
+  const toggleAllFixedSelected = checked => setSelectedFixedIds(checked ? visibleFixedSchedules.map(item => String(item.id)) : []);
 
 
   const handleAdd = async (type) => {
@@ -2681,7 +2693,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
       if (ok) showToast("บันทึกเวลาห้องไม่ว่างสำเร็จ");
     } else if (type === 'fixed') {
       if (!rulesReady) return showToast('ยังโหลดเงื่อนไขไม่สำเร็จ', 'error');
-      if (!fForm.subjectId || !fForm.classroomId) return showToast("กรุณาเลือกวิชาและห้อง", "error");
+      if (!fForm.classroomId || (isDevEditor ? !String(fForm.activityName||'').trim() : !fForm.subjectId)) return showToast(isDevEditor ? 'กรุณากรอกชื่อกิจกรรมและเลือกห้องเรียน' : 'กรุณาเลือกวิชาและห้อง', 'error');
       const maps = buildConstraintMaps(schedules, unavailabilities, classroomUnavailabilities, fixedSchedules, periods, customRules, activityGroups, classrooms, plcSessions, teachers);
       const chosenTeachers = fixedActivityTeacherIds(fForm);
       const existingOccupancy = buildTeacherOccupancy(schedules, fixedSchedules, activityGroups);
@@ -2698,7 +2710,10 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
         if (!window.confirm(`กิจกรรมนี้จะทำให้ครูต่อไปนี้มีภาระ 5 คาบในวัน${fForm.day}: ${names}\nยืนยันว่าเป็นกรณีจำเป็นจริงหรือไม่?`)) return;
         maps.maxTeacherPeriodsPerDay=SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay;
       }
-      const savedForm={...fForm,teacherId:'',teacherIds:chosenTeachers};
+      const savedForm={...fForm,teacherId:'',teacherIds:chosenTeachers,
+        activityType:isDevEditor ? 'development' : 'general',
+        activityName:isDevEditor ? String(fForm.activityName).trim() : ''};
+      if(isDevEditor) savedForm.subjectId='';
       if(fForm.classroomId !== ALL_CLASSROOMS_ID || !fixedRoomSubset) delete savedForm.includedClassroomIds;
       if (savedForm.classroomId === ALL_CLASSROOMS_ID && activityGrade && fixedRoomSubset) savedForm.scopeLabel = activityGrade;
       if(fixedRoomSubset && fForm.classroomId===ALL_CLASSROOMS_ID && !fForm.includedClassroomIds.length)
@@ -2724,8 +2739,33 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
       }
       const id = `F_${Date.now()}`;
       const ok = await dbAction('fixedSchedules', id, { ...savedForm, id });
-      if (ok) showToast("บันทึกล็อกตารางสำเร็จ");
+      if (ok) { showToast(isDevEditor ? 'บันทึกกิจกรรมพัฒนาผู้เรียนและล็อกวัน–คาบแล้ว' : 'บันทึกล็อกตารางสำเร็จ'); if(isDevEditor) setFForm(previous=>({...previous,activityName:''})); }
     }
+  };
+
+  const changeFixedActivityType = async (item, nextType) => {
+    const name = fixedActivityDisplayName(item, getSubject);
+    const originalSubjectId = item.originalSubjectId || item.subjectId || '';
+    if (nextType === 'general' && !activeSubjects.some(subject => subject.id === originalSubjectId))
+      return showToast('ไม่พบรหัสรายวิชาเดิม จึงยังเปลี่ยนเป็นกิจกรรมทั่วไปไม่ได้ กรุณาใช้ประเภทกิจกรรมพัฒนาผู้เรียนต่อ', 'error');
+    if (!window.confirm(`เปลี่ยนประเภท “${name}” เป็น ${nextType === 'development' ? 'กิจกรรมพัฒนาผู้เรียน' : 'กิจกรรมล็อกตายตัวทั่วไป'} หรือไม่?\nวัน คาบ ครู และห้องเรียนที่ล็อกไว้จะไม่เปลี่ยน`)) return;
+    // Keep original subject reference for reversibility, but never let a learning
+    // activity consume a regular teaching subject code or daily subject quota.
+    const next = {...item,activityType:nextType,originalSubjectId,
+      subjectId:nextType === 'development' ? '' : originalSubjectId,
+      activityName:nextType === 'development' ? name : (item.activityName || '')};
+    const ok = await dbAction('fixedSchedules',item.id,next);
+    if(ok) {setSelectedFixedIds([]); showToast('เปลี่ยนประเภทกิจกรรมสำเร็จ โดยไม่ย้ายคาบหรือแก้ข้อมูลครู');}
+  };
+
+  const renameDevelopmentActivity = async item => {
+    const raw = window.prompt('แก้ชื่อกิจกรรมพัฒนาผู้เรียน (วันและคาบที่ล็อกไว้จะไม่เปลี่ยน)',fixedActivityDisplayName(item,getSubject));
+    if (raw === null) return;
+    const activityName = raw.trim();
+    if (!activityName || activityName.length > 120) return showToast('ชื่อกิจกรรมต้องมีความยาว 1–120 ตัวอักษร', 'error');
+    if (activityName === item.activityName) return;
+    const ok = await dbAction('fixedSchedules',item.id,{...item,activityName});
+    if(ok) showToast('แก้ชื่อกิจกรรมสำเร็จ โดยคงวัน คาบ และครูเดิมไว้');
   };
 
   const saveExistingFixedTeachers = async item => {
@@ -2797,7 +2837,10 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
           )}
           {activeSubTab === 'fixed' && (
             <div className="space-y-4">
-              <select value={fForm.subjectId} onChange={e => setFForm({...fForm, subjectId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกวิชา / กิจกรรม --</option>{activeSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
+              {isDevEditor ? <label className="block text-sm font-bold">ชื่อกิจกรรมพัฒนาผู้เรียน
+                <input type="text" maxLength={120} placeholder="เช่น ชุมนุม / ลูกเสือ–เนตรนารี / เศรษฐกิจพอเพียง" value={fForm.activityName} onChange={e=>setFForm(old=>({...old,activityName:e.target.value}))} className="w-full mt-2 p-3 border rounded-xl bg-slate-50 font-normal" />
+                <span className="block text-xs text-slate-500 mt-1 font-normal">กิจกรรมนี้ไม่ต้องสร้างเป็นรายวิชาก่อน กำหนดวัน–คาบเองและล็อกทันที</span>
+              </label> : <select value={fForm.subjectId} onChange={e => setFForm({...fForm, subjectId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกวิชา / กิจกรรม --</option>{activeSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select>}
               <select value={fForm.classroomId} onChange={e => {setActivityGrade('');setFixedRoomSubset(false);setFForm({...fForm, classroomId: e.target.value, includedClassroomIds:[]});}} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกห้องเรียน --</option><option value={ALL_CLASSROOMS_ID}>ทุกห้องเรียน</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
               {fForm.classroomId === ALL_CLASSROOMS_ID && <div className="border border-amber-200 rounded-xl p-3 space-y-2">
                 <label className="text-xs font-bold block">เลือกกิจกรรมตามระดับชั้น (เช่น ลูกเสือ ม.1 ไม่จำกัดห้อง)</label>
@@ -2824,7 +2867,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
                 <p className="text-xs text-slate-500">กิจกรรมแสดงในตารางครูที่เลือกทุกคน โดยนับคาบกิจกรรมเพียงคนละหนึ่งครั้ง</p>
               </div>
               <div className="grid grid-cols-2 gap-3"><select value={fForm.day} onChange={e => setFForm({...fForm, day: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50">{DAYS.map(d => <option key={d} value={d}>{d}</option>)}</select><select value={fForm.periodId} onChange={e => setFForm({...fForm, periodId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50">{periods.filter(p=>!p.isBreak).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
-              <button onClick={() => handleAdd('fixed')} className="w-full bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึก</button>
+              <button onClick={() => handleAdd('fixed')} className="w-full bg-[#081a39] text-white py-3 rounded-xl font-bold">{isDevEditor ? 'บันทึกและล็อกกิจกรรมพัฒนาผู้เรียน' : 'บันทึก'}</button>
             </div>
           )}
         </div>
@@ -2832,8 +2875,8 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
            {activeSubTab === 'fixed' && <div className="no-print flex flex-wrap justify-between items-center gap-3 px-4 py-3 bg-slate-50 border-b border-slate-200">
              <div className="flex flex-wrap items-center gap-3 text-sm">
                <label className="flex items-center gap-2 font-semibold text-[#081a39] cursor-pointer">
-                 <input type="checkbox" aria-label="เลือกกิจกรรมล็อกทั้งหมด" checked={allFixedSelected} onChange={e => toggleAllFixedSelected(e.target.checked)} disabled={!fixedSchedules.length}/>
-                 เลือกทั้งหมด ({fixedSchedules.length})
+                 <input type="checkbox" aria-label="เลือกกิจกรรมล็อกทั้งหมด" checked={allFixedSelected} onChange={e => toggleAllFixedSelected(e.target.checked)} disabled={!visibleFixedSchedules.length}/>
+                 เลือกทั้งหมด ({visibleFixedSchedules.length})
                </label>
                <span className="text-slate-500">เลือกแล้ว {selectedFixedIds.length} รายการ</span>
                <button type="button" disabled={!selectedFixedIds.length} onClick={() => setSelectedFixedIds([])} className="text-indigo-700 underline disabled:text-slate-400 disabled:no-underline">ล้างการเลือก</button>
@@ -2842,7 +2885,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
            </div>}
            <div className="overflow-x-auto custom-scrollbar">
            <table className="w-full text-left border-collapse">
-              <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr>{activeSubTab === 'fixed' && <th className="p-4 text-center w-12"><input type="checkbox" aria-label="เลือกกิจกรรมล็อกทั้งหมดในตาราง" checked={allFixedSelected} disabled={!fixedSchedules.length} onChange={e => toggleAllFixedSelected(e.target.checked)}/></th>}<th className="p-4 font-bold">ข้อมูลรายการ</th><th className="p-4 font-bold text-center">วัน</th><th className="p-4 font-bold text-center">คาบที่</th><th className="p-4 font-bold text-center w-20">ลบ</th></tr></thead>
+              <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr>{activeSubTab === 'fixed' && <th className="p-4 text-center w-12"><input type="checkbox" aria-label="เลือกกิจกรรมล็อกทั้งหมดในตาราง" checked={allFixedSelected} disabled={!visibleFixedSchedules.length} onChange={e => toggleAllFixedSelected(e.target.checked)}/></th>}<th className="p-4 font-bold">ข้อมูลรายการ</th><th className="p-4 font-bold text-center">วัน</th><th className="p-4 font-bold text-center">คาบที่</th><th className="p-4 font-bold text-center w-20">ลบ</th></tr></thead>
               <tbody>
                 {activeSubTab === 'teacher' && unavailabilities.map(u => (
                   <tr key={u.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 font-medium text-[#081a39]">{getTeacher(u.teacherId).name}</td><td className="p-4 text-center">{u.day}</td><td className="p-4 text-center font-bold text-rose-500">{getPeriodDisplayName(periods, u.periodId)}</td><td className="p-4 text-center"><button onClick={() => handleRequestDelete('unavail', u)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td></tr>
@@ -2850,8 +2893,12 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
                 {activeSubTab === 'room' && classroomUnavailabilities.map(u => (
                   <tr key={u.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 font-medium text-[#081a39]">{getClassroom(u.classroomId).name} <span className="text-xs text-slate-400 ml-2">{u.reason}</span></td><td className="p-4 text-center">{u.day}</td><td className="p-4 text-center font-bold text-rose-500">{getPeriodDisplayName(periods, u.periodId)}</td><td className="p-4 text-center"><button onClick={() => handleRequestDelete('cUnavail', u)} className="p-2 text-slate-400 hover:text-rose-500"><Trash2 size={18}/></button></td></tr>
                 ))}
-                {activeSubTab === 'fixed' && fixedSchedules.map(f => (
-                  <tr key={f.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 text-center"><input type="checkbox" aria-label={`เลือกกิจกรรม ${getSubject(f.subjectId).name} วัน${f.day} คาบ ${getPeriodDisplayName(periods, f.periodId)}`} checked={selectedFixedSet.has(String(f.id))} onChange={e => toggleFixedSelected(f.id, e.target.checked)}/></td><td className="p-4 font-medium text-[#081a39]"><span className="text-amber-600 font-bold">{getSubject(f.subjectId).name}</span> <span className="text-xs text-slate-500 ml-2">ห้อง: {f.scopeLabel || getClassroom(f.classroomId).name} · ครู {fixedActivityTeacherIds(f).length} คน</span>
+                {activeSubTab === 'fixed' && visibleFixedSchedules.map(f => (
+                  <tr key={f.id} className="border-b border-slate-50 hover:bg-[#081a39]/5"><td className="p-4 text-center"><input type="checkbox" aria-label={`เลือกกิจกรรม ${fixedActivityDisplayName(f,getSubject)} วัน${f.day} คาบ ${getPeriodDisplayName(periods, f.periodId)}`} checked={selectedFixedSet.has(String(f.id))} onChange={e => toggleFixedSelected(f.id, e.target.checked)}/></td><td className="p-4 font-medium text-[#081a39]"><span className="text-amber-600 font-bold">{fixedActivityDisplayName(f,getSubject)}</span> <span className="text-xs text-slate-500 ml-2">ห้อง: {f.scopeLabel || getClassroom(f.classroomId).name} · ครู {fixedActivityTeacherIds(f).length} คน</span>
+                    {isDevelopmentActivity(f) && <button type="button" className="ml-2 underline text-indigo-700 text-xs" onClick={()=>renameDevelopmentActivity(f)}>แก้ชื่อ</button>}
+                    <select aria-label={`ประเภทกิจกรรม ${fixedActivityDisplayName(f,getSubject)}`} title="เปลี่ยนประเภทโดยไม่ลบหรือย้ายคาบ" className="ml-2 text-xs border rounded-md p-1 bg-white" value={isDevelopmentActivity(f)?'development':'general'} onChange={e=>changeFixedActivityType(f,e.target.value)}>
+                      <option value="general">กิจกรรมล็อกตายตัวทั่วไป</option><option value="development">กิจกรรมพัฒนาผู้เรียน</option>
+                    </select>
                     <button type="button" className="ml-2 underline text-indigo-700 text-xs" onClick={()=>{
                       setEditingFixedTeachers(editingFixedTeachers===f.id?'':f.id);
                       setFixedTeacherDraft(fixedActivityTeacherIds(f));
@@ -3005,7 +3052,7 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
 
 // STAGE 6: per-classroom activity labels under a single all-room fixed time slot.
 const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teachers, schedules, rulesReady,
-  unavailabilities, periods, customRules, dbAction, showToast}) => {
+  unavailabilities, periods, customRules, dbAction, showToast, getSubject}) => {
   const roots=fixedSchedules.filter(f=>f.classroomId===ALL_CLASSROOMS_ID);
   const [form,setForm]=useState({fixedId:'',classroomId:'',name:'',teacherId:''});
   const [busy,setBusy]=useState(false);
@@ -3044,7 +3091,7 @@ const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teacher
     <div className="bg-white rounded-2xl p-6 border space-y-4">
       <h2 className="text-xl font-bold">กิจกรรมพัฒนาผู้เรียนแยกตามห้อง</h2>
       <p className="text-sm text-slate-600">สร้างกิจกรรมล็อก “ทุกห้องเรียน” ก่อน แล้วกำหนดชื่อกิจกรรม/ครูให้แต่ละห้องได้โดยไม่เพิ่มคาบล็อกซ้ำ</p>
-      <select className="w-full border rounded-xl p-3" value={form.fixedId} onChange={e=>setForm({...form,fixedId:e.target.value})}><option value="">-- เลือกกิจกรรมหลักที่ล็อกทุกห้อง --</option>{roots.map(f=><option key={f.id} value={f.id}>{f.day} คาบ {f.periodId} · {f.subjectId}</option>)}</select>
+      <select className="w-full border rounded-xl p-3" value={form.fixedId} onChange={e=>setForm({...form,fixedId:e.target.value})}><option value="">-- เลือกกิจกรรมหลักที่ล็อกทุกห้อง --</option>{roots.map(f=><option key={f.id} value={f.id}>{f.day} คาบ {f.periodId} · {fixedActivityDisplayName(f,getSubject)}</option>)}</select>
       <select className="w-full border rounded-xl p-3" value={form.classroomId} onChange={e=>setForm({...form,classroomId:e.target.value})}><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
       <input className="w-full border rounded-xl p-3" placeholder="ชื่อกิจกรรม เช่น ชุมนุมดนตรี" value={form.name} onChange={e=>setForm({...form,name:e.target.value})}/>
       <select className="w-full border rounded-xl p-3" value={form.teacherId} onChange={e=>setForm({...form,teacherId:e.target.value})}><option value="">-- ครูผู้รับผิดชอบ (ไม่ระบุได้) --</option>{teachers.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select>
@@ -3201,6 +3248,7 @@ const ConstraintsHub = ({ commonProps }) => {
     { id: 'time', name: 'ข้อจำกัดเวลา', icon: Clock },
     { id: 'rules', name: 'เงื่อนไขการจัดตาราง', icon: Filter },
     { id: 'fixed', name: 'กิจกรรมล็อกตายตัว', icon: Pin },
+    { id: 'development', name: 'กิจกรรมพัฒนาผู้เรียน', icon: Activity },
     { id: 'plc', name: 'PLC กลุ่มสาระ', icon: Users },
   ];
   return <div className="space-y-6 animate-in fade-in">
@@ -3208,8 +3256,10 @@ const ConstraintsHub = ({ commonProps }) => {
     {section === 'time' && <ConstraintsView key="time-constraints" mode="time" {...commonProps} />}
     {section === 'rules' && <CustomRulesView {...commonProps} />}
     {section === 'plc' && <PLCView {...commonProps} />}
-    {section === 'fixed' && <>
-      <ConstraintsView key="fixed-activities" mode="fixed" {...commonProps} />
+    {section === 'fixed' && <ConstraintsView key="fixed-activities" mode="fixed" {...commonProps} />}
+    {section === 'development' && <>
+      <div className="bg-blue-50 text-blue-900 rounded-xl border border-blue-100 p-4 text-sm">กิจกรรมพัฒนาผู้เรียนกำหนดชื่อ วัน คาบ ห้อง และครูผู้รับผิดชอบด้วยตนเอง เมื่อบันทึกจะล็อกทันที Auto ไม่ย้ายหรือจัดวิชาทับ แสดงเฉพาะชื่อกิจกรรมในตารางครู/นักเรียนและเอกสารพิมพ์ กิจกรรมเดิมย้ายประเภทได้ที่เมนูกิจกรรมล็อกตายตัว</div>
+      <ConstraintsView key="development-activities" mode="development" {...commonProps} />
       <details className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 shadow-sm">
         <summary className="cursor-pointer font-bold text-[#081a39]">
           กำหนดกิจกรรมพัฒนาผู้เรียนแยกตามห้อง (เฉพาะกรณีที่ต้องการ)
@@ -3488,7 +3538,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
      if (!selectedId) return null;
      const cellSch = schedules.filter(s => viewMode === 'room' ? s.classroomId === selectedId && s.day === day && s.periodId === periodId : s.teacherId === selectedId && s.day === day && s.periodId === periodId);
      const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? fixedAppliesToClassroom(f, selectedId) && f.day === day && f.periodId === periodId : f.teacherId === selectedId && f.day === day && f.periodId === periodId);
-     const cellGroups = viewMode==='teacher' ? activityTeacherEntries(activityGroups,fixedSchedules).filter(x=>x.teacherId===selectedId&&x.day===day&&x.periodId===periodId).map(x=>({...x,name:x.__activityName||getSubject(x.subjectId).name})) : [];
+     const cellGroups = viewMode==='teacher' ? activityTeacherEntries(activityGroups,fixedSchedules).filter(x=>x.teacherId===selectedId&&x.day===day&&x.periodId===periodId).map(x=>({...x,name:x.__activityName || fixedActivityDisplayName(x,getSubject)})) : [];
      const cellPLC = viewMode==='teacher' ? buildPLCReservations(plcSessions,teachers)
        .filter(x=>x.teacherId===selectedId&&x.day===day&&x.periodId===periodId) : [];
      if (cellSch.length === 0 && cellFix.length === 0 && cellGroups.length===0 && cellPLC.length===0) return null;
@@ -3499,14 +3549,14 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
          {isConflict && <div className="absolute -top-2 -right-2 text-rose-500 bg-rose-100 rounded-full p-0.5 shadow-sm"><AlertCircle size={14}/></div>}
          {cellFix.map((f, idx) => (
            <div key={f.id} className={idx > 0 || cellSch.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
-             <div className="font-bold text-amber-700 flex items-center justify-center gap-1"><Pin size={10}/> {viewMode==='room' && f.classroomId===ALL_CLASSROOMS_ID
-               ? (activityGroups.find(g=>g.fixedId===f.id&&g.classroomId===selectedId)?.name || getSubject(f.subjectId).name)
-               : getSubject(f.subjectId).name}</div>
+             <div className="font-bold text-amber-700 flex items-center justify-center gap-1">{!isDevelopmentActivity(f) && <Pin size={10}/>} {viewMode==='room' && f.classroomId===ALL_CLASSROOMS_ID
+               ? fixedActivityDisplayName(f,getSubject,activityGroups,selectedId)
+               : fixedActivityDisplayName(f,getSubject)}</div>
              <button onClick={(e) => { e.stopPropagation(); handleRequestDelete('fixed', f); }} className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-rose-500 text-white rounded-full p-0.5 z-10"><X size={12}/></button>
            </div>
          ))}
-         {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{g.name} · {g.scopeLabel || getClassroom(g.classroomId).name}</div>)}
-         {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1">PLC กลุ่ม{item.subjectArea}</div>)}
+         {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{isDevelopmentActivity(g) ? g.name : `${g.name} · ${g.scopeLabel || getClassroom(g.classroomId).name}`}</div>)}
+         {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1">{plcDisplayName(item.subjectArea)}</div>)}
          {cellSch.map((sch, idx) => (
            <div key={sch.id} draggable={!isScheduling&&!editingRows} onDragStart={e=>{e.dataTransfer.setData('text/plain',sch.id);e.dataTransfer.effectAllowed='move';}}
              title="ลากเพื่อย้ายคาบ หรือกดไอคอนเพื่อเก็บคาบนี้เมื่อจัดใหม่" className={idx > 0 || cellFix.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
@@ -3672,7 +3722,7 @@ const ScheduleHistoryView = ({ db, appId, schoolSettings, getTermKey, getSubject
         : 'อ่านตารางล่าสุดจากเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่');
     } finally { setLoading(false); }
   };
-  const describeItem = item => item.subjectArea ? `PLC กลุ่ม${item.subjectArea} / วัน${item.day || '-'} คาบ ${item.periodId || '-'}` : `${getSubject(item.subjectId)?.name || item.subjectId || '-'} / ${getClassroom(item.classroomId)?.name || item.classroomId || '-'} / ${getTeacher(item.teacherId)?.name || '-'} / วัน${item.day || '-'} คาบ ${item.periodId || '-'}`;
+  const describeItem = item => item.subjectArea ? `${plcDisplayName(item.subjectArea)} / วัน${item.day || '-'} คาบ ${item.periodId || '-'}` : `${getSubject(item.subjectId)?.name || item.subjectId || '-'} / ${getClassroom(item.classroomId)?.name || item.classroomId || '-'} / ${getTeacher(item.teacherId)?.name || '-'} / วัน${item.day || '-'} คาบ ${item.periodId || '-'}`;
   const changeRows = diff => [
     ...diff.added.map(item=>({label:'เพิ่มในตารางปัจจุบัน',item})),
     ...diff.deleted.map(item=>({label:'มีในประวัติ แต่ไม่มีในปัจจุบัน',item})),
@@ -3787,10 +3837,11 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
         const groups=mode==='teacher'?activityTeacherEntries(activityGroups,fixedSchedules).filter(x=>x.teacherId===item.id&&x.day===day&&x.periodId===p.id):[];
         const plc=mode==='teacher'?buildPLCReservations(displayedPLC,teachers).filter(x=>x.teacherId===item.id&&x.day===day&&x.periodId===p.id):[];
         return [...regular,...fixed,...groups,...plc].map(x=>{
-          if(x.__isPLC)return sanitizeExcelInput(`PLC กลุ่ม${x.subjectArea}`);
+          if(x.__isPLC)return sanitizeExcelInput(plcDisplayName(x.subjectArea));
           const group=mode==='room'?activityGroups.find(g=>g.fixedId===x.id&&g.classroomId===item.id):
             activityGroups.find(g=>'activity_'+g.id===x.id);
-          const subject=x.__activityName||group?.name||getSubject(x.subjectId).name;
+          const subject=x.__activityName||group?.name||(isDevelopmentActivity(x)?fixedActivityDisplayName(x,getSubject):getSubject(x.subjectId).name);
+          if(isDevelopmentActivity(x)) return sanitizeExcelInput(subject);
           const other=mode==='room'?(x.teacherId?getTeacher(x.teacherId).name:(fixedActivityTeacherIds(x).length?`ครู ${fixedActivityTeacherIds(x).length} คน`:'ไม่ระบุครู')):
             (x.scopeLabel || getClassroom(x.classroomId).name);
           return sanitizeExcelInput(subject+' — '+other);
@@ -3835,7 +3886,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
                row.push(combined.map(s =>
                  (s.classroomId === ALL_CLASSROOMS_ID
                    ? activityGroups.find(g=>g.fixedId===s.id&&g.classroomId===c.id)?.name : '') ||
-                   getSubject(s.subjectId).name).join(' + '));
+                   fixedActivityDisplayName(s,getSubject,activityGroups,c.id)).join(' + '));
              });
              wsData.push(row);
           }); wsData.push([]); 
@@ -3958,7 +4009,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
                          const sch = schedules.filter(s => s.classroomId === c.id && s.day === day && s.periodId === p.id);
                          const fixed = fixedSchedules.filter(f => fixedAppliesToClassroom(f, c.id) && f.day === day && f.periodId === p.id);
                          const combined = [...fixed, ...sch];
-                         return <td key={p.id} className="p-1 border text-center h-12">{combined.map(s => <div key={s.id} className="font-bold truncate">{(s.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===s.id&&g.classroomId===c.id)?.name : '') || getSubject(s.subjectId).name}</div>)}</td>
+                         return <td key={p.id} className="p-1 border text-center h-12">{combined.map(s => <div key={s.id} className="font-bold truncate">{(s.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===s.id&&g.classroomId===c.id)?.name : '') || (isDevelopmentActivity(s) ? fixedActivityDisplayName(s,getSubject,activityGroups,c.id) : getSubject(s.subjectId).name)}</div>)}</td>
                        })}
                      </tr>
                    ))}
@@ -4014,7 +4065,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
     const cellFixed = fixedSchedules.filter(f => vMode === 'room' ? fixedAppliesToClassroom(f, targetId) && f.day === day && f.periodId === periodId : f.teacherId === targetId && f.day === day && f.periodId === periodId);
     const groupTeacherRows = vMode==='teacher' ? activityTeacherEntries(activityGroups,fixedSchedules)
       .filter(item=>item.teacherId===targetId&&item.day===day&&item.periodId===periodId)
-      .map(item=>({...item,groupLabel:item.__activityName || getSubject(item.subjectId).name})) : [];
+      .map(item=>({...item,groupLabel:item.__activityName || fixedActivityDisplayName(item,getSubject)})) : [];
     const plcRows=vMode==='teacher'?buildPLCReservations(printPLC,teachers)
       .filter(x=>x.teacherId===targetId&&x.day===day&&x.periodId===periodId):[];
     const combined = [...cellFixed, ...cellSchedules,...groupTeacherRows,...plcRows];
@@ -4022,13 +4073,15 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
     return (
       <div className="flex flex-col items-center justify-center text-[11px] text-center w-full h-full">
         {combined.map((sch, idx) => (
-          sch.__isPLC ? <div key={sch.id} className="font-bold text-[10px] leading-tight break-all">PLC กลุ่ม{sch.subjectArea}</div> : <div key={sch.id} className={`w-full ${idx > 0 ? 'mt-1 pt-1 border-t border-black/20' : ''}`}>
+          sch.__isPLC ? <div key={sch.id} className="font-bold text-[10px] leading-tight break-words">{plcDisplayName(sch.subjectArea)}</div> : <div key={sch.id} className={`w-full ${idx > 0 ? 'mt-1 pt-1 border-t border-black/20' : ''}`}>
+            {isDevelopmentActivity(sch) ? <div className="font-bold text-[11px] leading-tight break-words">{sch.groupLabel || (vMode==='room' ? fixedActivityDisplayName(sch,getSubject,activityGroups,targetId) : fixedActivityDisplayName(sch,getSubject))}</div> : <>
             <div className={`font-bold truncate text-[11px] ${cellFixed.includes(sch) ? 'text-amber-800' : ''}`}>{sch.subjectId}</div>
             {vMode === 'room' ? (
                <><div className="truncate text-[11px]">{sch.teacherId ? getShortTeacherName(getTeacher(sch.teacherId).name) : (fixedActivityTeacherIds(sch).length ? `ครู ${fixedActivityTeacherIds(sch).length} คน` : '-')}</div><div className="text-[10px] truncate">{sch.groupLabel || (vMode==='room' && sch.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===sch.id&&g.classroomId===targetId)?.name : '') || getSubject(sch.subjectId).name}</div></>
              ) : (
                <><div className="truncate text-[11px]">{sch.scopeLabel || getClassroom(sch.classroomId).name}</div><div className="text-[10px] truncate">{sch.groupLabel || (vMode==='room' && sch.classroomId===ALL_CLASSROOMS_ID ? activityGroups.find(g=>g.fixedId===sch.id&&g.classroomId===targetId)?.name : '') || getSubject(sch.subjectId).name}</div></>
              )}
+            </>}
           </div>
         ))}
       </div>
@@ -5402,7 +5455,7 @@ export default function App() {
         const candidates = candidatePool.slice(0, SCHEDULER_CANDIDATE_KEEP);
         const bestCandidate = candidates[0] || { schedule: preservedSchedules, generatedSchedule: [], preservedCount: preservedSchedules.length, unassigned: [], score: -Infinity, missingCount: 0, generationId: String(runSeed) };
         if (findSubjectDailyLimitConflicts([...fixedSchedules, ...bestCandidate.schedule], classrooms, customRules).length ||
-            findAutoSubjectDistributionConflicts([...fixedSchedules, ...bestCandidate.schedule], subjects, classrooms).length)
+            findAutoSubjectDistributionConflicts([...fixedSchedules.filter(f => !isDevelopmentActivity(f)), ...bestCandidate.schedule], subjects, classrooms).length)
           throw new Error('SUBJECT_DAILY_LIMIT_FAILED');
         if (findTeacherTeachingLimitConflicts(buildTeacherOccupancy(bestCandidate.schedule,fixedSchedules,activityGroups), periods, teachers).length) {
           throw new Error('TEACHER_HARD_LIMIT_FAILED');
