@@ -2127,11 +2127,12 @@ const getBulkDeletableSubjectIds = (subjectItems, teachingLoads, schedules, fixe
   return subjectItems.filter(item => !usedIds.has(item.id)).map(item => item.id);
 };
 
-const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixedSchedules, bulkDeleteSubjects, renameSubjectId, dbAction, showToast, handleRequestDelete, schoolSettings }) => {
+const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixedSchedules, bulkDeleteSubjects, renameSubjectId, dbAction, showToast, handleRequestDelete, schoolSettings, onOpenDevelopment }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [form, setForm] = useState({ id: '', name: '', abbr: '', periodsPerWeek: 1, term: '1', periodBlock: 1, preferredTime: 'any' });
   const [isEditing, setIsEditing] = useState(false);
   const [originalSubjectId, setOriginalSubjectId] = useState('');
+  const [newItemKind, setNewItemKind] = useState('subject'); // UI only; activities use the existing fixed-activity editor
   const { items: sortedSubjects, requestSort, sortConfig } = useSortableData(activeSubjects);
   const [selectedSubjectIds, setSelectedSubjectIds] = useState([]);
   const deletableIds = useMemo(() => getBulkDeletableSubjectIds(activeSubjects, teachingLoads, schedules, fixedSchedules), [activeSubjects, teachingLoads, schedules, fixedSchedules]);
@@ -2146,6 +2147,7 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
   const toggleAllSubjects = () => setSelectedSubjectIds(allSelected ? [] : [...deletableIds]);
 
   const saveForm = async () => {
+    if (!isEditing && newItemKind !== 'subject') return; // Never save activities into subjects collection
     const nextId = String(form.id || '').trim();
     const periodsPerWeek = Number(form.periodsPerWeek);
     if (!nextId || !String(form.name || '').trim()) return showToast("กรอกข้อมูลให้ครบ", "error");
@@ -2168,7 +2170,7 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
     <div className="animate-in fade-in space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
         <h2 className="text-xl font-bold text-[#081a39] flex items-center gap-2"><BookOpen className="text-[#d4af37]"/> รายวิชา <span className="text-sm font-normal text-slate-500 ml-2">(ภาคเรียนที่ {schoolSettings.semester})</span></h2>
-        <button onClick={() => {setForm({id:'', name:'', abbr:'', periodsPerWeek: 1, term: schoolSettings.semester, periodBlock: 1, preferredTime: 'any'}); setIsEditing(false); setOriginalSubjectId(''); setIsModalOpen(true);}} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มรายวิชา</button>
+        <button onClick={() => {setForm({id:'', name:'', abbr:'', periodsPerWeek: 1, term: schoolSettings.semester, periodBlock: 1, preferredTime: 'any'}); setNewItemKind('subject'); setIsEditing(false); setOriginalSubjectId(''); setIsModalOpen(true);}} className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#081a39] to-[#122b5e] text-white rounded-xl shadow-md font-bold"><Plus size={18} className="text-[#d4af37]"/> เพิ่มรายวิชา / กิจกรรม</button>
       </div>
       <div className="flex flex-wrap items-center gap-3 bg-white border border-slate-100 rounded-xl px-4 py-3">
         <button type="button" onClick={toggleAllSubjects} disabled={deletableIds.length === 0} className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold text-[#081a39] disabled:opacity-40 hover:bg-slate-50">{allSelected ? 'ยกเลิกเลือกทั้งหมด' : 'เลือกทั้งหมดที่ลบได้'}</button>
@@ -2197,8 +2199,15 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
           </tbody>
         </table>
       </div>
-      <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={isEditing ? 'แก้ไขรายวิชา' : 'เพิ่มรายวิชา'}>
+      <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={isEditing ? 'แก้ไขรายวิชา' : 'เพิ่มรายวิชา / กิจกรรม'}>
         <div className="space-y-4">
+          {!isEditing && <div><label className="block text-sm font-bold text-[#081a39] mb-1" htmlFor="bhs-subject-kind">ประเภทข้อมูล</label>
+            <select id="bhs-subject-kind" value={newItemKind} onChange={e=>setNewItemKind(e.target.value)} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50">
+              <option value="subject">รายวิชาพื้นฐาน/เพิ่มเติม</option>
+              <option value="development">กิจกรรมพัฒนาผู้เรียน</option>
+            </select>
+          </div>}
+          {isEditing || newItemKind === 'subject' ? <>
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">รหัสวิชา</label><input value={form.id} onChange={e => setForm({...form, id: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50" /></div>
           {isEditing && originalSubjectId !== String(form.id || '').trim() && <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3">การเปลี่ยนรหัสวิชาจะขอยืนยันก่อน และอัปเดตภาระสอน ตารางสอน และกิจกรรมล็อกของทุกภาคเรียนพร้อมกัน หากตรวจข้อมูลข้ามภาคเรียนไม่ได้ ระบบจะไม่แก้รหัส</p>}
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">ชื่อวิชา</label><input value={form.name} onChange={e => setForm({...form, name: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50" /></div>
@@ -2212,6 +2221,11 @@ const SubjectsView = ({ activeSubjects, subjects, teachingLoads, schedules, fixe
           </div>
           <div><label className="block text-sm font-bold mb-1">ภาคเรียน</label><select value={form.term} onChange={e => setForm({...form, term: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="1">ภาค 1</option><option value="2">ภาค 2</option><option value="all">ทั้งสองเทอม</option></select></div>
           <button onClick={saveForm} className="w-full mt-4 bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึก</button>
+          </> : <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl space-y-3">
+            <p className="font-bold text-blue-900">กิจกรรมพัฒนาผู้เรียนไม่ต้องกรอกรหัสวิชา</p>
+            <p className="text-sm text-blue-900">ใช้แบบฟอร์มกิจกรรมเดิมเพื่อระบุชื่อ วัน คาบ ห้องเรียน และครูผู้รับผิดชอบ โดยไม่สร้างรายวิชาซ้ำและไม่เพิ่มภาระสอนรายวิชา</p>
+            <button type="button" onClick={() => { setIsModalOpen(false); onOpenDevelopment?.(); }} className="w-full bg-[#081a39] text-white py-3 rounded-xl font-bold">ไปเพิ่ม / จัดการกิจกรรมพัฒนาผู้เรียน</button>
+          </div>}
         </div>
       </Modal>
     </div>
@@ -2318,7 +2332,24 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
   const [originalLoad, setOriginalLoad] = useState(null);
   const resetNewSubject = () => { setCreateNewSubject(false); setNewSubject({ id: '', name: '', abbr: '', periodBlock: 1, preferredTime: 'any' }); };
   const excelInputRef = useRef(null);
-  
+  const [selectedTeacherId, setSelectedTeacherId] = useState('all');
+  // Table-only view: retain original teachingLoad records and Firestore write paths.
+  const loadDisplayRows = teachingLoads.map(load => ({
+    load, id: load.id, teacherName: getTeacher(load.teacherId).name || '',
+    subjectName: getSubject(load.subjectId).name || '',
+    classroomName: getClassroom(load.classroomId).name || '',
+    classroomSortKey: (getClassroom(load.classroomId).name || '').replace(/\d+/g, digits => digits.padStart(5, '0')),
+    periods: Number(load.periods) || 0
+  }));
+  const { items: sortedLoadRows, requestSort: sortLoads, sortConfig: loadSortConfig } = useSortableData(loadDisplayRows, { key: 'teacherName', direction: 'asc' });
+  const displayedLoadRows = selectedTeacherId === 'all'
+    ? sortedLoadRows : sortedLoadRows.filter(row => row.load.teacherId === selectedTeacherId);
+  const displayedPeriods = displayedLoadRows.reduce((sum, row) => sum + row.periods, 0);
+  useEffect(() => {
+    if (selectedTeacherId !== 'all' && !teachers.some(t => t.id === selectedTeacherId)) setSelectedTeacherId('all');
+  }, [selectedTeacherId, teachers]);
+  useEffect(() => { setSelectedTeacherId('all'); }, [schoolSettings.academicYear, schoolSettings.semester]);
+
   const handleSave = async () => {
     if (isSaving) return;
     const periodsValue = Number(form.periods);
@@ -2587,18 +2618,40 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
         </div>
       </div>
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col">
+         <div className="px-4 py-4 border-b border-slate-100 flex flex-wrap gap-4 items-end justify-between">
+           <div className="flex flex-wrap gap-3 items-end">
+             <label className="text-sm font-bold text-[#081a39]">ดูภาระสอน
+               <select value={selectedTeacherId === 'all' ? 'all' : 'one'} onChange={e=>setSelectedTeacherId(e.target.value === 'all' ? 'all' : (teachers[0]?.id || 'all'))} className="block mt-1 p-2.5 border border-slate-200 rounded-lg min-w-[150px] bg-white">
+                 <option value="all">ครูทั้งหมด</option><option value="one">รายบุคคล</option>
+               </select>
+             </label>
+             {selectedTeacherId !== 'all' && <label className="text-sm font-bold text-[#081a39]">เลือกครู
+               <select value={selectedTeacherId} onChange={e=>setSelectedTeacherId(e.target.value)} className="block mt-1 p-2.5 border border-slate-200 rounded-lg min-w-[220px] bg-white">
+                 {teachers.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+               </select>
+             </label>}
+           </div>
+           <p className="text-sm text-slate-600">แสดง <strong className="text-[#081a39]">{displayedLoadRows.length}</strong> รายการ · รวม <strong className="text-[#081a39]">{displayedPeriods}</strong> คาบ/สัปดาห์ (เฉพาะรายวิชา ไม่รวมกิจกรรมและ PLC)</p>
+         </div>
          <div className="overflow-x-auto custom-scrollbar">
            <table className="w-full text-left border-collapse">
               <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]">
-                <tr><th className="p-4 font-bold">ครูผู้สอน</th><th className="p-4 font-bold">รายวิชา</th><th className="p-4 font-bold text-center">ห้อง</th><th className="p-4 font-bold text-center">คาบ/สัปดาห์</th><th className="p-4 font-bold text-center w-28">จัดการ</th></tr>
+                <tr>
+                  <th className="p-4 font-bold cursor-pointer select-none" onClick={() => sortLoads('teacherName')}>ครูผู้สอน <SortIcon column="teacherName" sortConfig={loadSortConfig}/></th>
+                  <th className="p-4 font-bold cursor-pointer select-none" onClick={() => sortLoads('subjectName')}>รายวิชา <SortIcon column="subjectName" sortConfig={loadSortConfig}/></th>
+                  <th className="p-4 font-bold text-center cursor-pointer select-none" onClick={() => sortLoads('classroomSortKey')}>ห้อง <SortIcon column="classroomSortKey" sortConfig={loadSortConfig}/></th>
+                  <th className="p-4 font-bold text-center cursor-pointer select-none" onClick={() => sortLoads('periods')}>คาบ/สัปดาห์ <SortIcon column="periods" sortConfig={loadSortConfig}/></th>
+                  <th className="p-4 font-bold text-center w-28">จัดการ</th>
+                </tr>
               </thead>
               <tbody>
-                {teachingLoads.map(l => (
+                {displayedLoadRows.map(({ load: l }) => (
                   <tr key={l.id} className="border-b border-slate-50 hover:bg-[#081a39]/5">
                     <td className="p-4 font-medium text-[#081a39]">{getTeacher(l.teacherId).name}</td><td className="p-4 text-slate-600"><span className="text-xs font-mono bg-slate-100 text-slate-500 px-2 py-1 rounded mr-2">{l.subjectId}</span>{getSubject(l.subjectId).name}</td><td className="p-4 text-center font-bold text-[#d4af37]">{getClassroom(l.classroomId).name}</td><td className="p-4 text-center font-medium">{l.periods}</td>
                     <td className="p-4 text-center"><div className="flex items-center justify-center gap-2"><button onClick={() => { setForm(l); resetNewSubject(); setOriginalLoad({...l}); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39] rounded-lg"><Edit size={18}/></button><button onClick={() => handleRequestDelete('load', l)} className="p-2 text-slate-400 hover:text-rose-500 rounded-lg"><Trash2 size={18}/></button></div></td>
                   </tr>
                 ))}
+                {displayedLoadRows.length === 0 && <tr><td colSpan={5} className="p-8 text-center text-slate-500">ไม่พบภาระสอนของครูที่เลือกในภาคเรียนนี้</td></tr>}
               </tbody>
            </table>
          </div>
@@ -3227,7 +3280,7 @@ const ManagementTabs = ({ title, tabs, value, onChange }) => (
   </div>
 );
 
-const BasicDataHub = ({ commonProps, autoGenerateClassrooms }) => {
+const BasicDataHub = ({ commonProps, autoGenerateClassrooms, onOpenDevelopment }) => {
   const [section, setSection] = useState('teachers');
   const tabs = [
     { id: 'teachers', name: 'ข้อมูลครู', icon: Users },
@@ -3237,13 +3290,13 @@ const BasicDataHub = ({ commonProps, autoGenerateClassrooms }) => {
   return <div className="space-y-6 animate-in fade-in">
     <ManagementTabs title="ข้อมูลพื้นฐาน" tabs={tabs} value={section} onChange={setSection} />
     {section === 'teachers' && <TeachersView {...commonProps} />}
-    {section === 'subjects' && <SubjectsView {...commonProps} importBasicSubjects={() => {}} />}
+    {section === 'subjects' && <SubjectsView {...commonProps} onOpenDevelopment={onOpenDevelopment} importBasicSubjects={() => {}} />}
     {section === 'classrooms' && <ClassroomsView {...commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
   </div>;
 };
 
-const ConstraintsHub = ({ commonProps }) => {
-  const [section, setSection] = useState('time');
+const ConstraintsHub = ({ commonProps, initialSection = 'time' }) => {
+  const [section, setSection] = useState(initialSection);
   const tabs = [
     { id: 'time', name: 'ข้อจำกัดเวลา', icon: Clock },
     { id: 'rules', name: 'เงื่อนไขการจัดตาราง', icon: Filter },
@@ -4144,6 +4197,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
 export default function App() {
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [constraintsEntrySection, setConstraintsEntrySection] = useState('time');
   const [dashboardTargetRoom, setDashboardTargetRoom] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [toast, setToast] = useState(null);
@@ -5801,7 +5855,7 @@ export default function App() {
         <nav className="flex-1 overflow-y-auto py-6 custom-scrollbar space-y-1 px-3">
           {TABS.map(tab => {
             const IconComponent = tab.icon;
-            return <button key={tab.id} onClick={() => { setDashboardTargetRoom(''); setActiveTab(tab.id); setIsSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-medium ${activeTab === tab.id ? 'bg-gradient-to-r from-[#d4af37] to-[#e6c55c] text-[#081a39] shadow-md font-bold' : 'text-slate-300 hover:text-white hover:bg-white/10'}`}><IconComponent size={20} className={activeTab === tab.id ? "text-[#081a39]" : "opacity-80"} /> {tab.name}</button>;
+            return <button key={tab.id} onClick={() => { setDashboardTargetRoom(''); if (tab.id === 'constraintsHub') setConstraintsEntrySection('time'); setActiveTab(tab.id); setIsSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-medium ${activeTab === tab.id ? 'bg-gradient-to-r from-[#d4af37] to-[#e6c55c] text-[#081a39] shadow-md font-bold' : 'text-slate-300 hover:text-white hover:bg-white/10'}`}><IconComponent size={20} className={activeTab === tab.id ? "text-[#081a39]" : "opacity-80"} /> {tab.name}</button>;
           })}
         </nav>
       </aside>
@@ -5813,9 +5867,9 @@ export default function App() {
         <div className="flex-1 overflow-y-auto p-4 sm:p-8 custom-scrollbar bhs-scroll-content">
           {activeTab === 'dashboard' && <Dashboard {...commonProps} onNavigate={(tab) => { setDashboardTargetRoom(''); setActiveTab(tab); }} onOpenRoom={(roomId) => { setDashboardTargetRoom(roomId); setActiveTab('schedule'); }} />}
           {activeTab === 'settings' && <SettingsView {...commonProps} handleRestoreBackup={handleRestoreBackup} />}
-          {activeTab === 'basicData' && <BasicDataHub commonProps={commonProps} autoGenerateClassrooms={autoGenerateClassrooms} />}
+          {activeTab === 'basicData' && <BasicDataHub commonProps={commonProps} autoGenerateClassrooms={autoGenerateClassrooms} onOpenDevelopment={() => { setConstraintsEntrySection('development'); setDashboardTargetRoom(''); setActiveTab('constraintsHub'); setIsSidebarOpen(false); }} />}
           {activeTab === 'loads' && <LoadsView {...commonProps} />}
-          {activeTab === 'constraintsHub' && <ConstraintsHub commonProps={commonProps} />}
+          {activeTab === 'constraintsHub' && <ConstraintsHub commonProps={commonProps} initialSection={constraintsEntrySection} />}
           {activeTab === 'schedule' && <ScheduleView {...commonProps} initialRoomId={dashboardTargetRoom} runSmartSchedule={runSmartSchedule} isScheduling={isScheduling} />}
           {activeTab === 'history' && <ScheduleHistoryView key={getTermKey(schoolSettings)} {...commonProps} />}
           {activeTab === 'reports' && <ReportsView {...commonProps} />}
