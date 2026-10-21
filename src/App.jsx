@@ -153,6 +153,9 @@ const DEFAULT_PERIODS = [
 ];
 
 const DAYS = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์'];
+// A single subject-specific block rule covers every active period on one weekday.
+// Do not generate seven per-period records; this preserves the existing Firebase rule format.
+const ALL_DAY_PERIOD_ID = '__ALL_DAY__';
 // STEP 10: กิจกรรมล็อกทุกห้องเก็บเป็นเอกสารเดียว (ครูผู้ดูแลไม่นับซ้ำหลายห้อง)
 const ALL_CLASSROOMS_ID = '__ALL_CLASSROOMS__';
 // Stage 30: saved in existing fixedSchedules collection, so backups, PLC, history and Auto
@@ -384,11 +387,16 @@ const isValidCustomRule = (rule, teachers, subjects, classrooms, periods) => {
   if (rule.mode === 'timeWindow') return rule.targetType === 'subject' &&
     ['morning','afternoon'].includes(rule.timeWindow) &&
     ['required','preferred'].includes(rule.strictness);
-  return ['block', 'prefer'].includes(rule.mode) && DAYS.includes(rule.day) &&
-    periods.some(p => !p.isBreak && String(p.id) === String(rule.periodId));
+  if (!['block', 'prefer'].includes(rule.mode) || !DAYS.includes(rule.day)) return false;
+  // Only subject block rules may cover a whole day; teacher/classroom/preference rules stay per-period.
+  if (String(rule.periodId) === ALL_DAY_PERIOD_ID)
+    return rule.targetType === 'subject' && rule.mode === 'block' && periods.some(p => !p.isBreak);
+  return periods.some(p => !p.isBreak && String(p.id) === String(rule.periodId));
 };
 const customRuleMatches = (rule, item) => !!(rule && item && rule.day === item.day &&
-  String(rule.periodId) === String(item.periodId) &&
+  (String(rule.periodId) === ALL_DAY_PERIOD_ID
+    ? rule.targetType === 'subject' && rule.mode === 'block'
+    : String(rule.periodId) === String(item.periodId)) &&
   (rule.targetType === 'teacher' ? !!item.teacherId && rule.targetId === item.teacherId :
    rule.targetType === 'subject' ? !!item.subjectId && rule.targetId === item.subjectId :
    rule.targetType === 'classroom' ? (rule.targetId === item.classroomId || (item.classroomId === ALL_CLASSROOMS_ID && fixedAppliesToClassroom(item,rule.targetId))) : false));
@@ -2985,16 +2993,19 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
   const [timeWindow, setTimeWindow] = useState('morning');
   const [timeStrictness, setTimeStrictness] = useState('required');
   const targets = form.targetType === 'teacher' ? teachers : form.targetType === 'subject' ? activeSubjects : classrooms;
+  const canBlockSubjectAllDay = form.targetType === 'subject' && form.mode === 'block';
   const listForRule = r => r.targetType === 'teacher' ? teachers : r.targetType === 'subject' ? activeSubjects : classrooms;
   const labelForRule = r => listForRule(r).find(x => x.id === r.targetId)?.name || r.targetId;
   const handleAdd = async () => {
     if (saving) return;
     if (!rulesReady) return showToast('ยังโหลดเงื่อนไขไม่สำเร็จ กรุณาตรวจการเชื่อมต่อ', 'error');
-    if (!isValidCustomRule(form, teachers, activeSubjects, classrooms, periods)) return showToast('กรุณาระบุครู/วิชา/ห้อง วัน และคาบที่ถูกต้อง', 'error');
+    if (!isValidCustomRule(form, teachers, activeSubjects, classrooms, periods)) return showToast('กรุณาระบุครู/วิชา/ห้อง วัน และคาบหรือทั้งวันที่ถูกต้อง', 'error');
     if (customRules.some(r => r.targetType === form.targetType && r.targetId === form.targetId && r.day === form.day && String(r.periodId) === String(form.periodId) && r.mode === form.mode))
       return showToast('มีเงื่อนไขนี้แล้ว', 'error');
     if (form.mode === 'block' && [...schedules, ...fixedSchedules].some(item => customRuleMatches(form, item)))
-      return showToast('มีตารางเดิมหรือกิจกรรมล็อกในช่วงนี้ กรุณาจัดการตารางเดิมก่อน', 'error');
+      return showToast(form.periodId === ALL_DAY_PERIOD_ID
+        ? 'มีรายวิชานี้อยู่ในตารางวันดังกล่าวแล้ว กรุณาย้ายคาบเดิมออกก่อนกำหนดห้ามทั้งวัน'
+        : 'มีตารางเดิมหรือกิจกรรมล็อกในช่วงนี้ กรุณาจัดการตารางเดิมก่อน', 'error');
     setSaving(true);
     try {
       const id = `RULE_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -3037,12 +3048,13 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
         {!rulesReady && <p role="alert" className="text-rose-700 mb-3">กำลังโหลดเงื่อนไขจาก Firebase หรือไม่มีสิทธิ์อ่านข้อมูล กรุณาตรวจการเชื่อมต่อก่อนแก้ไข</p>}
         <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ครูเป้าหมายรวมคาบสอน+กิจกรรม 4 คาบ/วัน (5 คาบเมื่อจำเป็นและยืนยัน) และไม่เกิน 2 คาบสอนรายวิชาติดกัน; กิจกรรมจัดติดกับวิชาได้โดยจะแจ้งเตือนเมื่อภาระต่อเนื่องหนัก</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <label className="text-sm font-bold">ประเภทข้อมูล<select className="w-full border rounded-xl p-3 mt-1" value={form.targetType} onChange={e => setForm(prev => ({ ...prev, targetType: e.target.value, targetId: '' }))}><option value="teacher">ครู</option><option value="subject">รายวิชา</option><option value="classroom">ห้องเรียน</option></select></label>
+          <label className="text-sm font-bold">ประเภทข้อมูล<select className="w-full border rounded-xl p-3 mt-1" value={form.targetType} onChange={e => setForm(prev => ({ ...prev, targetType: e.target.value, targetId: '', periodId: prev.periodId === ALL_DAY_PERIOD_ID ? '' : prev.periodId }))}><option value="teacher">ครู</option><option value="subject">รายวิชา</option><option value="classroom">ห้องเรียน</option></select></label>
           <label className="text-sm font-bold">เลือกบุคคล/รายการ<select className="w-full border rounded-xl p-3 mt-1" value={form.targetId} onChange={e => setForm(prev => ({ ...prev, targetId: e.target.value }))}><option value="">-- เลือก --</option>{targets.map(x => <option key={x.id} value={x.id}>{x.name} ({x.id})</option>)}</select></label>
           <label className="text-sm font-bold">วัน<select className="w-full border rounded-xl p-3 mt-1" value={form.day} onChange={e => setForm(prev => ({ ...prev, day: e.target.value }))}>{DAYS.map(day => <option key={day} value={day}>{day}</option>)}</select></label>
-          <label className="text-sm font-bold">คาบ<select className="w-full border rounded-xl p-3 mt-1" value={form.periodId} onChange={e => setForm(prev => ({ ...prev, periodId: e.target.value }))}><option value="">-- เลือกคาบ --</option>{periods.filter(p => !p.isBreak).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
-          <label className="text-sm font-bold sm:col-span-2">เงื่อนไข<select className="w-full border rounded-xl p-3 mt-1" value={form.mode} onChange={e => setForm(prev => ({ ...prev, mode: e.target.value }))}><option value="block">ข้อบังคับ: ห้ามจัดในคาบนี้</option><option value="prefer">ข้อแนะนำ: พยายามจัดในคาบนี้</option></select></label>
+          <label className="text-sm font-bold">คาบ<select className="w-full border rounded-xl p-3 mt-1" value={form.periodId} onChange={e => setForm(prev => ({ ...prev, periodId: e.target.value }))}><option value="">-- เลือกคาบ --</option>{canBlockSubjectAllDay && <option value={ALL_DAY_PERIOD_ID}>ทั้งวัน (ทุกคาบ)</option>}{periods.filter(p => !p.isBreak).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+          <label className="text-sm font-bold sm:col-span-2">เงื่อนไข<select className="w-full border rounded-xl p-3 mt-1" value={form.mode} onChange={e => setForm(prev => ({ ...prev, mode: e.target.value, periodId: e.target.value !== 'block' && prev.periodId === ALL_DAY_PERIOD_ID ? '' : prev.periodId }))}><option value="block">ข้อบังคับ: ห้ามจัดในคาบ/วันที่เลือก</option><option value="prefer">ข้อแนะนำ: พยายามจัดในคาบนี้</option></select></label>
         </div>
+        {canBlockSubjectAllDay && <p className="text-sm text-slate-600 mt-3">เลือก “ทั้งวัน (ทุกคาบ)” เพื่อห้ามรายวิชานี้ในวันดังกล่าวสำหรับทุกห้องเรียนที่ใช้รายวิชานี้ โดยยังเลือกห้ามเฉพาะคาบตามเดิมได้</p>}
         <button disabled={saving || !rulesReady || !form.targetId || !form.periodId} onClick={handleAdd} className="mt-4 px-6 py-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">{saving ? 'กำลังบันทึก...' : 'เพิ่มเงื่อนไข'}</button>
       </div>
       <div className="bg-white border rounded-2xl p-6 max-w-4xl">
@@ -3097,7 +3109,7 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
       <div className="bg-white border rounded-2xl p-6 max-w-4xl">
         <h3 className="font-bold text-lg mb-3">รายการเงื่อนไข ({customRules.length})</h3>
         {!customRules.length && <p className="text-slate-500 text-sm">ยังไม่มีเงื่อนไขเพิ่มเติม</p>}
-        <div className="space-y-2">{customRules.map(rule => <div key={rule.id} className="flex flex-wrap gap-2 items-center justify-between border rounded-xl p-3"><div className="text-sm"><span className="font-bold">{labelForRule(rule)}</span> · {rule.mode === 'dailyLimit' ? `ไม่เกิน ${rule.maxPerDay} คาบต่อวัน/ห้อง` : rule.mode === 'timeWindow' ? `ทุกวัน · ช่วง${rule.timeWindow === 'morning' ? 'เช้า' : 'บ่าย'}` : `วัน${rule.day} · ${getPeriodDisplayName(periods, rule.periodId)}`} <span className={rule.mode === 'block' || (rule.mode === 'timeWindow' && rule.strictness === 'required') ? 'text-rose-700' : 'text-emerald-700'}>({rule.mode === 'dailyLimit' ? 'ข้อบังคับจำนวนคาบ' : rule.mode === 'timeWindow' ? (rule.strictness === 'required' ? 'บังคับช่วงเวลา' : 'แนะนำช่วงเวลา') : rule.mode === 'block' ? 'ห้ามจัด' : 'ควรจัด'})</span></div><button className="text-rose-700 border border-rose-200 px-3 py-2 rounded-lg" onClick={async () => { if (window.confirm('ยืนยันลบเงื่อนไขนี้?')) await dbAction('scheduleRules', rule.id, null, 'delete'); }}>ลบ</button></div>)}</div>
+        <div className="space-y-2">{customRules.map(rule => <div key={rule.id} className="flex flex-wrap gap-2 items-center justify-between border rounded-xl p-3"><div className="text-sm"><span className="font-bold">{labelForRule(rule)}</span> · {rule.mode === 'dailyLimit' ? `ไม่เกิน ${rule.maxPerDay} คาบต่อวัน/ห้อง` : rule.mode === 'timeWindow' ? `ทุกวัน · ช่วง${rule.timeWindow === 'morning' ? 'เช้า' : 'บ่าย'}` : `วัน${rule.day} · ${rule.mode === 'block' && rule.targetType === 'subject' && String(rule.periodId) === ALL_DAY_PERIOD_ID ? 'ทั้งวัน (ทุกคาบ)' : getPeriodDisplayName(periods, rule.periodId)}`} <span className={rule.mode === 'block' || (rule.mode === 'timeWindow' && rule.strictness === 'required') ? 'text-rose-700' : 'text-emerald-700'}>({rule.mode === 'dailyLimit' ? 'ข้อบังคับจำนวนคาบ' : rule.mode === 'timeWindow' ? (rule.strictness === 'required' ? 'บังคับช่วงเวลา' : 'แนะนำช่วงเวลา') : rule.mode === 'block' ? 'ห้ามจัด' : 'ควรจัด'})</span></div><button className="text-rose-700 border border-rose-200 px-3 py-2 rounded-lg" onClick={async () => { if (window.confirm('ยืนยันลบเงื่อนไขนี้?')) await dbAction('scheduleRules', rule.id, null, 'delete'); }}>ลบ</button></div>)}</div>
       </div>
     </div>
   );
