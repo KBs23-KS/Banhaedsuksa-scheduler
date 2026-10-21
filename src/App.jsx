@@ -25,6 +25,90 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = 'bhs-school-scheduler-v3'; 
 
+// STAGE 27: ภาษาไทยสำหรับข้อความแจ้งเตือนที่ผู้ใช้มองเห็นเท่านั้น
+// คงรหัสเหตุผลเดิมไว้สำหรับการตรวจข้อบังคับและการบันทึกข้อมูล
+// เพิ่มรหัส/คำแนะนำใหม่ที่นี่ แทนการแก้คำแปลแยกแต่ละหน้าจอ
+const USER_ERROR_TH = Object.freeze({
+  MISSING_SOURCE: 'ไม่พบคาบเรียนต้นทาง อาจมีการลบหรือเปลี่ยนตารางจากเครื่องอื่น กรุณาโหลดตารางใหม่แล้วลองอีกครั้ง',
+  LOCKED_SOURCE: 'คาบเรียนต้นทางถูกล็อกไว้ กรุณาปลดล็อกก่อนย้ายคาบ',
+  LOCKED_PARTNER: 'คาบคู่ที่ต้องย้ายพร้อมกันถูกล็อกไว้ กรุณาปลดล็อกคาบคู่ก่อน',
+  INVALID_DAY: 'วันที่เลือกไม่ถูกต้อง กรุณาเลือกวันเรียนใหม่',
+  INVALID_PERIOD: 'คาบปลายทางไม่ถูกต้องหรือไม่มีอยู่ในตาราง กรุณาเลือกคาบใหม่',
+  INVALID_SOURCE_PERIOD: 'ไม่พบคาบต้นทางในช่วงเวลาเรียนปัจจุบัน กรุณาโหลดตารางใหม่',
+  INVALID_BLOCK_PAIR: 'วิชาคาบคู่ต้องอยู่ในคาบเรียนที่ติดกัน และห้ามข้ามคาบพัก กรุณาเลือกตำแหน่งใหม่',
+  BREAK_PERIOD: 'คาบนี้เป็นเวลาพักกลางวัน ไม่สามารถจัดวิชาเรียนได้',
+  ROOM_UNAVAILABLE: 'ห้องเรียนนี้ถูกปิดการจัดตารางอัตโนมัติในช่วงเวลาที่เลือก หากจำเป็นสามารถลงด้วยมือและยืนยันข้อยกเว้นได้',
+  TEACHER_UNAVAILABLE: 'ครูไม่ว่างในช่วงเวลานี้ หรือมี PLC กรุณาเลือกคาบอื่น',
+  FIXED_SCHEDULE_CONFLICT: 'ช่วงเวลานี้มีกิจกรรมล็อกตายตัวอยู่แล้ว กรุณาตรวจรายการกิจกรรมก่อน',
+  ROOM_CONFLICT: 'ห้องเรียนมีคาบเรียนหรือกิจกรรมอื่นในช่วงเวลาปลายทางแล้ว กรุณาเลือกคาบว่างหรือย้ายรายการเดิมออกก่อน',
+  TEACHER_CONFLICT: 'ครูมีคาบสอนหรือกิจกรรมอื่นในช่วงเวลาเดียวกัน กรุณาเลือกเวลาที่ครูว่าง',
+  TEACHER_DAILY_LIMIT: 'ครูมีภาระสอนและกิจกรรมครบเพดานของวันนั้นแล้ว กรุณากระจายคาบไปวันอื่น',
+  TEACHER_CONSECUTIVE_LIMIT: 'คาบสอนรายวิชาติดต่อกันเกินเงื่อนไข กรุณาเว้นคาบหรือเลือกช่วงเวลาอื่น',
+  TEACHER_FOUR_PERIOD_PATTERN: 'การกระจายคาบสอน 4 คาบของครูไม่ผ่านรูปแบบที่กำหนด กรุณาปรับตำแหน่งคาบ',
+  SUBJECT_DAILY_LIMIT: 'รายวิชานี้เกินจำนวนคาบสูงสุดต่อวันของห้องเรียน กรุณาเลือกวันอื่น',
+  CUSTOM_RULE_BLOCKED: 'ขัดกับเงื่อนไขจัดตารางของครู รายวิชา หรือห้องเรียน กรุณาตรวจเมนูข้อจำกัดและเงื่อนไข',
+  DOUBLE_PERIOD_NOT_AVAILABLE: 'ไม่พบคาบว่างติดกัน 2 คาบสำหรับวิชาคาบคู่ กรุณาตรวจคาบล็อกหรือสลับคาบอื่น',
+  BLOCK_COMPANION_NOT_AVAILABLE: 'ไม่พบคาบที่ติดกับคาบเดิมเพื่อจับคู่วิชา กรุณาตรวจคาบข้างเคียง',
+  NO_AVAILABLE_SLOT: 'ไม่พบคาบว่างที่ผ่านเงื่อนไขทั้งหมด กรุณาตรวจข้อจำกัดหรือปรับคาบที่จัดไว้',
+  SUBJECT_ID_TAKEN: 'รหัสรายวิชานี้มีอยู่ในระบบแล้ว กรุณาใช้รหัสอื่น',
+  SUBJECT_DATA_CHANGED: 'ข้อมูลรายวิชาเปลี่ยนไปจากเครื่องอื่น กรุณาโหลดข้อมูลใหม่แล้วลองอีกครั้ง',
+  SUBJECT_REFS_CHANGED: 'ข้อมูลที่เชื่อมโยงกับรายวิชาเปลี่ยนไป กรุณาโหลดข้อมูลใหม่ก่อนดำเนินการ',
+  SUBJECT_IN_USE: 'รายวิชานี้ถูกใช้อยู่ในภาระสอน ตาราง หรือกิจกรรม จึงยังลบไม่ได้',
+  NOT_SIGNED_IN: 'ยังไม่ได้เชื่อมต่อระบบ กรุณาตรวจการเข้าสู่ระบบแล้วลองอีกครั้ง',
+  TIME_RULE_EXISTS: 'รายวิชานี้มีเงื่อนไขช่วงเวลาอยู่แล้ว กรุณาตรวจรายการเดิม',
+  FIXED_SELECTION_EMPTY: 'ยังไม่ได้เลือกกิจกรรมที่ต้องการจัดการ กรุณาเลือกรายการก่อน',
+  FIXED_SELECTION_CHANGED: 'รายการกิจกรรมที่เลือกเปลี่ยนไป กรุณาโหลดข้อมูลใหม่แล้วเลือกอีกครั้ง',
+  FIXED_TERM_CHANGED: 'ภาคเรียนเปลี่ยนไประหว่างดำเนินการ กรุณาโหลดใหม่',
+  FIXED_DATA_CHANGED: 'ข้อมูลกิจกรรมเปลี่ยนไปจากเครื่องอื่น กรุณาตรวจและเลือกใหม่',
+  FIXED_HISTORY_FAILED: 'บันทึกประวัติก่อนลบกิจกรรมไม่สำเร็จ ระบบยังไม่ได้ลบข้อมูล',
+  BACKUP_SETTINGS_MISSING: 'ไม่พบการตั้งค่าภาคเรียนที่ต้องใช้สำรองข้อมูล กรุณาตรวจการตั้งค่า',
+  BACKUP_TERM_CHANGED: 'ภาคเรียนเปลี่ยนระหว่างสำรองข้อมูล กรุณาเริ่มสำรองใหม่',
+  BACKUP_SETTINGS_CHANGED: 'การตั้งค่าโรงเรียนเปลี่ยนระหว่างสำรองข้อมูล กรุณาเริ่มใหม่',
+  SNAPSHOT_ROW_TOO_LARGE: 'ข้อมูลประวัติบางรายการมีขนาดใหญ่เกินไป ยังบันทึกประวัติไม่สำเร็จ',
+  UNSUPPORTED_HISTORY_FORMAT: 'รูปแบบประวัติตารางนี้ยังไม่รองรับ กรุณาใช้รายการประวัติอื่น',
+  RESTORE_SNAPSHOT_FAILED: 'ไม่สามารถสร้างจุดย้อนกลับก่อนกู้คืนได้ ระบบจึงยังไม่เปลี่ยนข้อมูล',
+  INVALID_REPLACEMENT_ITEMS: 'ข้อมูลชุดที่จะนำเข้าไม่ถูกต้อง ระบบยังไม่ได้เขียนทับ',
+  INVALID_REPLACEMENT_ITEM: 'พบข้อมูลรายการที่นำเข้าไม่ถูกต้อง ระบบยังไม่ได้เขียนทับ',
+  NO_ACTIVE_PERIODS: 'ไม่พบคาบเรียนที่เปิดใช้งาน กรุณาตรวจการตั้งค่าคาบเรียน',
+  SCHEDULER_LOCK_LOST: 'สิทธิ์ล็อกการจัดตารางหมดอายุหรือเปลี่ยนไป ระบบหยุดทำงานเพื่อป้องกันตารางชน กรุณาลองใหม่',
+  SUBJECT_DAILY_LIMIT_FAILED: 'ผลจัดตารางไม่ผ่านเงื่อนไขจำนวนคาบรายวิชาต่อวัน ระบบยังไม่บันทึกผล',
+  TEACHER_HARD_LIMIT_FAILED: 'ผลจัดตารางไม่ผ่านข้อบังคับภาระสอนครู ระบบยังไม่บันทึกผล',
+  STALE_PREVIEW: 'มีข้อมูลตารางเปลี่ยนไประหว่างดูตัวอย่าง กรุณาจัดตารางใหม่ก่อนบันทึก',
+  ATOMIC_LIMIT: 'รายการที่จะบันทึกมีจำนวนมากเกินข้อจำกัดต่อครั้ง กรุณาแบ่งข้อมูลเป็นชุดเล็กลง',
+  ATOMIC_SIZE: 'ข้อมูลที่จะบันทึกมีขนาดใหญ่เกินข้อจำกัดต่อครั้ง กรุณาแบ่งข้อมูลเป็นชุดเล็กลง',
+});
+const FIREBASE_ERROR_TH = Object.freeze({
+  'auth/invalid-api-key': 'ค่า Firebase API Key ไม่ถูกต้อง กรุณาตรวจ Environment Variables บน Vercel แล้วเผยแพร่เว็บไซต์ใหม่',
+  'auth/operation-not-allowed': 'ยังไม่ได้เปิดวิธีเข้าสู่ระบบแบบไม่ระบุตัวตน (Anonymous) ใน Firebase Authentication',
+  'auth/network-request-failed': 'เชื่อมต่อระบบยืนยันตัวตนไม่ได้ กรุณาตรวจอินเทอร์เน็ต',
+  'auth/unauthorized-domain': 'โดเมนเว็บไซต์นี้ยังไม่ได้รับอนุญาตใน Firebase Authentication',
+  'auth/too-many-requests': 'มีคำขอเข้าสู่ระบบถี่เกินไป กรุณารอสักครู่แล้วลองใหม่',
+  'permission-denied': 'ไม่มีสิทธิ์อ่านหรือเขียนข้อมูล กรุณาตรวจ Firebase Security Rules',
+  'unauthenticated': 'ยังไม่ได้เข้าสู่ระบบ กรุณาโหลดหน้าใหม่แล้วลองอีกครั้ง',
+  'unavailable': 'ไม่สามารถเชื่อมต่อฐานข้อมูลได้ในขณะนี้ กรุณาตรวจอินเทอร์เน็ตแล้วลองใหม่',
+  'resource-exhausted': 'ระบบได้รับคำขอมากเกินไป กรุณารอสักครู่แล้วลองใหม่',
+  'deadline-exceeded': 'การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองอีกครั้ง',
+  'failed-precondition': 'ข้อมูลหรือการตั้งค่าบางอย่างยังไม่พร้อม กรุณาตรวจสอบก่อนทำรายการ',
+  'not-found': 'ไม่พบข้อมูลที่ต้องการ อาจถูกลบหรือเปลี่ยนแปลงแล้ว กรุณาโหลดข้อมูลใหม่',
+});
+const translateUserMessage = (message) => {
+  const raw = String(message?.message ?? message ?? '').trim();
+  if (!raw) return 'ไม่สามารถดำเนินการได้ กรุณาลองอีกครั้ง';
+  if (/^Invalid Format$/i.test(raw)) return 'รูปแบบไฟล์ไม่ถูกต้อง กรุณาเลือกไฟล์สำรองจากระบบนี้';
+  if (/^Missing document id in /i.test(raw)) return 'รายการข้อมูลนำเข้าไม่มีรหัสเอกสารครบถ้วน กรุณาตรวจไฟล์ก่อนนำเข้า';
+  if (/^Duplicate document id /i.test(raw)) return 'พบรหัสเอกสารซ้ำในข้อมูลนำเข้า กรุณาตรวจไฟล์ก่อนนำเข้า';
+  // แปลงข้อผิดพลาดของ Firebase ก่อนแปลงรหัสของระบบจัดตาราง
+  const firebaseTranslated = raw.replace(/(?:FirebaseError:\s*)?Firebase:\s*Error\s*\(([a-z-]+\/[a-z-]+)\)\.?/gi,
+    (_, code) => FIREBASE_ERROR_TH[code.toLowerCase()] || 'เชื่อมต่อ Firebase ไม่สำเร็จ กรุณาตรวจการตั้งค่าและลองใหม่');
+  const withFirebaseCodes = firebaseTranslated.replace(/\b(auth\/[a-z-]+|permission-denied|unauthenticated|unavailable|resource-exhausted|deadline-exceeded|failed-precondition|not-found)\b/gi,
+    (code) => FIREBASE_ERROR_TH[code.toLowerCase()] || 'ระบบเชื่อมต่อไม่สำเร็จ กรุณาลองใหม่');
+  return withFirebaseCodes.replace(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g,
+    code => USER_ERROR_TH[code] || 'เกิดข้อผิดพลาดในการดำเนินการ กรุณาลองใหม่หรือติดต่อผู้ดูแลระบบ')
+    .replace(/^ย้ายไม่ได้\s*:\s*/, 'ไม่สามารถย้ายคาบเรียนได้: ')
+    .replace(/^ย้ายคาบไม่สำเร็จ\s*:\s*/, 'ไม่สามารถย้ายคาบเรียนได้: ');
+};
+
+
 // STEP 04: Scheduler lock is acquired/released atomically and belongs to one run.
 // The lease duration remains 5 minutes (matching the old lock), with periodic renewal.
 const SCHEDULER_LOCK_TTL_MS = 5 * 60 * 1000;
@@ -125,8 +209,13 @@ const planClassroomDayClosure = ({classroomId,day,periods,schedules=[],fixedSche
   return {ok:true,reason:'',periodIds:(periods||[]).filter(p=>!p.isBreak&&!existing.has(String(p.id))).map(p=>p.id)};
 };
 // One teacher/day/period = one load slot regardless of report/table representation.
+// Stage 26: กิจกรรมล็อกมีครูรับผิดชอบ = ภาระประจำวัน แต่ไม่ใช่คาบสอนรายวิชา
+// ครูรับผิดชอบหลายห้องพร้อมกันให้นับเพียงหนึ่งคาบต่อช่วงเวลา
+const isTeacherActivityDuty = item => item?.__isFixedActivity === true ||
+  item?.__activityTeacherOnly === true || item?.__kind === 'กิจกรรมล็อก';
+const markFixedTeacherActivities = items => (items || []).map(item => ({...item,__isFixedActivity:true}));
 const buildTeacherOccupancy = (schedules = [], fixedSchedules = [], activityGroups = []) =>
-  [...schedules, ...fixedSchedules, ...activityTeacherEntries(activityGroups, fixedSchedules)]
+  [...schedules, ...markFixedTeacherActivities(fixedSchedules), ...activityTeacherEntries(activityGroups, fixedSchedules)]
     .filter(item => Boolean(item.teacherId));
 const summarizeTeacherWeek = (items, periods) => {
   const days = new Map();
@@ -609,7 +698,7 @@ const SortIcon = ({ column, sortConfig }) => {
 const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, teachers, subjects, classrooms, periods, customRules = [], activityGroups = [], plcSessions = []) => {
   const health = {
     status: 'ready', totalRequired: 0, scheduledForLoads: 0, missing: 0, overScheduled: 0, completionPercent: 0,
-    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], teacherLimitConflicts: [], teacherFivePeriodWarnings: [], customRuleConflicts: [], subjectDailyConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
+    teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], teacherLimitConflicts: [], teacherFivePeriodWarnings: [], teacherActivityConsecutiveWarnings: [], customRuleConflicts: [], subjectDailyConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
     teacherStats: {}, roomStats: {}, plcConflicts: [], 
   };
 
@@ -791,12 +880,13 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   health.customRuleConflicts = [...schedules, ...fixed].filter(item => blocksCustomRule(customRules, item, periods)).map(item =>
     `ข้อบังคับที่ตั้งเอง: ${item.subjectId || '-'} / วัน${item.day} ${getPeriodDisplayName(periods, item.periodId)} ไม่สามารถจัดได้`);
   health.teacherLimitConflicts = findTeacherTeachingLimitConflicts(occupied, periods, teachers);
-  health.teacherFivePeriodWarnings = findTeacherFifthPeriodDays([...schedules, ...fixed, ...groupTeacherItems], periods, teachers)
-    .map(x => `ครู ${x.teacherName} วัน${x.day} สอน 5 คาบ (ข้อยกเว้น ควรพิจารณากระจายใหม่)`);
+  health.teacherFivePeriodWarnings = findTeacherFifthPeriodDays(occupied, periods, teachers)
+    .map(x => `ครู ${x.teacherName} วัน${x.day} มีคาบสอนและกิจกรรมรวม 5 คาบ (ข้อยกเว้น ควรพิจารณากระจายใหม่)`);
+  health.teacherActivityConsecutiveWarnings = findTeacherActivityConsecutiveWarnings(occupied, periods, teachers);
   const hasHardConflict = health.teacherConflicts.length > 0 || health.roomConflicts.length > 0 || health.unavailConflicts.length > 0 || health.cUnavailConflicts.length > 0 || health.breakConflicts.length > 0 || health.blockConflicts.length > 0 || health.teacherLimitConflicts.length > 0 || health.customRuleConflicts.length > 0 || health.subjectDailyConflicts.length > 0 || health.orphans.length > 0 || health.plcConflicts.length > 0;
   if (hasHardConflict) health.status = 'error';
   else if (loads.length === 0) health.status = 'empty';
-  else if (health.missing > 0 || health.overScheduled > 0 || health.teacherFivePeriodWarnings.length) health.status = 'warning';
+  else if (health.missing > 0 || health.overScheduled > 0 || health.teacherFivePeriodWarnings.length || health.teacherActivityConsecutiveWarnings.length) health.status = 'warning';
   else health.status = 'ready';
 
   return health;
@@ -804,14 +894,19 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
 
 // ข้อบังคับครู: นับคาบที่ครูมีสอน/กิจกรรมล็อกจริงรวมกัน และไม่นับคาบพักเป็นคาบติดกัน
 const teacherDayKey = (teacherId, day) => JSON.stringify([teacherId, day]);
-const registerTeacherPeriod = (maps, item) => {
+const registerTeacherPeriod = (maps, item, isActivity = isTeacherActivityDuty(item)) => {
   if (!item.teacherId) return;
   const key = teacherDayKey(item.teacherId, item.day);
   if (!maps.teacherDayPeriods.has(key)) maps.teacherDayPeriods.set(key, new Set());
   maps.teacherDayPeriods.get(key).add(item.periodId);
+  // เฉพาะคาบสอนรายวิชาที่ใช้ตรวจข้อห้ามสอนติดกัน / รูปแบบคาบสอน
+  if (!isActivity) {
+    if (!maps.teacherInstructionDayPeriods.has(key)) maps.teacherInstructionDayPeriods.set(key, new Set());
+    maps.teacherInstructionDayPeriods.get(key).add(item.periodId);
+  }
 };
 
-const canPlaceTeacherEntries = (teacherId, entries, maps) => {
+const canPlaceTeacherEntries = (teacherId, entries, maps, isActivityPlacement = false) => {
   if (!teacherId) return { ok: true, reason: '' };
   const byDay = new Map();
   entries.forEach(item => {
@@ -824,11 +919,14 @@ const canPlaceTeacherEntries = (teacherId, entries, maps) => {
     if (result.size > (maps.maxTeacherPeriodsPerDay ?? SCHEDULER_CONFIG.maxTeacherPeriodsPerDay)) {
       return { ok: false, reason: 'TEACHER_DAILY_LIMIT' };
     }
-    if (calculateDayTeachingShape([...result], maps.periodContext).maxConsec > SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) {
+    // กิจกรรมอาจอยู่ติดกับวิชาสอน เช่น สอนคาบ 5–6 แล้วทำลูกเสือคาบ 7
+    // ไม่ห้ามเพียงเพราะเป็นหน้าที่ต่อเนื่อง 3 คาบ แต่เตือนใน Health Check แทน
+    const instruction = new Set([...(maps.teacherInstructionDayPeriods.get(teacherDayKey(teacherId, day)) || []), ...(isActivityPlacement ? [] : additions)]);
+    if (calculateDayTeachingShape([...instruction], maps.periodContext).maxConsec > SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) {
       return { ok: false, reason: 'TEACHER_CONSECUTIVE_LIMIT' };
     }
-    if (getFourPeriodTeachingPattern([...result], maps.periodContext)?.level === 'blocked' ||
-        hasSchoolPeriodSequence([...result], maps.periodContext, [3,4,5,6])) {
+    if (getFourPeriodTeachingPattern([...instruction], maps.periodContext)?.level === 'blocked' ||
+        hasSchoolPeriodSequence([...instruction], maps.periodContext, [3,4,5,6])) {
       return { ok: false, reason: 'TEACHER_FOUR_PERIOD_PATTERN' };
     }
   }
@@ -836,7 +934,7 @@ const canPlaceTeacherEntries = (teacherId, entries, maps) => {
 };
 
 const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = DEFAULT_PERIODS, customRules = [], activityGroups = [], classrooms = [], plcSessions = [], teachers = []) => {
-  const maps = { tUnavailMap: new Set(), cUnavailMap: new Set(), fixedMap: new Set(), teacherPlacements: new Set(), roomPlacements: new Set(), teacherDayPeriods: new Map(), subjectDayCounts: new Map(), periodContext: buildPeriodContext(periods), customRules, fixedItems: fixedSch || [], maxTeacherPeriodsPerDay: SCHEDULER_CONFIG.maxTeacherPeriodsPerDay };
+  const maps = { tUnavailMap: new Set(), cUnavailMap: new Set(), fixedMap: new Set(), teacherPlacements: new Set(), roomPlacements: new Set(), teacherDayPeriods: new Map(), teacherInstructionDayPeriods: new Map(), subjectDayCounts: new Map(), periodContext: buildPeriodContext(periods), customRules, fixedItems: fixedSch || [], maxTeacherPeriodsPerDay: SCHEDULER_CONFIG.maxTeacherPeriodsPerDay };
   tUnavail.forEach(u => maps.tUnavailMap.add(`${u.teacherId}_${u.day}_${u.periodId}`));
   buildPLCReservations(plcSessions,teachers).forEach(x=>
     maps.tUnavailMap.add(`${x.teacherId}_${x.day}_${x.periodId}`));
@@ -846,7 +944,7 @@ const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = 
     else if (!Array.isArray(f.includedClassroomIds) && !(f.excludedClassroomIds || []).length)
       maps.fixedMap.add(`${f.day}_${f.periodId}_${ALL_CLASSROOMS_ID}`);
     if (f.teacherId) maps.teacherPlacements.add(`${f.teacherId}_${f.day}_${f.periodId}`);
-    registerTeacherPeriod(maps, f);
+    registerTeacherPeriod(maps, f, true);
     if (f.classroomId === ALL_CLASSROOMS_ID &&
         (Array.isArray(f.includedClassroomIds) || (f.excludedClassroomIds || []).length)) {
       fixedTargetRoomIds(f,classrooms).forEach(id => {
@@ -858,7 +956,7 @@ const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = 
   });
   activityTeacherEntries(activityGroups,fixedSch).forEach(item=>{
     maps.teacherPlacements.add(`${item.teacherId}_${item.day}_${item.periodId}`);
-    registerTeacherPeriod(maps,item);
+    registerTeacherPeriod(maps,item,true);
   });
   schedules.forEach(s => {
     if (s.teacherId) maps.teacherPlacements.add(`${s.teacherId}_${s.day}_${s.periodId}`);
@@ -869,7 +967,7 @@ const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = 
   return maps;
 };
 
-const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak, subjectId = '', allowManualClosedRoom = false) => {
+const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak, subjectId = '', allowManualClosedRoom = false, isActivityPlacement = false) => {
   if (isBreak) return { ok: false, reason: "BREAK_PERIOD" };
   if (blocksCustomRule(maps.customRules, { teacherId, classroomId, subjectId, day, periodId }, maps.periodContext)) return { ok: false, reason: 'CUSTOM_RULE_BLOCKED' };
   if (!allowManualClosedRoom && maps.cUnavailMap.has(`${classroomId}_${day}_${periodId}`)) return { ok: false, reason: "ROOM_UNAVAILABLE" };
@@ -881,7 +979,7 @@ const canPlaceSchedule = (teacherId, classroomId, day, periodId, maps, isBreak, 
   if (teacherId && maps.teacherPlacements.has(`${teacherId}_${day}_${periodId}`)) return { ok: false, reason: "TEACHER_CONFLICT" };
   const subjectLimit = canPlaceSubjectDailyEntries({ classroomId, subjectId }, [{ day, periodId }], maps);
   if (!subjectLimit.ok) return subjectLimit;
-  const teachingLimit = canPlaceTeacherEntries(teacherId, [{ day, periodId }], maps);
+  const teachingLimit = canPlaceTeacherEntries(teacherId, [{ day, periodId }], maps, isActivityPlacement);
   if (!teachingLimit.ok) return teachingLimit;
   return { ok: true, reason: "" };
 };
@@ -1026,18 +1124,23 @@ const analyzeScheduleFeasibility = ({ teachingLoads, teachers, subjects, classro
   const seen = new Set();
   const block = message => { if (!seen.has(message)) { seen.add(message); result.blocking.push(message); } };
 
+  const fixedDutyRows = buildTeacherOccupancy([],fixedSchedules,activityGroups);
+  const existingActivityDuty = groupTeacherDuties(fixedDutyRows);
   teacherDemand.forEach((required, teacherId) => {
-    // upper bound ignores room collisions & subject distributions, but includes teacher-wide rules
-    let upper = 0;
-    DAYS.forEach(day => {
+    // 5 คาบรวมกิจกรรมต่อวันเป็นเพดานจริง; คำนวณความจุเหลือโดยหักกิจกรรมไว้ก่อน
+    let upper=0,preferredCapacity=0;
+    DAYS.forEach(day=>{
+      const activities=existingActivityDuty.get(teacherDayKey(teacherId,day))?.all.size || 0;
       const slots = active.filter(p =>
         !unavailabilities.some(u => u.teacherId === teacherId && u.day === day && String(u.periodId) === String(p.id)) &&
+        !fixedDutyRows.some(a => a.teacherId===teacherId && a.day===day && String(a.periodId)===String(p.id)) &&
         !blocksCustomRule(customRules, {teacherId, day, periodId:p.id, classroomId:'', subjectId:''}, periods)
       ).length;
-      upper += Math.min(SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay, slots);
+      upper += Math.min(Math.max(0,SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay-activities),slots);
+      preferredCapacity += Math.min(Math.max(0,SCHEDULER_CONFIG.maxTeacherPeriodsPerDay-activities),slots);
     });
-    if (required > upper) block(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: ภาระสอน ${required} คาบ แต่เพดานข้อยกเว้น 5 คาบ/วันและเวลาว่างรวมได้ไม่เกิน ${upper} คาบ/สัปดาห์`);
-    else if (required > DAYS.length * SCHEDULER_CONFIG.maxTeacherPeriodsPerDay) result.advisories.push(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: มีภาระ ${required} คาบ/สัปดาห์ สูงกว่าเป้าหมาย ${DAYS.length * SCHEDULER_CONFIG.maxTeacherPeriodsPerDay} คาบ จำเป็นต้องพิจารณาวันที่สอน 5 คาบ`);
+    if (required > upper) block(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: ภาระสอน ${required} คาบ แต่เมื่อนับกิจกรรมล็อกแล้ว เหลือความจุสูงสุดประมาณ ${upper} คาบสอน/สัปดาห์`);
+    else if (required > preferredCapacity) result.advisories.push(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: มีภาระสอน ${required} คาบ และมีกิจกรรมล็อก ทำให้เกินเป้าหมายรวม 4 คาบบางวันได้ (ความจุที่เป้าหมายประมาณ ${preferredCapacity} คาบ/สัปดาห์)`);
     else if (upper > 0 && required / upper >= .85) result.advisories.push(`ครู ${teachers.find(t=>t.id===teacherId)?.name || teacherId}: ภาระสอนใช้ ${Math.round(required/upper*100)}% ของเพดานสูงสุดที่คำนวณแบบคร่าว ๆ`);
   });
   roomDemand.forEach((required, roomId) => {
@@ -1103,7 +1206,7 @@ const describeUnassignedReasons = ({ load, schedules, fixedSchedules, periods,
     else counts.set(attempt.reason, (counts.get(attempt.reason)||0)+1);
   }));
   const topReasons = [...counts].sort((a,b)=>b[1]-a[1]).slice(0,3)
-    .map(([code,count])=>({ code, count, label:labels[code] || code }));
+    .map(([code,count])=>({ code, count, label:labels[code] || translateUserMessage(code) }));
   let pairOptions = 0;
   if (load.reason === 'DOUBLE_PERIOD_NOT_AVAILABLE' || load.reason === 'BLOCK_COMPANION_NOT_AVAILABLE') {
     DAYS.forEach(day => context.doublePairs.forEach(([a,b]) => {
@@ -1142,6 +1245,7 @@ const cloneConstraintMaps = (maps) => ({
   teacherPlacements: new Set(maps.teacherPlacements),
   roomPlacements: new Set(maps.roomPlacements),
   teacherDayPeriods: new Map([...maps.teacherDayPeriods].map(([day, values]) => [day, new Set(values)])),
+  teacherInstructionDayPeriods: new Map([...maps.teacherInstructionDayPeriods].map(([day, values]) => [day, new Set(values)])),
   subjectDayCounts: new Map(maps.subjectDayCounts),
   periodContext: maps.periodContext,
   customRules: maps.customRules,
@@ -1208,33 +1312,62 @@ const calculateDayTeachingShape = (dayPeriods, periodsOrContext) => {
   return { gaps, maxConsec };
 };
 
-const findTeacherTeachingLimitConflicts = (items, periods, teachers = []) => {
-  const byTeacherDay = new Map();
-  const names = new Map(teachers.map(t => [t.id, t.name]));
-  items.forEach(item => {
+// Stage 26: เพดาน 4/5 คาบนับกิจกรรม+คาบสอนรวมกัน; ไม่เอากิจกรรมไปนับว่า "สอนวิชา" 3 คาบติด
+const groupTeacherDuties = (items = []) => {
+  const byDay = new Map();
+  (items || []).forEach(item => {
     if (!item.teacherId || !DAYS.includes(item.day)) return;
     const key = teacherDayKey(item.teacherId, item.day);
-    if (!byTeacherDay.has(key)) byTeacherDay.set(key, { teacherId: item.teacherId, day: item.day, periodIds: new Set() });
-    byTeacherDay.get(key).periodIds.add(item.periodId);
+    if (!byDay.has(key)) byDay.set(key,{teacherId:item.teacherId,day:item.day,all:new Set(),lessons:new Set(),activities:new Set()});
+    const row = byDay.get(key);
+    const periodId=String(item.periodId);
+    row.all.add(periodId);
+    if (isTeacherActivityDuty(item)) row.activities.add(periodId);
+    else row.lessons.add(periodId);
   });
+  return byDay;
+};
+const findTeacherTeachingLimitConflicts = (items, periods, teachers = []) => {
+  const names = new Map(teachers.map(t => [t.id, t.name]));
   const violations = [];
-  byTeacherDay.forEach(({ teacherId, day, periodIds }) => {
-    const periodsOnDay = [...periodIds];
+  groupTeacherDuties(items).forEach(({teacherId,day,all,lessons}) => {
     const teacherName = names.get(teacherId) || teacherId;
-    if (periodsOnDay.length > SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay) {
-      violations.push(`ครู ${teacherName} วัน${day} มี ${periodsOnDay.length} คาบ (ห้ามเกิน ${SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay} คาบ/วัน)`);
+    if (all.size > SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay) {
+      violations.push(`ครู ${teacherName} วัน${day} มีคาบสอนและกิจกรรมรวม ${all.size} คาบ (ห้ามเกิน ${SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay} คาบ/วัน)`);
     }
-    const maxConsec = calculateDayTeachingShape(periodsOnDay, periods).maxConsec;
+    const lessonPeriods=[...lessons];
+    const maxConsec = calculateDayTeachingShape(lessonPeriods, periods).maxConsec;
     if (maxConsec > SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) {
-      violations.push(`ครู ${teacherName} วัน${day} สอนติดกัน ${maxConsec} คาบ (สูงสุด ${SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods} คาบติดกัน)`);
+      violations.push(`ครู ${teacherName} วัน${day} สอนรายวิชาติดกัน ${maxConsec} คาบ (สูงสุด ${SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods} คาบติดกัน; กิจกรรมไม่ใช่คาบสอนรายวิชา)`);
     }
-    const pattern = getFourPeriodTeachingPattern(periodsOnDay, periods);
-    if ((pattern?.level === 'blocked' || hasSchoolPeriodSequence(periodsOnDay, periods, [3,4,5,6])) &&
+    const pattern = getFourPeriodTeachingPattern(lessonPeriods, periods);
+    if ((pattern?.level === 'blocked' || hasSchoolPeriodSequence(lessonPeriods, periods, [3,4,5,6])) &&
         maxConsec <= SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) {
-      violations.push(`ครู ${teacherName} วัน${day} มีช่วงสอนหนัก 3–4–5–6 ที่ไม่อนุญาต หรือรูปแบบ 4 คาบผิดเกณฑ์ (${pattern?.key || 'รวมคาบหนัก'})`);
+      violations.push(`ครู ${teacherName} วัน${day} มีรูปแบบคาบสอนรายวิชาผิดเกณฑ์ (${pattern?.key || 'ช่วง 3–4–5–6'})`);
     }
   });
   return violations;
+};
+// เมื่อคาบสอนต่อเนื่องกับกิจกรรมตั้งแต่ 3 ช่วงขึ้นไป เป็นคำเตือน ไม่ใช่ Hard Conflict
+const findTeacherActivityConsecutiveWarnings = (items, periods, teachers = []) => {
+  const names = new Map(teachers.map(t=>[t.id,t.name]));
+  const ctx=getPeriodContext(periods);
+  const messages=[];
+  groupTeacherDuties(items).forEach(({teacherId,day,all,activities})=>{
+    if (!activities.size || all.size<3) return;
+    const ordered=[...all].filter(id=>ctx.realIndex.has(id)).sort((a,b)=>ctx.realIndex.get(a)-ctx.realIndex.get(b));
+    let streak=[];
+    const addWarning=()=>{
+      if(streak.length>=3 && streak.some(id=>activities.has(id)))
+        messages.push(`ครู ${names.get(teacherId)||teacherId} วัน${day} มีสอน/กิจกรรมต่อเนื่อง ${streak.length} คาบ (รวมกิจกรรมล็อก) ควรตรวจความเหมาะสม`);
+    };
+    ordered.forEach(id=>{
+      if(streak.length && ctx.realIndex.get(id)!==ctx.realIndex.get(streak[streak.length-1])+1){addWarning();streak=[];}
+      streak.push(id);
+    });
+    addWarning();
+  });
+  return messages;
 };
 
 const getTeacherDayShapeScore = (dayPeriods, periodsOrContext) => {
@@ -1263,13 +1396,17 @@ const getTeacherDayShapeScore = (dayPeriods, periodsOrContext) => {
 };
 
 const buildPlacementState = (seedSchedules) => {
-  const state = { teacherDayPeriods: new Map(), teacherDayCounts: new Map(), roomSubjectDayCounts: new Map() };
+  const state = { teacherDayPeriods: new Map(), teacherInstructionDayPeriods:new Map(), teacherDayCounts: new Map(), roomSubjectDayCounts: new Map() };
   seedSchedules.forEach(sch => {
     if (sch.teacherId) {
       const tdKey = `${sch.teacherId}_${sch.day}`;
       if (!state.teacherDayPeriods.has(tdKey)) state.teacherDayPeriods.set(tdKey, new Set());
       state.teacherDayPeriods.get(tdKey).add(sch.periodId);
-      state.teacherDayCounts.set(tdKey, (state.teacherDayCounts.get(tdKey) || 0) + 1);
+      if(!isTeacherActivityDuty(sch)){
+        if(!state.teacherInstructionDayPeriods.has(tdKey))state.teacherInstructionDayPeriods.set(tdKey,new Set());
+        state.teacherInstructionDayPeriods.get(tdKey).add(sch.periodId);
+      }
+      state.teacherDayCounts.set(tdKey, state.teacherDayPeriods.get(tdKey).size);
     }
     const rsdKey = `${sch.classroomId}_${sch.subjectId}_${sch.day}`;
     state.roomSubjectDayCounts.set(rsdKey, (state.roomSubjectDayCounts.get(rsdKey) || 0) + 1);
@@ -1282,7 +1419,11 @@ const registerPlacementState = (state, scheduleItem) => {
     const tdKey = `${scheduleItem.teacherId}_${scheduleItem.day}`;
     if (!state.teacherDayPeriods.has(tdKey)) state.teacherDayPeriods.set(tdKey, new Set());
     state.teacherDayPeriods.get(tdKey).add(scheduleItem.periodId);
-    state.teacherDayCounts.set(tdKey, (state.teacherDayCounts.get(tdKey) || 0) + 1);
+    if(!isTeacherActivityDuty(scheduleItem)){
+      if(!state.teacherInstructionDayPeriods.has(tdKey))state.teacherInstructionDayPeriods.set(tdKey,new Set());
+      state.teacherInstructionDayPeriods.get(tdKey).add(scheduleItem.periodId);
+    }
+    state.teacherDayCounts.set(tdKey, state.teacherDayPeriods.get(tdKey).size);
   }
   const rsdKey = `${scheduleItem.classroomId}_${scheduleItem.subjectId}_${scheduleItem.day}`;
   state.roomSubjectDayCounts.set(rsdKey, (state.roomSubjectDayCounts.get(rsdKey) || 0) + 1);
@@ -1305,7 +1446,12 @@ const scorePlacementOption = (entries, load, state, periodsOrContext, getSubject
       const tdKey = `${load.teacherId}_${day}`;
       const oldPeriods = Array.from(state.teacherDayPeriods.get(tdKey) || []);
       const newPeriods = [...oldPeriods, ...periodIds];
-      score += getTeacherDayShapeScore(newPeriods, periodContext) - getTeacherDayShapeScore(oldPeriods, periodContext);
+      const oldInstructions=Array.from(state.teacherInstructionDayPeriods.get(tdKey) || []);
+      score += getTeacherDayShapeScore([...oldInstructions,...periodIds], periodContext) - getTeacherDayShapeScore(oldInstructions, periodContext);
+      // รวมเวลาเว้นว่างระหว่างคาบสอนกับกิจกรรมเพื่อจัดตารางให้ครูเดินคาบสะดวก
+      const oldGaps=calculateDayTeachingShape(oldPeriods,periodContext).gaps;
+      const newGaps=calculateDayTeachingShape(newPeriods,periodContext).gaps;
+      score -= (newGaps-oldGaps)*2;
 
       const oldCount = state.teacherDayCounts.get(tdKey) || 0;
       const newCount = oldCount + periodIds.length;
@@ -1397,9 +1543,11 @@ const calculateScheduleScore = (schedules, teachers, subjects, periodsOrContext,
   schedules.forEach(sch => {
     score += customRulePreferenceScore(customRules, sch, periodContext);
     if (sch.teacherId) {
-      if (!teacherStats[sch.teacherId]) teacherStats[sch.teacherId] = { days: {} };
+      if (!teacherStats[sch.teacherId]) teacherStats[sch.teacherId] = { days: {}, lessonDays: {} };
       if (!teacherStats[sch.teacherId].days[sch.day]) teacherStats[sch.teacherId].days[sch.day] = [];
       teacherStats[sch.teacherId].days[sch.day].push(sch.periodId);
+      if (!teacherStats[sch.teacherId].lessonDays[sch.day]) teacherStats[sch.teacherId].lessonDays[sch.day]=[];
+      teacherStats[sch.teacherId].lessonDays[sch.day].push(sch.periodId);
     }
     const rsKey = `${sch.classroomId}_${sch.subjectId}`;
     if (!roomSubjectStats[rsKey]) roomSubjectStats[rsKey] = { days: {} };
@@ -1417,17 +1565,18 @@ const calculateScheduleScore = (schedules, teachers, subjects, periodsOrContext,
   // Activity group teachers occupy slots and must influence fairness just like lessons.
   activityTeacherItems.forEach(item => {
     if (!item.teacherId) return;
-    if (!teacherStats[item.teacherId]) teacherStats[item.teacherId]={days:{}};
+    if (!teacherStats[item.teacherId]) teacherStats[item.teacherId]={days:{},lessonDays:{}};
     if (!teacherStats[item.teacherId].days[item.day]) teacherStats[item.teacherId].days[item.day]=[];
     teacherStats[item.teacherId].days[item.day].push(item.periodId);
   });
   Object.values(teacherStats).forEach(tStat => {
     let totalPeriods = 0;
-    Object.values(tStat.days).forEach(dayPeriods => {
-      totalPeriods += dayPeriods.length;
-      const overload = Math.max(0, dayPeriods.length - SCHEDULER_CONFIG.maxTeacherPeriodsPerDay);
+    Object.entries(tStat.days).forEach(([day,dayPeriods]) => {
+      totalPeriods += new Set(dayPeriods).size;
+      const overload = Math.max(0, new Set(dayPeriods).size - SCHEDULER_CONFIG.maxTeacherPeriodsPerDay);
       score -= overload * 240;
-      score += getTeacherDayShapeScore(dayPeriods, periodContext);
+      // รูปแบบคาบสอนต่อเนื่องให้นับเฉพาะวิชา ไม่ลงโทษเมื่อกิจกรรมล็อกอยู่ติดกับวิชา
+      score += getTeacherDayShapeScore(tStat.lessonDays[day] || [], periodContext);
     });
     if (totalPeriods > 0) {
       // Repeated 4/5-period days are tiring even if each individual day is valid.
@@ -1701,7 +1850,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
             <h2 className="font-bold text-lg text-[#081a39] flex gap-2 items-center"><AlertTriangle size={20} className={summary.conflictCount ? 'text-rose-500' : 'text-slate-400'}/>รายการที่ต้องตรวจสอบ</h2>
             <div className="grid grid-cols-2 gap-2 mt-4">
               <div className="bg-rose-50 rounded-xl p-3"><p className="text-2xl font-bold text-rose-700">{summary.conflictCount}</p><p className="text-xs text-rose-700">ข้อขัดแย้ง</p></div>
-              <div className="bg-amber-50 rounded-xl p-3"><p className="text-2xl font-bold text-amber-700">{summary.fiveDays.length}</p><p className="text-xs text-amber-700">วันครูสอน 5 คาบ</p></div>
+              <div className="bg-amber-50 rounded-xl p-3"><p className="text-2xl font-bold text-amber-700">{summary.fiveDays.length}</p><p className="text-xs text-amber-700">วันภาระรวม 5 คาบ</p></div>
             </div>
             {!!summary.heavyPatterns.length && <p className="text-sm text-amber-700 mt-3">พบรูปแบบคาบที่ควรกระจายใหม่ {summary.heavyPatterns.length} วัน-ครู</p>}
             {summary.conflictCount === 0 && allAlerts.length === 0 && health.missing === 0 && teachingLoads.length > 0 && <p className="text-sm text-emerald-700 mt-3 flex gap-2 items-center"><CheckCircle2 size={17}/> ไม่พบรายการเตือนจากข้อมูลปัจจุบัน</p>}
@@ -2494,11 +2643,11 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
         if (!valid.ok) return showToast(`${room.name}: ${reasons[valid.reason] || 'ล็อกไม่ได้'}`, 'error');
       }
       for (const id of chosenTeachers) {
-        const valid = canPlaceSchedule(id, targetRooms[0].id, fForm.day, fForm.periodId, maps, false, fForm.subjectId);
+        const valid = canPlaceSchedule(id, targetRooms[0].id, fForm.day, fForm.periodId, maps, false, fForm.subjectId, false, true);
         if (!valid.ok) return showToast(`${teachers.find(t=>t.id===id)?.name}: ${reasons[valid.reason] || 'ครูไม่ว่าง'}`, 'error');
         // Check the same rules applied to all teacher activities before saving.
         if (findTeacherTeachingLimitConflicts([...existingOccupancy,{
-          teacherId:id,day:fForm.day,periodId:fForm.periodId
+          teacherId:id,day:fForm.day,periodId:fForm.periodId,__isFixedActivity:true
         }],periods,teachers).length) return showToast('ครูที่เลือกขัดกับข้อบังคับการกระจายคาบ', 'error');
       }
       const id = `F_${Date.now()}`;
@@ -2529,9 +2678,9 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
       maps.maxTeacherPeriodsPerDay=SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay;
     }
     for (const teacherId of chosen) {
-      const valid = canPlaceSchedule(teacherId,targets[0].id,item.day,item.periodId,maps,false,item.subjectId);
+      const valid = canPlaceSchedule(teacherId,targets[0].id,item.day,item.periodId,maps,false,item.subjectId,false,true);
       if (!valid.ok) return showToast(`${teachers.find(t=>t.id===teacherId)?.name}: มีคาบชนหรือไม่ผ่านข้อบังคับ (${valid.reason})`,'error');
-      const conflicts = findTeacherTeachingLimitConflicts([...existing,{teacherId,day:item.day,periodId:item.periodId}],periods,teachers);
+      const conflicts = findTeacherTeachingLimitConflicts([...existing,{teacherId,day:item.day,periodId:item.periodId,__isFixedActivity:true}],periods,teachers);
       if (conflicts.length) return showToast(conflicts[0],'error');
     }
     const ok = await dbAction('fixedSchedules',item.id,{...item,teacherId:chosen.includes(item.teacherId) ? item.teacherId : '',teacherIds:chosen});
@@ -2714,7 +2863,7 @@ const CustomRulesView = ({ customRules, teachers, activeSubjects, classrooms, pe
       <div className="bg-white rounded-2xl border border-slate-100 p-6 max-w-4xl">
         <h2 className="text-xl font-bold text-[#081a39] mb-2">เงื่อนไขการจัดตารางเพิ่มเติม</h2>
         {!rulesReady && <p role="alert" className="text-rose-700 mb-3">กำลังโหลดเงื่อนไขจาก Firebase หรือไม่มีสิทธิ์อ่านข้อมูล กรุณาตรวจการเชื่อมต่อก่อนแก้ไข</p>}
-        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ครูเป้าหมาย 4 คาบ/วัน (5 คาบเมื่อจำเป็นและมีการยืนยัน) และไม่เกิน 2 คาบติดกันในช่วงเดียวกัน</p>
+        <p className="text-sm text-slate-600 mb-4">กฎบังคับใช้กับการจัดอัตโนมัติและการเพิ่มคาบด้วยมือ ส่วนกฎแนะนำมีผลกับการให้คะแนนตอนจัดอัตโนมัติเท่านั้น ครูเป้าหมายรวมคาบสอน+กิจกรรม 4 คาบ/วัน (5 คาบเมื่อจำเป็นและยืนยัน) และไม่เกิน 2 คาบสอนรายวิชาติดกัน; กิจกรรมจัดติดกับวิชาได้โดยจะแจ้งเตือนเมื่อภาระต่อเนื่องหนัก</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="text-sm font-bold">ประเภทข้อมูล<select className="w-full border rounded-xl p-3 mt-1" value={form.targetType} onChange={e => setForm(prev => ({ ...prev, targetType: e.target.value, targetId: '' }))}><option value="teacher">ครู</option><option value="subject">รายวิชา</option><option value="classroom">ห้องเรียน</option></select></label>
           <label className="text-sm font-bold">เลือกบุคคล/รายการ<select className="w-full border rounded-xl p-3 mt-1" value={form.targetId} onChange={e => setForm(prev => ({ ...prev, targetId: e.target.value }))}><option value="">-- เลือก --</option>{targets.map(x => <option key={x.id} value={x.id}>{x.name} ({x.id})</option>)}</select></label>
@@ -2804,7 +2953,8 @@ const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teacher
         return showToast('ครูไม่สะดวกในช่วงเวลานี้','error');
       if(blocksCustomRule(customRules,{teacherId:form.teacherId,day:root.day,periodId:root.periodId}))
         return showToast('ครูติดเงื่อนไขห้ามจัดในช่วงเวลานี้','error');
-      const extended=[...other,{teacherId:form.teacherId,day:root.day,periodId:root.periodId}];
+      const extended=[...buildTeacherOccupancy(schedules,fixedSchedules,activityGroups).filter(x=>x.teacherId===form.teacherId),
+        {teacherId:form.teacherId,day:root.day,periodId:root.periodId,__activityTeacherOnly:true}];
       if(findTeacherTeachingLimitConflicts(extended,periods,teachers).length)
         return showToast('เกินข้อบังคับสูงสุด 5 คาบต่อวัน หรือมีคาบติดกันที่ไม่อนุญาต','error');
       const newFifth=findTeacherFifthPeriodDays(extended,periods,teachers);
@@ -3046,7 +3196,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
       fixedSchedules.filter(x=>x.teacherId===load.teacherId&&x.subjectId===load.subjectId&&x.classroomId===load.classroomId).length);
     if(remaining<block) return [];
     const maps=buildConstraintMaps(schedules,unavailabilities,classroomUnavailabilities,fixedSchedules,periods,customRules,activityGroups,classrooms,plcSessions,teachers);
-    const state=buildPlacementState([...fixedSchedules,...activityTeacherEntries(activityGroups,fixedSchedules),...schedules]);
+    const state=buildPlacementState([...markFixedTeacherActivities(fixedSchedules),...activityTeacherEntries(activityGroups,fixedSchedules),...schedules]);
     const slots=[];
     DAYS.forEach(day=>periods.forEach((p,index)=>{
       if(p.isBreak||!canPlaceSchedule(load.teacherId,load.classroomId,day,p.id,maps,false,load.subjectId).ok) return;
@@ -3104,8 +3254,8 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     // ผู้จัดตารางอนุมัติข้อยกเว้น 5 คาบด้วยตนเองเท่านั้น
     if (bookedToday + blockSize > SCHEDULER_CONFIG.maxTeacherPeriodsPerDay) {
       if (bookedToday + blockSize > SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay)
-        return showToast('ครูสอนเกิน 5 คาบต่อวันไม่ได้', 'error');
-      if (!window.confirm(`ครูคนนี้มีสอน ${bookedToday} คาบในวัน${addForm.day} แล้ว\nเพิ่มอีก ${blockSize} คาบจะเป็น ${bookedToday + blockSize} คาบ ซึ่งเกินเป้าหมาย 4 คาบ\nยืนยันกรณีจำเป็นจริง ๆ หรือไม่?`)) return;
+        return showToast('ครูมีคาบสอนและกิจกรรมรวมเกิน 5 คาบต่อวันไม่ได้', 'error');
+      if (!window.confirm(`ครูคนนี้มีคาบสอนและกิจกรรมรวม ${bookedToday} คาบในวัน${addForm.day} แล้ว\nเพิ่มอีก ${blockSize} คาบจะเป็น ${bookedToday + blockSize} คาบ ซึ่งเกินเป้าหมาย 4 คาบ\nยืนยันกรณีจำเป็นจริง ๆ หรือไม่?`)) return;
       maps.maxTeacherPeriodsPerDay = SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay;
     }
     const selectedValid = canPlaceSchedule(addForm.teacherId, addForm.classroomId, addForm.day, addForm.periodId, maps, false, addForm.subjectId, true);
@@ -3142,7 +3292,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
 
           if (candidatePairs.length === 0) return showToast("วิชานี้กำหนดเป็น Block 2 แต่ไม่มีคาบข้างเคียงที่ว่างสำหรับจัดติดกัน", "error");
 
-          const placementState = buildPlacementState([...fixedSchedules, ...schedules]);
+          const placementState = buildPlacementState([...markFixedTeacherActivities(fixedSchedules), ...schedules]);
           candidatePairs.sort((a, b) => scorePlacementOption(b, matchingLoad, placementState, periods, getSubject, customRules) - scorePlacementOption(a, matchingLoad, placementState, periods, getSubject, customRules));
           plannedEntries = candidatePairs[0];
         }
@@ -3231,11 +3381,11 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     }
     if(!canPlaceTeacherEntries(source.teacherId,entries,maps).ok || !canPlaceSubjectDailyEntries(source,entries,maps).ok)
       return showToast('ย้ายไม่ได้ เพราะเกินข้อบังคับครูหรือวิชาในวันเดียวกัน','error');
-    const outcome=findTeacherTeachingLimitConflicts([...remaining,...planned,...fixedSchedules,...activityTeacherEntries(activityGroups,fixedSchedules)],periods,teachers);
+    const outcome=findTeacherTeachingLimitConflicts(buildTeacherOccupancy([...remaining,...planned],fixedSchedules,activityGroups),periods,teachers);
     if(outcome.length) return showToast('ย้ายไม่ได้: '+outcome[0],'error');
     const subjectIssues=findSubjectDailyLimitConflicts([...remaining,...planned,...fixedSchedules],classrooms,customRules);
     if(subjectIssues.length) return showToast('ย้ายไม่ได้: '+subjectIssues[0],'error');
-    if(!window.confirm(`ย้าย ${moved.length} คาบ ไปวัน${targetDay} คาบ ${targetPeriodId} และตำแหน่งติดกัน (ถ้ามี) ใช่หรือไม่?${newFifth.length ? `\n\nคำเตือน: ${newFifth.map(x=>`ครู ${x.teacherName} วัน${x.day} จะสอน 5 คาบ`).join(' / ')}\nยืนยันข้อยกเว้นเมื่อจำเป็นจริง ๆ` : ''}`)) return;
+    if(!window.confirm(`ย้าย ${moved.length} คาบ ไปวัน${targetDay} คาบ ${targetPeriodId} และตำแหน่งติดกัน (ถ้ามี) ใช่หรือไม่?${newFifth.length ? `\n\nคำเตือน: ${newFifth.map(x=>`ครู ${x.teacherName} วัน${x.day} จะมีภาระรวม 5 คาบ`).join(' / ')}\nยืนยันข้อยกเว้นเมื่อจำเป็นจริง ๆ` : ''}`)) return;
     setEditingRows(true);
     try {
       const termPath=`school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
@@ -3555,7 +3705,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
       classrooms.forEach(c=>append('ห้อง-'+c.name,build(c,'room')));
       teachers.forEach(t=>append('ครู-'+t.name,build(t,'teacher')));
       XLSX.writeFile(wb,`BHS-Timetable-${showingPublished?'Published':'Draft'}-${schoolSettings.academicYear}-T${schoolSettings.semester}.xlsx`);
-    }catch(error){console.error(error);window.alert('สร้าง Excel ไม่สำเร็จ: '+error.message);}
+    }catch(error){console.error(error);window.alert(translateUserMessage('สร้าง Excel ไม่สำเร็จ: '+error.message));}
   };
 
   const handleExportCSV = (type) => {
@@ -3638,8 +3788,9 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
             <ul className="space-y-2 text-sm text-slate-700">
               {health.overloads.map((c,i) => <li key={`ov-${i}`} className="p-2 bg-amber-50 rounded border border-amber-100">{c}</li>)}
               {(health.teacherFivePeriodWarnings || []).map((c,i) => <li key={`five-${i}`} className="p-2 bg-amber-50 rounded border border-amber-100">{c}</li>)}
+              {(health.teacherActivityConsecutiveWarnings || []).map((c,i) => <li key={`activity-cont-${i}`} className="p-2 bg-amber-50 rounded border border-amber-100">{c}</li>)}
               {health.missing > 0 && <li className="p-2 bg-amber-50 rounded border border-amber-100">มีภาระสอนที่ยังจัดตารางไม่ครบรวม {health.missing} คาบ</li>}
-              {(!health.overloads.length && health.missing === 0) && <li className="text-emerald-600 font-bold p-2 bg-emerald-50 rounded border border-emerald-100">ตรวจสอบผ่าน: จัดคาบครบและไม่มีสอนเกิน</li>}
+              {(!health.overloads.length && health.missing === 0 && !(health.teacherFivePeriodWarnings||[]).length && !(health.teacherActivityConsecutiveWarnings||[]).length) && <li className="text-emerald-600 font-bold p-2 bg-emerald-50 rounded border border-emerald-100">ตรวจสอบผ่าน: จัดคาบครบและไม่พบคำเตือนเรื่องภาระครู</li>}
             </ul>
           </div>
         </div>
@@ -3667,7 +3818,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
       {activeSubTab === 'workload' && (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
           <table className="w-full text-left text-sm">
-            <thead className="bg-[#081a39] text-white"><tr><th className="p-3">ชื่อครู</th><th className="p-3 text-center">ภาระสอน</th><th className="p-3 text-center">จัดสอน</th><th className="p-3 text-center">กิจกรรม/คาบล็อก</th><th className="p-3 text-center">PLC</th><th className="p-3 text-center">รวมภาระจริง</th><th className="p-3 text-center">วันที่สอน 4–5 คาบ</th><th className="p-3 text-center">สถานะ</th><th className="p-3 text-center">Gap</th><th className="p-3 text-center">ติดกันสูงสุด</th><th className="p-3 text-center">การกระจาย จ–ศ</th></tr></thead>
+            <thead className="bg-[#081a39] text-white"><tr><th className="p-3">ชื่อครู</th><th className="p-3 text-center">ภาระสอน</th><th className="p-3 text-center">จัดสอน</th><th className="p-3 text-center">กิจกรรม/คาบล็อก</th><th className="p-3 text-center">PLC</th><th className="p-3 text-center">รวมภาระจริง</th><th className="p-3 text-center">วันที่ภาระรวม 4–5 คาบ</th><th className="p-3 text-center">สถานะ</th><th className="p-3 text-center">Gap</th><th className="p-3 text-center">ติดกันสูงสุด</th><th className="p-3 text-center">การกระจาย จ–ศ</th></tr></thead>
             <tbody>
               {teachers.map((t, i) => {
                 const st = health.teacherStats[t.id] || { req: 0, sch: 0, gaps: 0, maxConsec: 0 };
@@ -3871,7 +4022,7 @@ export default function App() {
   const rulesReady = !!user && rulesLoadedTerm === getTermKey(schoolSettings) && groupsLoadedTerm === getTermKey(schoolSettings) && plcLoadedTerm === getTermKey(schoolSettings);
 
   const health = useMemo(() => {
-    if (!periods || periods.length === 0) return { status: teachingLoads.length === 0 ? 'empty' : 'warning', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherLimitConflicts: [], teacherFivePeriodWarnings: [], customRuleConflicts: [], subjectDailyConflicts: [], teacherStats: {} };
+    if (!periods || periods.length === 0) return { status: teachingLoads.length === 0 ? 'empty' : 'warning', missing: 0, scheduledForLoads: 0, totalRequired: 0, completionPercent: 0, teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], orphans: [], missingLoads: [], overloads: [], blockConflicts: [], teacherLimitConflicts: [], teacherFivePeriodWarnings: [], teacherActivityConsecutiveWarnings: [], customRuleConflicts: [], subjectDailyConflicts: [], teacherStats: {} };
     return calculateScheduleHealth(schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods, customRules, activityGroups, plcSessions);
   }, [schedules, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, teachers, subjects, classrooms, periods, customRules, activityGroups, plcSessions]);
 
@@ -3930,7 +4081,7 @@ export default function App() {
     return () => unsubscribers.forEach(unsub => unsub && unsub());
   }, [user, schoolSettings.academicYear, schoolSettings.semester]);
 
-  const showToast = (msg, type = 'success') => { setToast({ msg: String(msg), type }); setTimeout(() => setToast(null), 3000); };
+  const showToast = (msg, type = 'success') => { setToast({ msg: type === 'error' ? translateUserMessage(msg) : String(msg), type }); setTimeout(() => setToast(null), type === 'error' ? 7000 : 3500); };
 
   const dbAction = async (collectionName, id, data, action = 'set') => {
     if (!user) return false;
@@ -4930,7 +5081,7 @@ export default function App() {
           const currentMaps = cloneConstraintMaps(baseMaps);
           currentMaps.maxTeacherPeriodsPerDay = dayLimit;
           const placementState = buildPlacementState([
-            ...fixedSchedules, ...activityTeacherEntries(activityGroups,fixedSchedules), ...preservedSchedules]);
+            ...markFixedTeacherActivities(fixedSchedules), ...activityTeacherEntries(activityGroups,fixedSchedules), ...preservedSchedules]);
           let idSequence = 0;
 
           const addEntries = (load, entries) => {
@@ -5015,8 +5166,8 @@ export default function App() {
           }
 
           const fullSchedule = [...preservedSchedules, ...generatedSchedule];
-          const score = calculateScheduleScore([...fixedSchedules, ...fullSchedule], teachers, subjects, periodContext,
-            getSubject, customRules, activityTeacherEntries(activityGroups,fixedSchedules));
+          const score = calculateScheduleScore(fullSchedule, teachers, subjects, periodContext,
+            getSubject, customRules, [...markFixedTeacherActivities(fixedSchedules),...activityTeacherEntries(activityGroups,fixedSchedules)]);
           const missingCount = currentUnassigned.reduce((acc, curr) => acc + (Number(curr.missing) || 0), 0);
           const fivePeriodCount = findTeacherFifthPeriodDays([
             ...fixedSchedules, ...activityTeacherEntries(activityGroups, fixedSchedules), ...fullSchedule], periods).length;
@@ -5456,14 +5607,14 @@ export default function App() {
               <p className="text-sm text-slate-700">{scheduleResult.candidateIndex===0
                 ? 'กำลังแสดงแบบที่ระบบแนะนำ (แบบที่ 1) ตรวจผลด้านล่างแล้วกด “ใช้งานตารางนี้” ได้เลย'
                 : `คุณเลือกแบบที่ ${scheduleResult.candidateIndex+1} แทนแบบที่ระบบแนะนำ`}</p>
-              <p className="text-xs text-slate-500">ระบบจัดอันดับจากความครบของคาบ จำนวนวันที่สอน 5 คาบ และความสมดุลของภาระครู โดยยังให้ตรวจสอบก่อนบันทึกจริง</p>
+              <p className="text-xs text-slate-500">ระบบจัดอันดับจากความครบของคาบ จำนวนวันที่มีคาบสอนรวมกิจกรรม 5 คาบ และความสมดุลของภาระครู โดยยังให้ตรวจสอบก่อนบันทึกจริง</p>
               {(scheduleResult.candidates||[]).length>1&&<details className="border border-indigo-100 rounded-lg p-3 bg-white">
                 <summary className="cursor-pointer font-bold text-sm text-indigo-800">ไม่พอใจแบบที่เลือก? ดูและเปลี่ยนตัวเลือกอื่น ({scheduleResult.candidates.length} แบบ)</summary>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3">
                   {(scheduleResult.candidates||[]).map((option,index)=><button key={index} type="button"
                     onClick={()=>chooseScheduleCandidate(index)} className={`rounded-xl border p-3 text-left text-sm ${scheduleResult.candidateIndex===index?'border-indigo-600 bg-indigo-50':'border-slate-200 hover:bg-slate-50'}`}>
                     <strong>แบบ {index+1}{index===0?' (ระบบแนะนำ)':''}</strong><br/>ขาด {option.missingCount} คาบ<br/>
-                    วันสอน 5 คาบ {option.fivePeriodCount} วัน<br/>
+                    วันภาระรวม 5 คาบ {option.fivePeriodCount} วัน<br/>
                     วันหนัก 4–5 คาบ {option.weeklyBalance?.heavyDays??'-'} วัน<br/>
                     คาบว่างคั่น {option.weeklyBalance?.gaps??'-'} ช่อง
                   </button>)}
@@ -5476,7 +5627,7 @@ export default function App() {
             </div>
             {!!scheduleResult.fivePeriodDays?.length && (
               <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 space-y-2 text-amber-900">
-                <div className="font-bold flex items-center gap-2"><AlertTriangle size={18}/> ต้องยืนยันข้อยกเว้น: มีครูสอน 5 คาบต่อวัน</div>
+                <div className="font-bold flex items-center gap-2"><AlertTriangle size={18}/> ต้องยืนยันข้อยกเว้น: มีครูสอนรวมกิจกรรม 5 คาบต่อวัน</div>
                 <p className="text-xs">ระบบให้ความสำคัญกับ 4 คาบก่อนเสมอ คาบที่ 5 อาจเป็นคาบล็อกเดิมหรือมาจากรอบสำรองเมื่อรอบ 4 คาบยังจัดไม่ครบ กรุณาตรวจสอบและอนุมัติก่อนบันทึก (การค้นหาไม่รับประกันว่ารูปแบบ 4 คาบไม่มีทางทำได้)</p>
                 <p className="text-xs mb-2">รอบทดลองจำกัด 4 คาบยังขาดอย่างน้อย {scheduleResult.bestFourPeriodMissing ?? '-'} คาบจากตัวเลือกที่ค้นพบ (ไม่ใช่หลักฐานว่าไม่มีวิธีจัดครบโดยใช้ 4 คาบ)</p>
                 <ul className="list-disc pl-5 text-sm">{scheduleResult.fivePeriodDays.map(x=><li key={`${x.teacherId}_${x.day}`}>{x.teacherName} — วัน{x.day} ({x.count} คาบ) · ต้องตรวจและยืนยันก่อนบันทึก</li>)}</ul>
@@ -5524,7 +5675,7 @@ export default function App() {
       </Modal>
 
       {toast && (
-        <div className={`fixed bottom-6 right-6 px-6 py-4 rounded-xl shadow-xl border flex items-center gap-3 animate-in slide-in-from-bottom-5 z-[70] font-medium ${toast.type === 'error' ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-[#081a39] text-[#d4af37] border-[#122b5e]'}`}>
+        <div role={toast.type === 'error' ? 'alert' : 'status'} className={`fixed bottom-6 right-6 max-w-[min(92vw,620px)] whitespace-pre-line break-words px-6 py-4 rounded-xl shadow-xl border flex items-start gap-3 animate-in slide-in-from-bottom-5 z-[70] font-medium ${toast.type === 'error' ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-[#081a39] text-[#d4af37] border-[#122b5e]'}`}>
           {toast.type === 'error' ? <AlertCircle size={22} /> : <CheckCircle2 size={22} />} {String(toast.msg)}
         </div>
       )}
