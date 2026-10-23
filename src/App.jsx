@@ -3789,6 +3789,9 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     const key=JSON.stringify([scheduleId,entityId,day,String(periodId)]);
     if(dropKeyRef.current===key) return dropOutcomeRef.current?.status || 'blocked';
     dropKeyRef.current=key;
+    // Browser has begun a native drag by the time the destination receives dragover.
+    // Updating visual state here is safer than during onDragStart.
+    if (draggedScheduleId !== scheduleId) setDraggedScheduleId(scheduleId);
     const outcome=previewDrop(scheduleId,entityId,day,periodId);
     dropOutcomeRef.current=outcome;
     setDropFeedback({key,entityId,day,periodId,...outcome});
@@ -3819,10 +3822,13 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
          {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{g.name}</div>)}
          {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1">{plcDisplayName(item.subjectArea)}</div>)}
          {cellSch.map((sch, idx) => (
-           <div key={sch.id} draggable={!isScheduling&&!editingRows} onDragStart={e=>{
+           <div key={sch.id} draggable={!isScheduling&&!editingRows&&rulesReady} onDragStart={e=>{
+               // IMPORTANT: do not trigger React re-render on dragstart; a synchronous
+               // grid/layout update may cancel the browser's native drag operation.
+               if (isScheduling || editingRows || !rulesReady) { e.preventDefault(); return; }
                dragSourceIdRef.current=sch.id; dropKeyRef.current=''; dropOutcomeRef.current=null;
-               setDraggedScheduleId(sch.id); setDropFeedback(null); setHoveredSlot(null);
-               e.dataTransfer.setData('text/plain',sch.id); e.dataTransfer.effectAllowed='move';
+               e.dataTransfer.setData('text/plain', String(sch.id));
+               e.dataTransfer.effectAllowed='move';
              }} onDragEnd={clearDragVisuals}
              title="ลากเพื่อย้ายคาบ หรือกดไอคอนเพื่อเก็บคาบนี้เมื่อจัดใหม่"
              className={`${idx > 0 || cellFix.length > 0 ? 'mt-2 pt-2 border-t w-full relative' : 'w-full relative'} cursor-grab active:cursor-grabbing rounded-md ${draggedScheduleId === sch.id ? 'bg-blue-100 ring-2 ring-blue-500 opacity-65' : 'hover:bg-blue-50'}`}>
@@ -3858,11 +3864,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
         publishedSnapshot ? `มีฉบับประกาศใช้แล้ว (${new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH')})` : 'ยังไม่เคยประกาศใช้')}
         {publishedSnapshot&&<span className="ml-2 text-amber-700">การแก้ร่างไม่เปลี่ยนฉบับประกาศ</span>}</div>
       {!selectedId && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-12 text-slate-600">เลือกห้องเรียน ครู หรือเลือกทั้งหมดเพื่อดูตารางและจัดคาบด้วยมือ</div>}
-      {displayedEntities.length > 0 && <div className="flex flex-wrap gap-3 text-sm text-slate-700 bg-blue-50 border border-blue-200 p-3 rounded-xl">
-        <span className="font-bold">กำลังแสดง {selectedId === ALL_TIMETABLE_VIEW_ID ? `ทั้งหมด ${displayedEntities.length} ${viewMode === 'room' ? 'ห้องเรียน' : 'คน'}` : displayedEntities[0].name}</span>
-        <span>• ชี้เมาส์: <strong>สีฟ้า</strong> • ลากวางได้: <strong className="text-emerald-700">สีเขียว</strong> • ต้องยืนยัน: <strong className="text-amber-700">สีเหลือง</strong> • วางไม่ได้: <strong className="text-rose-700">สีแดง</strong></span>
-      </div>}
-      {draggedScheduleId && <div role="status" aria-live="polite" className={`sticky top-2 z-30 rounded-xl border-2 px-4 py-3 shadow-lg text-sm font-semibold ${
+      {draggedScheduleId && <div role="status" aria-live="polite" className={`fixed bottom-4 right-4 z-50 max-w-[min(92vw,520px)] pointer-events-none rounded-xl border-2 px-4 py-3 shadow-lg text-sm font-semibold ${
         dropFeedback?.status==='blocked' ? 'bg-rose-50 text-rose-900 border-rose-500' :
         dropFeedback?.status==='confirm' ? 'bg-amber-50 text-amber-900 border-amber-500' :
         dropFeedback?.status==='allowed' ? 'bg-emerald-50 text-emerald-900 border-emerald-500' :
@@ -3882,19 +3884,13 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
               <table className="w-full text-left border-collapse min-w-[900px] table-fixed">
                 <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr>
                   <th className="p-4 w-28 text-center font-bold">วัน/เวลา</th>
-                  {periods.map(p => {
-                    const active = hoveredSlot?.entityId===entity.id && String(hoveredSlot.periodId)===String(p.id);
-                    const dropActive = dropFeedback?.entityId===entity.id && String(dropFeedback.periodId)===String(p.id);
-                    return <th key={p.id} className={`p-2 border-l border-[#122b5e] text-center text-sm transition-colors ${active||dropActive?'bg-blue-700':''}`}>
-                      <div className="font-bold">{p.name}</div><div className="text-[#d4af37] text-xs font-normal opacity-90">{p.start}-{p.end}</div>
-                    </th>;
-                  })}
+                  {periods.map(p => <th key={p.id} className="p-2 border-l border-[#122b5e] text-center text-sm">
+                    <div className="font-bold">{p.name}</div><div className="text-[#d4af37] text-xs font-normal opacity-90">{p.start}-{p.end}</div>
+                  </th>)}
                 </tr></thead>
                 <tbody>
                   {DAYS.map(day => <tr key={day} className="border-b border-slate-200 group">
-                    <td className={`p-4 font-bold text-center border-r border-slate-200 text-[#081a39] transition-colors ${
-                      ((hoveredSlot?.entityId===entity.id && hoveredSlot.day===day) || (dropFeedback?.entityId===entity.id && dropFeedback.day===day)) ? 'bg-blue-200 ring-1 ring-inset ring-blue-400' : 'bg-slate-50'
-                    }`}>{day}</td>
+                    <td className="p-4 font-bold text-center border-r border-slate-200 text-[#081a39] bg-slate-50">{day}</td>
                     {periods.map(p => {
                       const content=getCellContent(day,p.id,entity.id);
                       const isHovered=hoveredSlot?.entityId===entity.id && hoveredSlot.day===day && String(hoveredSlot.periodId)===String(p.id);
@@ -3910,7 +3906,9 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
                         onDragOver={e=>{
                           const sourceId=dragSourceIdRef.current;
                           if(!sourceId) return;
+                          // Native dragover must be cancelled for the table cell to receive onDrop.
                           e.preventDefault();
+                          e.stopPropagation();
                           const status=updateDropFeedback(sourceId,entity.id,day,p.id);
                           e.dataTransfer.dropEffect=status==='blocked'?'none':'move';
                         }}
