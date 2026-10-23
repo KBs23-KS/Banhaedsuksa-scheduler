@@ -3390,6 +3390,31 @@ const ConstraintsHub = ({ commonProps, initialSection = 'time' }) => {
   </div>;
 };
 
+// ใช้ข้อมูลภาระสอนจริงเพื่อกำหนดห้องที่เลือกได้เมื่อเพิ่มคาบด้วยมือ
+// หากยังไม่เลือกรายวิชาให้คงการเลือกห้องแบบเดิม เพื่อให้เลือกห้องก่อนรายวิชาได้
+const buildManualRoomOptions = (classrooms, teachingLoads, schedules, fixedSchedules, teacherId, subjectId) => {
+  if (!teacherId || !subjectId) return classrooms.map(room => ({ ...room, optionLabel: room.name }));
+  const loadsByRoom = new Map(teachingLoads.filter(load =>
+    load.teacherId === teacherId && load.subjectId === subjectId
+  ).map(load => [load.classroomId, load]));
+  return classrooms.filter(room => loadsByRoom.has(room.id)).map(room => {
+    const load = loadsByRoom.get(room.id);
+    const required = Math.max(0, Number(load.periods) || 0);
+    const belongsToLoad = row => row.teacherId === teacherId &&
+      row.subjectId === subjectId && row.classroomId === room.id;
+    const assigned = schedules.filter(belongsToLoad).length + fixedSchedules.filter(belongsToLoad).length;
+    const remaining = Math.max(0, required - assigned);
+    return {
+      ...room,
+      remaining,
+      isComplete: remaining === 0,
+      optionLabel: remaining === 0
+        ? `${room.name} — จัดครบแล้ว (${required}/${required} คาบ)`
+        : `${room.name} — เหลือ ${remaining}/${required} คาบ`
+    };
+  });
+};
+
 const ALL_TIMETABLE_VIEW_ID = '__BHS_ALL_TIMETABLES__';
 
 const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, customRules, rulesReady, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, clearUnlockedSchedules, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, plcSessions = [], initialRoomId = '' }) => {
@@ -3450,6 +3475,19 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     });
   }, [addForm.teacherId, addForm.classroomId, teachingLoads, activeSubjects, schedules, fixedSchedules]);
   const selectableManualSubjects = availableManualSubjects.filter(subject => !subject.isComplete);
+  const manualRoomOptions = useMemo(() => buildManualRoomOptions(
+    classrooms, teachingLoads, schedules, fixedSchedules, addForm.teacherId, addForm.subjectId
+  ), [classrooms, teachingLoads, schedules, fixedSchedules, addForm.teacherId, addForm.subjectId]);
+  const selectedManualRoom = manualRoomOptions.find(room => room.id === addForm.classroomId);
+  const handleManualRoomChange = classroomId => {
+    // เปลี่ยนห้องแล้วคงรายวิชาเดิมถ้าครูมีภาระสอนวิชานี้ในห้องใหม่
+    const currentSubjectId = addForm.subjectId;
+    const subjectStillValid = !classroomId || !currentSubjectId || teachingLoads.some(load =>
+      load.teacherId === addForm.teacherId && load.subjectId === currentSubjectId && load.classroomId === classroomId
+    );
+    setAddForm(prev => ({ ...prev, classroomId, subjectId: subjectStillValid ? prev.subjectId : '' }));
+    if (!subjectStillValid) showToast('ห้องนี้ไม่มีภาระสอนในรายวิชาเดิม กรุณาเลือกรายวิชาใหม่', 'error');
+  };
   // Only suggest HARD-VALID slots under the normal four-period/day target.
   const manualSlotSuggestions = useMemo(()=>{
     if(!isAddModalOpen || !rulesReady || !addForm.teacherId || !addForm.subjectId || !addForm.classroomId) return [];
@@ -3943,7 +3981,16 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
           <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">วัน</label><input value={addForm.day} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div><div><label className="block text-sm font-bold mb-1">คาบที่</label><input value={periods.find(p=>p.id===addForm.periodId)?.name} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div></div>
           <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm(prev => ({ ...prev, teacherId: e.target.value, subjectId: '' }))} disabled={viewMode === 'teacher'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
           <div><label className="block text-sm font-bold mb-1">รายวิชา</label><select value={addForm.subjectId} onChange={e => setAddForm({...addForm, subjectId: e.target.value})} disabled={!addForm.teacherId || selectableManualSubjects.length === 0} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">{!addForm.teacherId ? '-- กรุณาเลือกครูผู้สอนก่อน --' : availableManualSubjects.length === 0 ? '-- ไม่พบรายวิชาในภาระสอน --' : selectableManualSubjects.length === 0 ? '-- รายวิชาของครู/ห้องนี้จัดครบแล้ว --' : '-- เลือกรายวิชา --'}</option>{availableManualSubjects.map(s => <option key={s.id} value={s.id} disabled={!!s.isComplete}>{s.optionLabel}</option>)}</select>{addForm.teacherId && availableManualSubjects.length === 0 && <p role="status" className="text-sm text-amber-700 mt-2">{addForm.classroomId ? 'ไม่พบภาระสอนสำหรับครูและห้องเรียนนี้' : 'ไม่พบภาระสอนสำหรับครูคนนี้'} กรุณาตรวจสอบเมนูภาระสอน</p>}{addForm.teacherId && addForm.classroomId && availableManualSubjects.length > 0 && selectableManualSubjects.length === 0 && <p role="status" className="text-sm text-emerald-700 mt-2">รายวิชาในภาระสอนของครูและห้องนี้จัดครบทุกคาบแล้ว</p>}</div>
-          <div><label className="block text-sm font-bold mb-1">ห้องเรียน</label><select value={addForm.classroomId} onChange={e => setAddForm(prev => ({ ...prev, classroomId: e.target.value, subjectId: '' }))} disabled={viewMode === 'room'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
+          <div><label className="block text-sm font-bold mb-1">ห้องเรียน</label>
+            <select value={addForm.classroomId} onChange={e => handleManualRoomChange(e.target.value)} disabled={viewMode === 'room'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100">
+              <option value="">{addForm.teacherId && addForm.subjectId && manualRoomOptions.length === 0 ? '-- ไม่พบห้องที่มีภาระสอนรายวิชานี้ --' : '-- เลือกห้องเรียน --'}</option>
+              {manualRoomOptions.map(room => <option key={room.id} value={room.id}>{room.optionLabel}</option>)}
+            </select>
+            {viewMode === 'teacher' && addForm.teacherId && addForm.subjectId && <p role="status" className="text-xs text-slate-600 mt-2">แสดงเฉพาะ {manualRoomOptions.length} ห้องที่มีภาระสอนของครูในรายวิชานี้ โดยคงรายวิชาเดิมเมื่อเปลี่ยนห้องที่สอนได้</p>}
+            {addForm.teacherId && addForm.subjectId && manualRoomOptions.length === 0 && <p role="status" className="text-sm text-amber-700 mt-2">ไม่พบห้องเรียนที่มีภาระสอนรายวิชานี้ กรุณาตรวจสอบข้อมูลภาระสอน</p>}
+            {addForm.teacherId && addForm.subjectId && addForm.classroomId && selectedManualRoom?.isComplete && <p role="status" className="text-sm text-amber-700 mt-2">ห้อง {selectedManualRoom.name} จัดรายวิชานี้ครบตามภาระสอนแล้ว ไม่สามารถเพิ่มคาบได้อีก</p>}
+            {addForm.teacherId && addForm.subjectId && addForm.classroomId && !selectedManualRoom && <p role="status" className="text-sm text-rose-700 mt-2">ห้องนี้ไม่มีภาระสอนสำหรับครูและรายวิชาที่เลือก กรุณาเลือกห้องหรือรายวิชาใหม่</p>}
+          </div>
           {addForm.classroomId && classroomUnavailabilities.some(u=>u.classroomId===addForm.classroomId&&u.day===addForm.day&&u.periodId===addForm.periodId) && <div className="bg-amber-50 border border-amber-300 text-amber-900 text-sm p-3 rounded-xl">
             ห้องนี้ถูกปิดไม่ให้ Auto จัดในคาบที่เลือก แต่สามารถลงด้วยมือเป็นกรณีพิเศษได้ ระบบจะขอให้ยืนยันก่อนบันทึก และยังตรวจครูชน / PLC / คาบซ้ำตามปกติ
           </div>}
@@ -3954,7 +4001,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
               key={`${slot.day}_${slot.periodId}`} type="button" onClick={()=>setAddForm(prev=>({...prev,day:slot.day,periodId:slot.periodId}))}
               className="px-3 py-2 bg-white rounded-lg border border-emerald-200 text-sm font-medium">{i+1}. {slot.day} {slot.periodName}{slot.block===2?' (คาบคู่)':''}</button>)}</div>:<p className="text-xs text-amber-800">ไม่พบช่องแนะนำตามข้อบังคับ 4 คาบ กรุณาตรวจเงื่อนไขหรือคาบที่ลงไว้</p>}
           </div>}
-          <button onClick={handleManualAdd} className="w-full mt-2 bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึกคาบเรียน</button>
+          <button onClick={handleManualAdd} disabled={!!(addForm.teacherId && addForm.subjectId && addForm.classroomId && (!selectedManualRoom || selectedManualRoom.isComplete))} className="w-full mt-2 bg-[#081a39] text-white py-3 rounded-xl font-bold disabled:opacity-50 disabled:cursor-not-allowed">บันทึกคาบเรียน</button>
         </div>
       </Modal>
     </div>
