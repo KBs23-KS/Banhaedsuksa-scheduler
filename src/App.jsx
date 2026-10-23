@@ -354,25 +354,38 @@ const findSubjectDailyLimitConflicts = (items, classrooms, customRules) => {
   return [...new Set(result)];
 };
 
-// ตรวจคาบที่ลงเอง/ล็อกไว้: Auto ไม่ควรสร้างผลลัพธ์ที่ฝ่าฝืนกฎกระจายวัน
-const findAutoSubjectDistributionConflicts = (items = [], subjects = [], classrooms = []) => {
-  const blockBySubject = new Map(subjects.map(s => [String(s.id), Number(s.periodBlock) === 2 ? 2 : 1]));
-  const roomNames = new Map(classrooms.map(c => [String(c.id), c.name || c.id]));
+// STAGE 30: Count timetable entries per subject / room / day, including
+// room-wide fixed lessons where appropriate (never count development activities).
+const countSubjectDayDistribution = (items = [], subjects = [], classrooms = []) => {
+  const knownSubjects = new Set(subjects.map(s => String(s.id)));
   const counts = new Map();
   items.forEach(item => {
-    if (!item?.subjectId || !item?.day || !blockBySubject.has(String(item.subjectId))) return;
+    if (!item?.subjectId || !item?.day || !knownSubjects.has(String(item.subjectId)) || isDevelopmentActivity(item)) return;
     const targets = item.classroomId === ALL_CLASSROOMS_ID ? fixedTargetRoomIds(item, classrooms) : [item.classroomId];
     targets.forEach(roomId => {
       if (!roomId) return;
       const key = subjectDailyKey(roomId, item.subjectId, item.day);
-      if (!counts.has(key)) counts.set(key, { roomId, subjectId: String(item.subjectId), day: item.day, count: 0 });
+      if (!counts.has(key)) counts.set(key, {roomId,subjectId:String(item.subjectId),day:item.day,count:0});
       counts.get(key).count++;
     });
   });
-  return [...counts.values()].filter(x => x.count > blockBySubject.get(x.subjectId)).map(x => {
+  return counts;
+};
+
+// Auto must NOT create excess same-subject/day lessons, but pre-existing manual
+// lessons and pinned anchors are deliberately preserved. The protected baseline
+// must be supplied explicitly by the caller, never inferred from generated rows.
+const findAutoSubjectDistributionConflicts = (items = [], subjects = [], classrooms = [], protectedAnchors = []) => {
+  const blockBySubject = new Map(subjects.map(s => [String(s.id), Number(s.periodBlock) === 2 ? 2 : 1]));
+  const roomNames = new Map(classrooms.map(c => [String(c.id), c.name || c.id]));
+  const counts = countSubjectDayDistribution(items, subjects, classrooms);
+  const baseline = countSubjectDayDistribution(protectedAnchors, subjects, classrooms);
+  return [...counts.entries()].filter(([key,x]) =>
+    x.count > Math.max(blockBySubject.get(x.subjectId), baseline.get(key)?.count || 0)
+  ).map(([key,x]) => {
     const max = blockBySubject.get(x.subjectId);
     const desc = max === 1 ? 'ไม่ได้ตั้งเป็นคาบคู่ ต้องกระจายไปคนละวัน' : 'ตั้งเป็นคาบคู่ แต่ห้ามเกิน 2 คาบในวันเดียว';
-    return `รหัสวิชา ${x.subjectId} ห้อง ${roomNames.get(String(x.roomId)) || x.roomId} วัน${x.day}: มี ${x.count} คาบ (${desc}) กรุณาย้ายคาบที่ลงเอง/ล็อกไว้ก่อนกด Auto`;
+    return `รหัสวิชา ${x.subjectId} ห้อง ${roomNames.get(String(x.roomId)) || x.roomId} วัน${x.day}: มี ${x.count} คาบ (${desc}) Auto ห้ามเพิ่มคาบจนเกินเกณฑ์เดิมหรือเกินคาบที่คงไว้`;
   });
 };
 
@@ -999,10 +1012,15 @@ const canPlaceTeacherEntries = (teacherId, entries, maps, isActivityPlacement = 
     // กิจกรรมอาจอยู่ติดกับวิชาสอน เช่น สอนคาบ 5–6 แล้วทำลูกเสือคาบ 7
     // ไม่ห้ามเพียงเพราะเป็นหน้าที่ต่อเนื่อง 3 คาบ แต่เตือนใน Health Check แทน
     const instruction = new Set([...(maps.teacherInstructionDayPeriods.get(teacherDayKey(teacherId, day)) || []), ...(isActivityPlacement ? [] : additions)]);
-    if (calculateDayTeachingShape([...instruction], maps.periodContext).maxConsec >
-        (allowManualThree ? 3 : SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods)) {
-      return { ok: false, reason: 'TEACHER_CONSECUTIVE_LIMIT' };
-    }
+    // Exact 3-lesson runs confirmed in the MANUAL timetable are safe anchors.
+    // An Auto candidate may coexist on a separate run, but cannot extend such
+    // a streak to 4 or create a new unapproved 3-lesson run.
+    const instructionRuns = getTeacherTeachingRuns([...instruction], maps.periodContext);
+    const unapprovedRun = instructionRuns.some(streak =>
+      streak.length > (allowManualThree ? 3 : SCHEDULER_CONFIG.maxConsecutiveTeacherPeriods) &&
+      !(streak.length === 3 && maps.approvedManualTeachingStreaks?.has(
+        JSON.stringify([String(teacherId),day,streak]))));
+    if (unapprovedRun) return { ok: false, reason: 'TEACHER_CONSECUTIVE_LIMIT' };
     if (getFourPeriodTeachingPattern([...instruction], maps.periodContext)?.level === 'blocked' ||
         hasSchoolPeriodSequence([...instruction], maps.periodContext, [3,4,5,6])) {
       return { ok: false, reason: 'TEACHER_FOUR_PERIOD_PATTERN' };
@@ -1041,6 +1059,15 @@ const buildConstraintMaps = (schedules, tUnavail, cUnavail, fixedSch, periods = 
     registerTeacherPeriod(maps, s);
     registerSubjectDayPeriod(maps, s);
     maps.roomPlacements.add(`${s.classroomId}_${s.day}_${s.periodId}`);
+  });
+  // Store only already-confirmed exact manual three-period streaks. This is a
+  // read-only baseline and is copied to each Auto candidate constraint map.
+  maps.approvedManualTeachingStreaks = new Set();
+  groupTeacherDuties([...fixedSch, ...schedules]).forEach(({teacherId,day,lessons}) => {
+    getTeacherTeachingRuns([...lessons], maps.periodContext).forEach(streak => {
+      if (streak.length === 3 && getApprovedManualTeachingStreak(schedules,teacherId,day,streak))
+        maps.approvedManualTeachingStreaks.add(JSON.stringify([String(teacherId),day,streak]));
+    });
   });
   return maps;
 };
@@ -1158,7 +1185,12 @@ const validateAutoScheduleInputs = ({ teachingLoads, teachers, subjects, classro
     }
   });
   findSubjectDailyLimitConflicts(anchors.filter(item => !isDevelopmentActivity(item)), classrooms, customRules).forEach(addProblem);
-  findAutoSubjectDistributionConflicts(anchors.filter(item => !isDevelopmentActivity(item)), subjects, classrooms).forEach(addProblem);
+  // Pre-existing manual/pinned lessons are protected exceptions, NOT an Auto
+  // input error. Still reject invalid fixed-only subject distributions.
+  findAutoSubjectDistributionConflicts(
+    anchors.filter(item => item.__kind === 'กิจกรรมล็อก' && !isDevelopmentActivity(item)),
+    subjects, classrooms
+  ).forEach(addProblem);
   anchors.filter(item => blocksCustomRule(customRules, item, periods)).forEach(item =>
     addProblem(`ตารางเดิม/กิจกรรมล็อกฝ่าฝืนข้อบังคับเพิ่มเติม: วัน${item.day} คาบ ${item.periodId}`));
   const groupTeachers=activityTeacherEntries(activityGroups,fixedSchedules);
@@ -1192,6 +1224,11 @@ const analyzeScheduleFeasibility = ({ teachingLoads, teachers, subjects, classro
   const allSlots = DAYS.length * active.length;
   const anchored = schedules.filter(s => !isAutoGeneratedSchedule(s));
   const anchors = [...anchored, ...fixedSchedules];
+  const anchoredSubjectDays = countSubjectDayDistribution(anchors, subjects, classrooms);
+  const protectedDailyExceptions = findAutoSubjectDistributionConflicts(anchors,subjects,classrooms);
+  protectedDailyExceptions.forEach(message => result.advisories.push(
+    message.replace(/ Auto ห้ามเพิ่มคาบจนเกินเกณฑ์เดิมหรือเกินคาบที่คงไว้$/, ' (คงคาบที่ลงเอง/ล็อกไว้ และ Auto จะไม่เพิ่มคาบในวันนั้น)')
+  ));
   const baseMaps = buildConstraintMaps(anchored, unavailabilities, classroomUnavailabilities,
     fixedSchedules, periods, customRules,activityGroups,classrooms,plcSessions,teachers);
   baseMaps.enforceAutoSubjectDailyCap = true;
@@ -1236,7 +1273,12 @@ const analyzeScheduleFeasibility = ({ teachingLoads, teachers, subjects, classro
   roomSubjectDemand.forEach((required, key) => {
     const [roomId, subjectId] = JSON.parse(key);
     const cap = baseMaps.autoSubjectBlockSizes.get(subjectId) === 2 ? 2 : 1;
-    if (required > DAYS.length * cap) block(`วิชา ${subjectId} ห้อง ${classrooms.find(r=>String(r.id)===roomId)?.name || roomId}: ต้องการ ${required} คาบ/สัปดาห์ แต่จัดได้สูงสุด ${DAYS.length * cap} คาบ/สัปดาห์ (ไม่เกิน ${cap} คาบต่อวัน) กรุณาตรวจจำนวนคาบหรือ Block รายวิชา`);
+    // An existing manual/pinned overflow on a particular day is already part
+    // of the required weekly load; Auto can still use the other weekdays.
+    const protectedOverflow = DAYS.reduce((sum,day) =>
+      sum + Math.max(0,(anchoredSubjectDays.get(subjectDailyKey(roomId,subjectId,day))?.count || 0)-cap),0);
+    const upperWeekly = DAYS.length * cap + protectedOverflow;
+    if (required > upperWeekly) block(`วิชา ${subjectId} ห้อง ${classrooms.find(r=>String(r.id)===roomId)?.name || roomId}: ต้องการ ${required} คาบ/สัปดาห์ แต่จัดได้สูงสุด ${upperWeekly} คาบ/สัปดาห์ (นับข้อยกเว้นคาบเดิมแล้ว) กรุณาตรวจจำนวนคาบหรือ Block รายวิชา`);
   });
 
   teachingLoads.forEach(load => {
@@ -1345,6 +1387,7 @@ const cloneConstraintMaps = (maps) => ({
   customRules: maps.customRules,
   enforceAutoSubjectDailyCap: maps.enforceAutoSubjectDailyCap,
   autoSubjectBlockSizes: maps.autoSubjectBlockSizes,
+  approvedManualTeachingStreaks: maps.approvedManualTeachingStreaks,
   maxTeacherPeriodsPerDay: maps.maxTeacherPeriodsPerDay,
 });
 
@@ -5796,7 +5839,11 @@ export default function App() {
         const candidates = candidatePool.slice(0, SCHEDULER_CANDIDATE_KEEP);
         const bestCandidate = candidates[0] || { schedule: preservedSchedules, generatedSchedule: [], preservedCount: preservedSchedules.length, unassigned: [], score: -Infinity, missingCount: 0, generationId: String(runSeed) };
         if (findSubjectDailyLimitConflicts([...fixedSchedules, ...bestCandidate.schedule], classrooms, customRules).length ||
-            findAutoSubjectDistributionConflicts([...fixedSchedules.filter(f => !isDevelopmentActivity(f)), ...bestCandidate.schedule], subjects, classrooms).length)
+            findAutoSubjectDistributionConflicts(
+              [...fixedSchedules.filter(f => !isDevelopmentActivity(f)), ...bestCandidate.schedule],
+              subjects, classrooms,
+              [...fixedSchedules.filter(f => !isDevelopmentActivity(f)), ...preservedSchedules]
+            ).length)
           throw new Error('SUBJECT_DAILY_LIMIT_FAILED');
         if (findTeacherTeachingLimitConflicts(buildTeacherOccupancy(bestCandidate.schedule,fixedSchedules,activityGroups), periods, teachers).length) {
           throw new Error('TEACHER_HARD_LIMIT_FAILED');
