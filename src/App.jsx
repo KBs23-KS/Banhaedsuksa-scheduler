@@ -4695,7 +4695,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   const PrintPage = ({ id, mode }) => (
     <div className="bg-white p-10 rounded-xl border border-slate-200 text-black shadow-sm print-page mb-6">
       <div className="text-center mb-8 print-header">
-        {schoolSettings?.schoolLogoData && <img src={schoolSettings.schoolLogoData} alt="ตราโรงเรียน" className="mx-auto mb-2 object-contain print-school-logo" style={{width:'16mm',height:'16mm'}}/>}
+        {schoolSettings?.schoolLogoData && <img src={schoolSettings.schoolLogoData} alt="ตราโรงเรียน" className="mx-auto mb-2 object-contain print-school-logo" style={{width:'30mm',height:'30mm'}}/>}
         <h1 className="text-3xl font-bold mb-2">{String(schoolSettings?.schoolName || 'โรงเรียน')}</h1>
         <h2 className="text-xl mb-1">ตาราง{mode === 'room' ? 'เรียน' : 'สอน'} ภาคเรียนที่ {String(schoolSettings?.semester || '1')} ปีการศึกษา {String(schoolSettings?.academicYear || '2569')}</h2>
         <h3 className="text-lg font-bold">{mode === 'room' ? `ชั้น ${getClassroom(id).name}` : `ชื่อครูผู้สอน: ${getTeacher(id).name}`}</h3>
@@ -6350,10 +6350,92 @@ export default function App() {
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #081a39; }
-        /* Print only the timetable: let the page use the full A4 landscape width. */
+        /* Timetable paper template: the preview and the printer share the SAME
+           header/table/signature geometry, measured in physical millimetres. */
         @page { size: A4 landscape; margin: 8mm; }
+        #print-area { overflow-x: auto; }
+        #print-area .print-page {
+          box-sizing: border-box !important;
+          width: 281mm !important; min-height: 194mm !important;
+          max-width: none !important; padding: 0 !important;
+          margin: 0 auto 8mm !important;
+          background: #fff !important;
+        }
+        #print-area .print-header {
+          text-align: center !important; margin: 0 0 5mm !important;
+          line-height: 1.22 !important;
+        }
+        #print-area .print-school-logo {
+          display: block !important; width: 30mm !important; height: 30mm !important;
+          object-fit: contain !important; margin: 0 auto 2mm !important;
+        }
+        #print-area .print-header h1 {
+          font-size: 22.5pt !important; font-weight: 700 !important;
+          line-height: 1.22 !important; margin: 0 0 2mm !important;
+        }
+        #print-area .print-header h2 {
+          font-size: 15pt !important; line-height: 1.22 !important;
+          margin: 0 0 1mm !important;
+        }
+        #print-area .print-header h3 {
+          font-size: 13.5pt !important; line-height: 1.22 !important;
+          margin: 0 !important;
+        }
+        #print-area .print-header p {
+          font-size: 12pt !important; line-height: 1.22 !important;
+          margin: 0 !important;
+        }
+        #print-area .print-table {
+          width: 100% !important; max-width: 100% !important;
+          table-layout: fixed !important; border-collapse: collapse !important;
+          margin: 0 !important;
+          -webkit-print-color-adjust: exact; print-color-adjust: exact;
+        }
+        #print-area .print-table th, #print-area .print-table td {
+          box-sizing: border-box !important; border: 1px solid #111 !important;
+          padding: 1mm !important; vertical-align: middle !important;
+          text-align: center !important; font-size: 9pt !important; line-height: 1.2 !important;
+          overflow-wrap: anywhere !important; word-break: break-word !important;
+          white-space: normal !important;
+        }
+        #print-area .print-table th:first-child { width: 19mm !important; }
+        #print-area .print-table thead th {
+          height: 11mm !important; font-size: 9pt !important;
+        }
+        #print-area .print-table thead th div {
+          font-size: 8.5pt !important; line-height: 1.15 !important;
+        }
+        #print-area .print-table tbody tr {
+          height: 15mm !important; break-inside: avoid !important;
+          page-break-inside: avoid !important;
+        }
+        #print-area .print-table tbody td { height: 15mm !important; }
+        #print-area .print-table .truncate {
+          overflow: visible !important; text-overflow: clip !important;
+          white-space: normal !important;
+        }
+        #print-area .print-table td div {
+          max-width: 100% !important; overflow-wrap: anywhere !important;
+        }
+        #print-area .print-signatures {
+          display: flex !important; justify-content: space-between !important;
+          margin: 14mm 0 0 !important; padding: 0 28mm !important;
+          font-size: 10.5pt !important; line-height: 1.35 !important;
+          break-inside: avoid !important; page-break-inside: avoid !important;
+        }
+        #print-area .print-signatures > div {
+          width: 46% !important; text-align: center !important;
+        }
+        #print-area .print-signatures p {
+          margin: 0 !important; line-height: 1.35 !important;
+        }
+        #print-area .print-signatures p + p { margin-top: 3mm !important; }
+        #print-area .print-signatures p + p + p { margin-top: 1mm !important; }
         @media print {
-          html, body, #root { width: 100% !important; height: auto !important; overflow: visible !important; margin: 0 !important; padding: 0 !important; background: white !important; }
+          html, body, #root {
+            width: 100% !important; height: auto !important; overflow: visible !important;
+            margin: 0 !important; padding: 0 !important; background: white !important;
+          }
           .bhs-app-shell, .bhs-main, .bhs-scroll-content, .bhs-print-view {
             display: block !important; position: static !important; width: 100% !important;
             height: auto !important; max-width: none !important; min-height: 0 !important;
@@ -6361,54 +6443,24 @@ export default function App() {
             background: white !important; box-shadow: none !important;
           }
           .bhs-app-shell > aside, .bhs-main > header, .no-print { display: none !important; }
-          #print-area { display: block !important; position: static !important; left: auto !important; top: auto !important; width: 100% !important; max-width: none !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+          #print-area {
+            display: block !important; position: static !important;
+            left: auto !important; top: auto !important; width: 100% !important;
+            max-width: none !important; margin: 0 !important; padding: 0 !important;
+            overflow: visible !important;
+          }
           #print-area .print-page {
-            display: block !important; box-sizing: border-box !important; position: static !important;
-            width: 100% !important; height: auto !important; min-height: 0 !important;
-            padding: 0 !important; margin: 0 !important; border: 0 !important;
-            border-radius: 0 !important; box-shadow: none !important;
-            break-inside: avoid-page; page-break-inside: avoid;
+            width: 100% !important; min-height: 0 !important;
+            margin: 0 !important; padding: 0 !important;
+            border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
             break-after: page; page-break-after: always;
           }
-          #print-area .print-page:last-child { break-after: auto !important; page-break-after: auto !important; }
-          #print-area .print-header { margin: 0 0 3mm !important; line-height: 1.2 !important; }
-          #print-area .print-school-logo { width: 16mm !important; height: 16mm !important; margin: 0 auto 1mm !important; }
-          #print-area .print-header h1 { font-size: 17pt !important; margin: 0 0 1.5mm !important; }
-          #print-area .print-header h2 { font-size: 11.5pt !important; margin: 0 0 1mm !important; }
-          #print-area .print-header h3 { font-size: 11pt !important; margin: 0 !important; }
-          #print-area .print-header div { font-size: 9pt !important; margin: 0 0 1mm !important; }
-          #print-area .print-table {
-            width: 100% !important; max-width: 100% !important; table-layout: fixed !important;
-            border-collapse: collapse !important; margin: 0 !important;
-            -webkit-print-color-adjust: exact; print-color-adjust: exact;
+          #print-area .print-page:last-child {
+            break-after: auto !important; page-break-after: auto !important;
           }
           #print-area .print-table th, #print-area .print-table td {
-            box-sizing: border-box !important; border: 1px solid #111 !important;
-            padding: 1.5mm 1mm !important; vertical-align: middle !important;
-            text-align: center !important; font-size: 9pt !important; line-height: 1.2 !important;
-            overflow-wrap: anywhere !important; word-break: break-word !important;
-            white-space: normal !important;
+            -webkit-print-color-adjust: exact; print-color-adjust: exact;
           }
-          #print-area .print-table th:first-child { width: 19mm !important; }
-          #print-area .print-table thead th { height: 13mm !important; font-size: 9pt !important; }
-          #print-area .print-table thead th div { font-size: 8.5pt !important; line-height: 1.15 !important; }
-          #print-area .print-table tbody tr { height: 20mm !important; break-inside: avoid !important; page-break-inside: avoid !important; }
-          #print-area .print-table tbody td { height: 20mm !important; }
-          #print-area .print-table .truncate {
-            overflow: visible !important; text-overflow: clip !important; white-space: normal !important;
-          }
-          #print-area .print-table td div { max-width: 100% !important; overflow-wrap: anywhere !important; }
-          #print-area .print-signatures {
-            display: flex !important; justify-content: space-between !important;
-            margin: 5mm 0 0 !important; padding: 0 10mm !important;
-            font-size: 10pt !important; line-height: 1.25 !important;
-            break-inside: avoid !important;
-          }
-          #print-area .print-signatures > div { width: 46%; }
-          #print-area .print-signatures p { margin: 0 0 1.5mm !important; }
-          #print-area .print-version { margin-top: 3mm !important; text-align: right !important;
-            font-size: 7.5pt !important; line-height: 1.1 !important; color: #555 !important;
-            overflow-wrap: anywhere !important; }
         }
       `}</style>
       
