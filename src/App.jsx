@@ -3390,9 +3390,30 @@ const ConstraintsHub = ({ commonProps, initialSection = 'time' }) => {
   </div>;
 };
 
+const ALL_TIMETABLE_VIEW_ID = '__BHS_ALL_TIMETABLES__';
+
 const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, customRules, rulesReady, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, clearUnlockedSchedules, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, plcSessions = [], initialRoomId = '' }) => {
   const [viewMode, setViewMode] = useState('room');
   const [selectedId, setSelectedId] = useState(initialRoomId);
+  const [hoveredSlot, setHoveredSlot] = useState(null);
+  const [draggedScheduleId, setDraggedScheduleId] = useState('');
+  const [dropFeedback, setDropFeedback] = useState(null);
+  const dragSourceIdRef = useRef('');
+  const dropKeyRef = useRef('');
+  const dropOutcomeRef = useRef(null);
+  const teacherActivitySlots = useMemo(() => activityTeacherEntries(activityGroups,fixedSchedules), [activityGroups,fixedSchedules]);
+  const teacherPLCSlots = useMemo(() => buildPLCReservations(plcSessions,teachers), [plcSessions,teachers]);
+  const displayedEntities = useMemo(() => {
+    const source = viewMode === 'room' ? classrooms : teachers;
+    return selectedId === ALL_TIMETABLE_VIEW_ID ? source : source.filter(item => item.id === selectedId);
+  }, [viewMode, selectedId, classrooms, teachers]);
+  const clearDragVisuals = () => {
+    dragSourceIdRef.current = '';
+    dropKeyRef.current = '';
+    dropOutcomeRef.current = null;
+    setDraggedScheduleId('');
+    setDropFeedback(null);
+  };
   useEffect(() => { if (initialRoomId) { setViewMode('room'); setSelectedId(initialRoomId); } }, [initialRoomId]);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [feasibility, setFeasibility] = useState(null);
@@ -3458,9 +3479,9 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     schedules,teachingLoads,activeSubjects,fixedSchedules,activityGroups,periods,
     unavailabilities,classroomUnavailabilities,customRules,classrooms,rulesReady]);
 
-  const handleCellClick = (day, periodId) => {
-    if (!selectedId) return;
-    setAddForm({ teacherId: viewMode === 'teacher' ? selectedId : '', subjectId: '', classroomId: viewMode === 'room' ? selectedId : '', day, periodId });
+  const handleCellClick = (day, periodId, entityId) => {
+    if (!entityId || isScheduling || editingRows) return;
+    setAddForm({ teacherId: viewMode === 'teacher' ? entityId : '', subjectId: '', classroomId: viewMode === 'room' ? entityId : '', day, periodId });
     setIsAddModalOpen(true);
   };
 
@@ -3671,13 +3692,78 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     finally {setEditingRows(false);}
   };
 
-  const getCellContent = (day, periodId) => {
-     if (!selectedId) return null;
-     const cellSch = schedules.filter(s => viewMode === 'room' ? s.classroomId === selectedId && s.day === day && s.periodId === periodId : s.teacherId === selectedId && s.day === day && s.periodId === periodId);
-     const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? fixedAppliesToClassroom(f, selectedId) && f.day === day && f.periodId === periodId : f.teacherId === selectedId && f.day === day && f.periodId === periodId);
-     const cellGroups = viewMode==='teacher' ? activityTeacherEntries(activityGroups,fixedSchedules).filter(x=>x.teacherId===selectedId&&x.day===day&&x.periodId===periodId).map(x=>({...x,name:x.__activityName || fixedActivityDisplayName(x,getSubject)})) : [];
-     const cellPLC = viewMode==='teacher' ? buildPLCReservations(plcSessions,teachers)
-       .filter(x=>x.teacherId===selectedId&&x.day===day&&x.periodId===periodId) : [];
+  // Preview drag feasibility before displaying a green destination. The commit handler
+  // still rechecks every hard constraint and verifies the latest server data.
+  const previewDrop = (scheduleId, entityId, targetDay, targetPeriodId) => {
+    if (!rulesReady || isScheduling || editingRows) return {status:'blocked', message:'กำลังโหลดกฎหรือระบบไม่พร้อมแก้ไข'};
+    const source = schedules.find(item => item.id === scheduleId);
+    if (!source) return {status:'blocked', message:'ไม่พบคาบต้นทาง'};
+    if ((viewMode === 'room' && source.classroomId !== entityId) ||
+        (viewMode === 'teacher' && source.teacherId !== entityId)) {
+      return {status:'blocked',message:'ย้ายข้ามห้องหรือข้ามครูด้วยการลากไม่ได้ ต้องใช้ห้อง/ครูเดิม'};
+    }
+    let plan;
+    try {
+      plan = buildScheduleDragPlan({schedules,sourceId:scheduleId,targetDay,targetPeriodId,
+        periods,subject:getSubject(source.subjectId)});
+    } catch (error) {
+      return {status:'blocked',message:USER_ERROR_TH[error.message] || error.message};
+    }
+    const {moved,planned,remaining} = plan;
+    if (planned.every((item,i)=>item.day===moved[i].day && item.periodId===moved[i].periodId))
+      return {status:'blocked',message:'เป็นช่องเดิม ไม่จำเป็นต้องย้าย'};
+    const maps = buildConstraintMaps(remaining,unavailabilities,classroomUnavailabilities,
+      fixedSchedules,periods,customRules,activityGroups,classrooms,plcSessions,teachers);
+    const groupItems = activityTeacherEntries(activityGroups,fixedSchedules);
+    const oldFifth = findTeacherFifthPeriodDays([...schedules,...fixedSchedules,...groupItems],periods,teachers);
+    const projectedFifth = findTeacherFifthPeriodDays([...remaining,...planned,...fixedSchedules,...groupItems],periods,teachers);
+    const newFifth = projectedFifth.filter(item=>!oldFifth.some(old=>old.teacherId===item.teacherId && old.day===item.day));
+    if(projectedFifth.length) maps.maxTeacherPeriodsPerDay=SCHEDULER_CONFIG.absoluteMaxTeacherPeriodsPerDay;
+    const entries=planned.map(item=>({day:item.day,periodId:item.periodId}));
+    for(const item of planned){
+      const result=canPlaceSchedule(item.teacherId,item.classroomId,item.day,item.periodId,maps,
+        false,item.subjectId,false,false,true);
+      if (!result.ok) return {status:'blocked',message:USER_ERROR_TH[result.reason] || result.reason};
+    }
+    const teacherCheck=canPlaceTeacherEntries(source.teacherId,entries,maps,false,true);
+    if(!teacherCheck.ok) return {status:'blocked',message:USER_ERROR_TH[teacherCheck.reason] || teacherCheck.reason};
+    const subjectCheck=canPlaceSubjectDailyEntries(source,entries,maps);
+    if(!subjectCheck.ok) return {status:'blocked',message:USER_ERROR_TH[subjectCheck.reason] || subjectCheck.reason};
+    const instruction=[...(maps.teacherInstructionDayPeriods.get(teacherDayKey(source.teacherId,targetDay))||[]),
+      ...entries.map(item=>item.periodId)];
+    const streak=getTeacherTeachingRuns(instruction,periods).find(run=>run.length===3 && entries.some(item=>run.includes(String(item.periodId))));
+    const approval=streak ? {teacherId:source.teacherId,day:targetDay,periodIds:streak} : null;
+    const approvedPlanned=planned.map(item=>{
+      const copy={...item}; delete copy.manualConsecutiveApproval;
+      if(approval) copy.manualConsecutiveApproval=approval;
+      return copy;
+    });
+    const limitIssues=findTeacherTeachingLimitConflicts(buildTeacherOccupancy([...remaining,...approvedPlanned],fixedSchedules,activityGroups),periods,teachers);
+    if(limitIssues.length) return {status:'blocked',message:limitIssues[0]};
+    const subjectIssues=findSubjectDailyLimitConflicts([...remaining,...planned,...fixedSchedules],classrooms,customRules);
+    if(subjectIssues.length) return {status:'blocked',message:subjectIssues[0]};
+    if(approval || newFifth.length) return {status:'confirm',message:approval
+      ? 'จะเกิดการสอน 3 คาบติดกัน ต้องยืนยันก่อนย้าย' : 'ครูจะมีภาระ 5 คาบในวันนี้ ต้องยืนยันก่อนย้าย'};
+    return {status:'allowed',message:'ย้ายมาคาบนี้ได้ (ระบบจะตรวจซ้ำก่อนบันทึก)'};
+  };
+
+  const updateDropFeedback = (scheduleId, entityId, day, periodId) => {
+    const key=JSON.stringify([scheduleId,entityId,day,String(periodId)]);
+    if(dropKeyRef.current===key) return dropOutcomeRef.current?.status || 'blocked';
+    dropKeyRef.current=key;
+    const outcome=previewDrop(scheduleId,entityId,day,periodId);
+    dropOutcomeRef.current=outcome;
+    setDropFeedback({key,entityId,day,periodId,...outcome});
+    return outcome.status;
+  };
+
+  const getCellContent = (day, periodId, entityId) => {
+     if (!entityId) return null;
+     const cellSch = schedules.filter(s => viewMode === 'room' ? s.classroomId === entityId && s.day === day && s.periodId === periodId : s.teacherId === entityId && s.day === day && s.periodId === periodId);
+     const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? fixedAppliesToClassroom(f, entityId) && f.day === day && f.periodId === periodId : f.teacherId === entityId && f.day === day && f.periodId === periodId);
+     const cellGroups = viewMode==='teacher' ? teacherActivitySlots.filter(x=>x.teacherId===entityId&&x.day===day&&x.periodId===periodId).map(x=>({...x,name:x.__activityName || fixedActivityDisplayName(x,getSubject)})) : [];
+     const cellPLC = viewMode==='teacher' ? teacherPLCSlots
+       .filter(x=>x.teacherId===entityId&&x.day===day&&x.periodId===periodId) : [];
      if (cellSch.length === 0 && cellFix.length === 0 && cellGroups.length===0 && cellPLC.length===0) return null;
      const isConflict = cellSch.length + cellFix.length + cellGroups.length + cellPLC.length > 1;
 
@@ -3687,7 +3773,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
          {cellFix.map((f, idx) => (
            <div key={f.id} className={idx > 0 || cellSch.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
              <div className="font-bold text-amber-700 flex items-center justify-center gap-1">{viewMode==='room' && f.classroomId===ALL_CLASSROOMS_ID
-               ? fixedActivityDisplayName(f,getSubject,activityGroups,selectedId)
+               ? fixedActivityDisplayName(f,getSubject,activityGroups,entityId)
                : fixedActivityDisplayName(f,getSubject)}</div>
              <button onClick={(e) => { e.stopPropagation(); handleRequestDelete('fixed', f); }} className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-rose-500 text-white rounded-full p-0.5 z-10"><X size={12}/></button>
            </div>
@@ -3695,8 +3781,13 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
          {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{g.name}</div>)}
          {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1">{plcDisplayName(item.subjectArea)}</div>)}
          {cellSch.map((sch, idx) => (
-           <div key={sch.id} draggable={!isScheduling&&!editingRows} onDragStart={e=>{e.dataTransfer.setData('text/plain',sch.id);e.dataTransfer.effectAllowed='move';}}
-             title="ลากเพื่อย้ายคาบ หรือกดไอคอนเพื่อเก็บคาบนี้เมื่อจัดใหม่" className={idx > 0 || cellFix.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
+           <div key={sch.id} draggable={!isScheduling&&!editingRows} onDragStart={e=>{
+               dragSourceIdRef.current=sch.id; dropKeyRef.current=''; dropOutcomeRef.current=null;
+               setDraggedScheduleId(sch.id); setDropFeedback(null); setHoveredSlot(null);
+               e.dataTransfer.setData('text/plain',sch.id); e.dataTransfer.effectAllowed='move';
+             }} onDragEnd={clearDragVisuals}
+             title="ลากเพื่อย้ายคาบ หรือกดไอคอนเพื่อเก็บคาบนี้เมื่อจัดใหม่"
+             className={`${idx > 0 || cellFix.length > 0 ? 'mt-2 pt-2 border-t w-full relative' : 'w-full relative'} cursor-grab active:cursor-grabbing rounded-md ${draggedScheduleId === sch.id ? 'bg-blue-100 ring-2 ring-blue-500 opacity-65' : 'hover:bg-blue-50'}`}>
              <div className="font-bold text-[#081a39] truncate">{getSubject(sch.subjectId).name}</div>
              {viewMode === 'room' ? (
                <><div className="text-slate-600 truncate">{getShortTeacherName(getTeacher(sch.teacherId).name)}</div></>
@@ -3715,8 +3806,8 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     <div className="space-y-6 animate-in fade-in">
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
-          <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId('');}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">ตารางเรียน (รายห้อง)</option><option value="teacher">ตารางสอน (รายครู)</option></select>
-          <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+          <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId(''); setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">ตารางเรียน (รายห้อง)</option><option value="teacher">ตารางสอน (รายครู)</option></select>
+          <select value={selectedId} onChange={e => {setSelectedId(e.target.value);setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option><option value={ALL_TIMETABLE_VIEW_ID}>{viewMode === 'room' ? `ทุกห้องเรียน (${classrooms.length} ห้อง)` : `ครูทั้งหมด (${teachers.length} คน)`}</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button onClick={handleFeasibilityClick} disabled={isScheduling || !rulesReady} className="flex items-center gap-2 px-4 py-3 bg-slate-100 text-[#081a39] border border-slate-200 rounded-xl font-bold disabled:opacity-50"><Search size={17}/> ตรวจความเป็นไปได้</button>
@@ -3728,26 +3819,88 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
       <div className="text-xs text-slate-600">กำลังแก้ไข: <strong>ฉบับร่าง</strong> · {publishedLoading?'กำลังตรวจฉบับประกาศ...':publishedError||(
         publishedSnapshot ? `มีฉบับประกาศใช้แล้ว (${new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH')})` : 'ยังไม่เคยประกาศใช้')}
         {publishedSnapshot&&<span className="ml-2 text-amber-700">การแก้ร่างไม่เปลี่ยนฉบับประกาศ</span>}</div>
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto p-4 min-h-[500px]">
-        <table className="w-full text-left border-collapse min-w-[900px] table-fixed">
-          <thead className="bg-[#081a39] text-white rounded-t-xl border-b-4 border-[#d4af37]"><tr><th className="p-4 w-28 text-center font-bold">วัน/เวลา</th>{periods.map(p => <th key={p.id} className="p-2 border-l border-[#122b5e] text-center text-sm"><div className="font-bold">{p.name}</div><div className="text-[#d4af37] text-xs font-normal opacity-90">{p.start}-{p.end}</div></th>)}</tr></thead>
-          <tbody>
-            {DAYS.map(day => (
-              <tr key={day} className="border-b border-slate-100 group"><td className="p-4 font-bold text-center bg-slate-50 border-r border-slate-100 text-[#081a39]">{day}</td>{periods.map(p => {
-                  const content = getCellContent(day, p.id);
-                  return (
-                    <td key={`${day}-${p.id}`} className={`p-1.5 border-r border-slate-100 h-28 align-top relative group/cell ${p.isBreak ? 'bg-slate-50/80' : (selectedId ? 'hover:bg-slate-50 cursor-pointer' : '')}`}
-                      onDragOver={e=>{if(!p.isBreak&&selectedId)e.preventDefault();}}
-                      onDrop={e=>{e.preventDefault();const sourceId=e.dataTransfer.getData('text/plain');if(sourceId&&!p.isBreak)moveScheduleByDrag(sourceId,day,p.id);}}
-                      onClick={() => { if (!p.isBreak && selectedId) handleCellClick(day, p.id); }}>
-                      {p.isBreak ? <div className="h-full flex items-center justify-center text-slate-400 text-sm font-bold opacity-60">พักเที่ยง</div> : <>{content}{!content && selectedId && !isScheduling && <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/cell:opacity-100 transition-opacity"><div className="bg-[#081a39]/5 p-2 rounded-full text-[#081a39]/40"><Plus size={24} /></div></div>}</>}
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {!selectedId && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-12 text-slate-600">เลือกห้องเรียน ครู หรือเลือกทั้งหมดเพื่อดูตารางและจัดคาบด้วยมือ</div>}
+      {displayedEntities.length > 0 && <div className="flex flex-wrap gap-3 text-sm text-slate-700 bg-blue-50 border border-blue-200 p-3 rounded-xl">
+        <span className="font-bold">กำลังแสดง {selectedId === ALL_TIMETABLE_VIEW_ID ? `ทั้งหมด ${displayedEntities.length} ${viewMode === 'room' ? 'ห้องเรียน' : 'คน'}` : displayedEntities[0].name}</span>
+        <span>• ชี้เมาส์: <strong>สีฟ้า</strong> • ลากวางได้: <strong className="text-emerald-700">สีเขียว</strong> • ต้องยืนยัน: <strong className="text-amber-700">สีเหลือง</strong> • วางไม่ได้: <strong className="text-rose-700">สีแดง</strong></span>
+      </div>}
+      {draggedScheduleId && <div role="status" aria-live="polite" className={`sticky top-2 z-30 rounded-xl border-2 px-4 py-3 shadow-lg text-sm font-semibold ${
+        dropFeedback?.status==='blocked' ? 'bg-rose-50 text-rose-900 border-rose-500' :
+        dropFeedback?.status==='confirm' ? 'bg-amber-50 text-amber-900 border-amber-500' :
+        dropFeedback?.status==='allowed' ? 'bg-emerald-50 text-emerald-900 border-emerald-500' :
+        'bg-blue-50 text-blue-900 border-blue-500'
+      }`}>
+        กำลังลาก: {getSubject(schedules.find(s=>s.id===draggedScheduleId)?.subjectId).name || 'รายวิชา'}
+        {dropFeedback ? ` → ${viewMode === 'room' ? getClassroom(dropFeedback.entityId).name : getTeacher(dropFeedback.entityId).name} วัน${dropFeedback.day} ${getPeriodDisplayName(periods,dropFeedback.periodId)} : ${dropFeedback.message}` : ' — เลื่อนไปยังช่องปลายทางเพื่อดูสถานะ'}
+      </div>}
+      <div className="space-y-6">
+        {displayedEntities.map(entity => (
+          <section key={`${viewMode}-${entity.id}`} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4" aria-label={`${viewMode==='room'?'ตารางเรียน':'ตารางสอน'} ${entity.name}`}>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-bold text-lg text-[#081a39]">{viewMode==='room'?'ตารางเรียน':'ตารางสอน'} {entity.name}</h3>
+              <span className="text-xs text-slate-500">คลิกช่องว่างเพื่อเพิ่มคาบด้วยมือ · ลากคาบเพื่อย้ายภายใน{viewMode==='room'?'ห้อง':'ตารางครู'}นี้</span>
+            </div>
+            <div className="overflow-x-auto" onMouseLeave={()=>{if(!dragSourceIdRef.current) setHoveredSlot(null);}}>
+              <table className="w-full text-left border-collapse min-w-[900px] table-fixed">
+                <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr>
+                  <th className="p-4 w-28 text-center font-bold">วัน/เวลา</th>
+                  {periods.map(p => {
+                    const active = hoveredSlot?.entityId===entity.id && String(hoveredSlot.periodId)===String(p.id);
+                    const dropActive = dropFeedback?.entityId===entity.id && String(dropFeedback.periodId)===String(p.id);
+                    return <th key={p.id} className={`p-2 border-l border-[#122b5e] text-center text-sm transition-colors ${active||dropActive?'bg-blue-700':''}`}>
+                      <div className="font-bold">{p.name}</div><div className="text-[#d4af37] text-xs font-normal opacity-90">{p.start}-{p.end}</div>
+                    </th>;
+                  })}
+                </tr></thead>
+                <tbody>
+                  {DAYS.map(day => <tr key={day} className="border-b border-slate-200 group">
+                    <td className={`p-4 font-bold text-center border-r border-slate-200 text-[#081a39] transition-colors ${
+                      ((hoveredSlot?.entityId===entity.id && hoveredSlot.day===day) || (dropFeedback?.entityId===entity.id && dropFeedback.day===day)) ? 'bg-blue-200 ring-1 ring-inset ring-blue-400' : 'bg-slate-50'
+                    }`}>{day}</td>
+                    {periods.map(p => {
+                      const content=getCellContent(day,p.id,entity.id);
+                      const isHovered=hoveredSlot?.entityId===entity.id && hoveredSlot.day===day && String(hoveredSlot.periodId)===String(p.id);
+                      const isDrop=!!draggedScheduleId && dropFeedback?.entityId===entity.id && dropFeedback.day===day && String(dropFeedback.periodId)===String(p.id);
+                      const state=isDrop ? dropFeedback.status : '';
+                      const cellColor=state==='allowed' ? 'bg-emerald-100 ring-4 ring-inset ring-emerald-500 outline outline-2 outline-offset-[-3px] outline-emerald-500' :
+                        state==='confirm' ? 'bg-amber-100 ring-4 ring-inset ring-amber-500 outline outline-2 outline-offset-[-3px] outline-amber-500' :
+                        state==='blocked' ? 'bg-rose-100 ring-4 ring-inset ring-rose-500 outline outline-2 outline-offset-[-3px] outline-rose-500' :
+                        p.isBreak ? 'bg-slate-100' : isHovered ? 'bg-blue-100 ring-2 ring-inset ring-blue-500' : 'bg-white hover:bg-blue-50';
+                      return <td key={`${entity.id}-${day}-${p.id}`} title={`วัน${day} ${p.name} · ${entity.name}`}
+                        className={`p-1.5 border-r border-b border-slate-200 h-28 align-top relative group/cell transition-colors duration-100 ${cellColor} ${!p.isBreak && !isScheduling && !editingRows ? 'cursor-pointer' : ''}`}
+                        onMouseEnter={()=>{if(!dragSourceIdRef.current && !p.isBreak)setHoveredSlot({entityId:entity.id,day,periodId:p.id});}}
+                        onDragOver={e=>{
+                          const sourceId=dragSourceIdRef.current;
+                          if(!sourceId) return;
+                          e.preventDefault();
+                          const status=updateDropFeedback(sourceId,entity.id,day,p.id);
+                          e.dataTransfer.dropEffect=status==='blocked'?'none':'move';
+                        }}
+                        onDrop={e=>{
+                          e.preventDefault();e.stopPropagation();
+                          const sourceId=dragSourceIdRef.current || e.dataTransfer.getData('text/plain');
+                          const feedback=sourceId ? previewDrop(sourceId,entity.id,day,p.id) : {status:'blocked',message:'ไม่พบคาบต้นทาง'};
+                          clearDragVisuals();
+                          if(feedback.status==='blocked') return showToast('ย้ายไม่ได้: '+feedback.message,'error');
+                          moveScheduleByDrag(sourceId,day,p.id);
+                        }}
+                        onClick={()=>{if(!p.isBreak && !dragSourceIdRef.current) handleCellClick(day,p.id,entity.id);}}>
+                        {p.isBreak ? <div className="h-full flex flex-col items-center justify-center text-slate-500 text-sm font-bold">พักเที่ยง{isDrop && <span className="text-xs text-rose-800 mt-1">✕ วางไม่ได้</span>}</div> : <>
+                          {content}
+                          {!content && !draggedScheduleId && !isScheduling && !editingRows && <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/cell:opacity-100 pointer-events-none transition-opacity"><div className="bg-blue-200 border border-blue-400 px-2 py-1 rounded-lg text-blue-900 flex items-center gap-1 font-bold text-xs"><Plus size={16}/> เพิ่มคาบ</div></div>}
+                          {isHovered && !draggedScheduleId && <span className="pointer-events-none absolute bottom-1 right-1 text-[10px] bg-blue-700 text-white rounded px-1.5 py-0.5 shadow">{day} · {p.name}</span>}
+                          {isDrop && <span className={`pointer-events-none absolute bottom-1 right-1 z-20 text-[10px] font-bold rounded px-1.5 py-1 shadow ${state==='allowed'?'bg-emerald-700 text-white':state==='confirm'?'bg-amber-600 text-white':'bg-rose-700 text-white'}`}>
+                            {state==='allowed'?'✓ วางได้':state==='confirm'?'! ต้องยืนยัน':'✕ วางไม่ได้'}
+                          </span>}
+                        </>}
+                      </td>;
+                    })}
+                  </tr>)}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ))}
       </div>
       <Modal isOpen={clearModalOpen} onClose={() => setClearModalOpen(false)} title="ล้างคาบที่ไม่ล็อก (ฉบับร่าง)">
         <div className="space-y-4 text-sm">
