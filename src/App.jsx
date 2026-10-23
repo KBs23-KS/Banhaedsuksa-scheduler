@@ -4695,7 +4695,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   const PrintPage = ({ id, mode }) => (
     <div className="bg-white p-10 rounded-xl border border-slate-200 text-black shadow-sm print-page mb-6">
       <div className="text-center mb-8 print-header">
-        {schoolSettings?.schoolLogoData && <img src={schoolSettings.schoolLogoData} alt="ตราโรงเรียน" className="mx-auto mb-2 object-contain print-school-logo" style={{width:'30mm',height:'30mm'}}/>}
+        {schoolSettings?.schoolLogoData && <img src={schoolSettings.schoolLogoData} alt="ตราโรงเรียน" className="mx-auto mb-2 object-contain print-school-logo" style={{width:'25mm',height:'25mm'}}/>}
         <h1 className="text-3xl font-bold mb-2">{String(schoolSettings?.schoolName || 'โรงเรียน')}</h1>
         <h2 className="text-xl mb-1">ตาราง{mode === 'room' ? 'เรียน' : 'สอน'} ภาคเรียนที่ {String(schoolSettings?.semester || '1')} ปีการศึกษา {String(schoolSettings?.academicYear || '2569')}</h2>
         <h3 className="text-lg font-bold">{mode === 'room' ? `ชั้น ${getClassroom(id).name}` : `ชื่อครูผู้สอน: ${getTeacher(id).name}`}</h3>
@@ -6363,26 +6363,26 @@ export default function App() {
         }
         #print-area .print-header {
           text-align: center !important; margin: 0 0 5mm !important;
-          line-height: 1.22 !important;
+          line-height: 1.4 !important;
         }
         #print-area .print-school-logo {
-          display: block !important; width: 30mm !important; height: 30mm !important;
+          display: block !important; width: 25mm !important; height: 25mm !important;
           object-fit: contain !important; margin: 0 auto 2mm !important;
         }
         #print-area .print-header h1 {
           font-size: 22.5pt !important; font-weight: 700 !important;
-          line-height: 1.22 !important; margin: 0 0 2mm !important;
+          line-height: 1.25 !important; margin: 0 0 2mm !important;
         }
         #print-area .print-header h2 {
-          font-size: 15pt !important; line-height: 1.22 !important;
+          font-size: 15pt !important; line-height: 1.4 !important;
           margin: 0 0 1mm !important;
         }
         #print-area .print-header h3 {
-          font-size: 13.5pt !important; line-height: 1.22 !important;
+          font-size: 13.5pt !important; line-height: 1.48 !important;
           margin: 0 !important;
         }
         #print-area .print-header p {
-          font-size: 12pt !important; line-height: 1.22 !important;
+          font-size: 12pt !important; line-height: 1.48 !important;
           margin: 0 !important;
         }
         #print-area .print-table {
@@ -6406,10 +6406,27 @@ export default function App() {
           font-size: 8.5pt !important; line-height: 1.15 !important;
         }
         #print-area .print-table tbody tr {
-          height: 15mm !important; break-inside: avoid !important;
+          height: 16mm !important; break-inside: avoid !important;
           page-break-inside: avoid !important;
         }
-        #print-area .print-table tbody td { height: 15mm !important; }
+        #print-area .print-table tbody td { height: 16mm !important; }
+        /* Printing: emphasize only the day/time headers, not the three-line cell content. */
+        #print-area .print-table thead th,
+        #print-area .print-table thead th div,
+        #print-area .print-table tbody tr > td:first-child {
+          font-weight: 700 !important;
+        }
+        #print-area .print-table tbody td:not(:first-child),
+        #print-area .print-table tbody td:not(:first-child) * {
+          font-weight: 400 !important;
+        }
+        #print-area .print-table tbody td:not(:first-child) div {
+          font-size: 8.5pt !important;
+          line-height: 1.45 !important;
+        }
+        #print-area .print-table tbody td:not(:first-child) .truncate + .truncate {
+          margin-top: 0.35mm !important;
+        }
         #print-area .print-table .truncate {
           overflow: visible !important; text-overflow: clip !important;
           white-space: normal !important;
