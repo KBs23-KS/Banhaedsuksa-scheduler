@@ -279,6 +279,22 @@ const SUBJECT_AREAS = [
 // STAGE 21 — PLC is a shared teacher-only reservation, NOT a teaching load.
 // Membership is calculated from the teachers' current subject area; a published copy
 // receives the subject-area catalog frozen at the time of publication.
+// Display-only teacher ordering; the original teacher ids and Firebase records are unchanged.
+const sortTeachersByArea = (list = []) => [...list].sort((a,b) => {
+  const ai=SUBJECT_AREAS.indexOf(a.subjectArea), bi=SUBJECT_AREAS.indexOf(b.subjectArea);
+  const aIndex=ai<=0?SUBJECT_AREAS.length:ai, bIndex=bi<=0?SUBJECT_AREAS.length:bi;
+  return aIndex-bIndex || String(a.name||'').localeCompare(String(b.name||''),'th');
+});
+const teacherAreaLabel = teacher => !teacher?.subjectArea || teacher.subjectArea==='ไม่มีกลุ่มสาระการเรียนรู้' ? 'ไม่มีกลุ่มสาระการเรียนรู้' : `กลุ่มสาระการเรียนรู้${teacher.subjectArea}`;
+// Native optgroups identify subject areas while keeping the teacher identifiers intact.
+const TeacherOptionsByArea = ({teachers=[]}) => {
+  const sorted=sortTeachersByArea(teachers);
+  const areas=[...new Set(sorted.map(t=>t.subjectArea||'ไม่มีกลุ่มสาระการเรียนรู้'))];
+  return <>{areas.map(area=><optgroup key={area} label={teacherAreaLabel({subjectArea:area})}>
+    {sorted.filter(t=>(t.subjectArea||'ไม่มีกลุ่มสาระการเรียนรู้')===area)
+      .map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+  </optgroup>)}</>;
+};
 const PLC_AREAS = SUBJECT_AREAS.filter(area => area !== 'ไม่มีกลุ่มสาระการเรียนรู้');
 const plcIdForArea = area => `PLC_${PLC_AREAS.indexOf(area)}`;
 const plcTeachersForArea = (area, teachers = []) => teachers.filter(t => t.subjectArea === area);
@@ -616,6 +632,71 @@ const suggestSingleSlotRepair = ({load,schedules,fixedSchedules,activityGroups,p
     if(proposals.length>=2) break;
   }
   return proposals;
+};
+
+// Read-only post-Auto assist. At most TWO unlocked, single-period lessons may move.
+// All intermediate placements obey normal Auto rules, even when manual baselines are exceptions.
+const findMissingLessonRepairs = ({schedules,teachingLoads,fixedSchedules,activityGroups,periods,
+    plcSessions=[],unavailabilities,classroomUnavailabilities,customRules,subjects,classrooms,teachers},
+    maxProposals=3) => {
+  const active=periods.filter(p=>!p.isBreak);
+  const locations=DAYS.flatMap(day=>active.map(p=>({day,periodId:p.id})));
+  const subjectMap=new Map(subjects.map(s=>[String(s.id),s]));
+  const missingLoads=teachingLoads.flatMap(load=>{
+    const required=Math.max(0,Number(load.periods)||0);
+    const match=x=>x.teacherId===load.teacherId && x.classroomId===load.classroomId && x.subjectId===load.subjectId;
+    const assigned=schedules.filter(match).length+fixedSchedules.filter(match).length;
+    return required>assigned?[{...load,missing:required-assigned}]:[];
+  });
+  const searchResults=[];
+  const proposalLimit=Math.max(12,maxProposals*6);
+  const baselineHealth=calculateScheduleHealth(schedules,teachingLoads,unavailabilities,classroomUnavailabilities,
+    fixedSchedules,teachers,subjects,classrooms,periods,customRules,activityGroups,plcSessions);
+  const issueCount=h=>['teacherConflicts','roomConflicts','plcConflicts','customRuleConflicts','blockConflicts','subjectDailyConflicts','teacherLimitConflicts'].reduce((n,key)=>n+(h[key]?.length||0),0);
+  const initialErrors=issueCount(baselineHealth);
+  const buildMaps=rows=>buildConstraintMaps(rows,unavailabilities,classroomUnavailabilities,
+    fixedSchedules,periods,customRules,activityGroups,classrooms,plcSessions,teachers);
+  const fits=(row,loc,rows)=>canPlaceSchedule(row.teacherId,row.classroomId,loc.day,loc.periodId,
+    buildMaps(rows),false,row.subjectId).ok;
+  const qualifies=x=>!isScheduleProtectedFromAuto(x) && Number(subjectMap.get(String(x.subjectId))?.periodBlock)!==2;
+  let evaluations=0;
+  for(const load of missingLoads) {
+    // A double-period course needs coupled placement/movement; do not break it into singles.
+    if(Number(subjectMap.get(String(load.subjectId))?.periodBlock)===2) continue;
+    for(const location of locations){
+      if(searchResults.length>=proposalLimit || evaluations>4500) break;
+      const blockers=schedules.filter(x=>x.day===location.day && String(x.periodId)===String(location.periodId) &&
+        (x.classroomId===load.classroomId || x.teacherId===load.teacherId));
+      if(blockers.length>2 || blockers.some(x=>!qualifies(x))) continue;
+      const base=schedules.filter(x=>!blockers.some(y=>y.id===x.id));
+      const insert={...load,id:'__bhs_repair_preview__',day:location.day,periodId:location.periodId,source:'auto',keepOnRegenerate:false};
+      evaluations++;
+      if(!fits(insert,location,base)) continue;
+      const relocate=(rows,remaining,moves)=>{
+        if(evaluations>4500)return;
+        if(!remaining.length){
+          // Final simulation: no dropped lessons, only listed unlocked moves and ONE new lesson.
+          const result=[...rows];
+          const health=calculateScheduleHealth(result,teachingLoads,unavailabilities,classroomUnavailabilities,
+            fixedSchedules,teachers,subjects,classrooms,periods,customRules,activityGroups,plcSessions);
+          if(issueCount(health)>initialErrors)return;
+          searchResults.push({load,location,moves,result,missingBefore:missingLoads.reduce((n,x)=>n+x.missing,0)});
+          return;
+        }
+        const [current,...rest]=remaining;
+        for(const loc of locations){
+          if(evaluations++>4500 || searchResults.length>=proposalLimit)return;
+          if(loc.day===current.day && String(loc.periodId)===String(current.periodId))continue;
+          if(!fits(current,loc,rows))continue;
+          relocate([...rows,{...current,day:loc.day,periodId:loc.periodId}],rest,
+            [...moves,{id:current.id,from:{day:current.day,periodId:current.periodId},to:loc,subjectId:current.subjectId,classroomId:current.classroomId,teacherId:current.teacherId}]);
+        }
+      };
+      relocate([...base,insert],blockers,[]);
+    }
+    if(searchResults.length>=proposalLimit || evaluations>4500)break;
+  }
+  return {missingLoads,proposals:searchResults.sort((a,b)=>a.moves.length-b.moves.length).slice(0,maxProposals),limited:evaluations>4500};
 };
 
 const SCHEDULE_VERSION_LIMIT = 10;
@@ -2100,6 +2181,42 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
 const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, fullDataForBackup, handleRestoreBackup }) => {
   const [form, setForm] = useState(schoolSettings);
   const fileInputRef = useRef(null);
+  const logoInputRef = useRef(null);
+  const [logoBusy,setLogoBusy] = useState(false);
+  // Keep transparent PNG in existing settings document (no new Firebase collection or Storage rules).
+  const handleLogoUpload = async event => {
+    const file=event.target.files?.[0];
+    event.target.value='';
+    if (!file) return;
+    if (file.type!=='image/png') return showToast('กรุณาใช้ตราโรงเรียนแบบ PNG พื้นหลังโปร่งใสเท่านั้น','error');
+    if (file.size>2*1024*1024) return showToast('รูปภาพต้นฉบับต้องไม่เกิน 2 MB','error');
+    setLogoBusy(true);
+    try {
+      const img=new Image();
+      const url=URL.createObjectURL(file);
+      try { await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url;}); }
+      finally { URL.revokeObjectURL(url); }
+      if (!img.naturalWidth || !img.naturalHeight) throw new Error('ไม่สามารถอ่านรูปภาพได้');
+      const edge=280, scale=Math.min(1,edge/Math.max(img.naturalWidth,img.naturalHeight));
+      const canvas=document.createElement('canvas');
+      canvas.width=Math.max(1,Math.round(img.naturalWidth*scale));
+      canvas.height=Math.max(1,Math.round(img.naturalHeight*scale));
+      const ctx=canvas.getContext('2d');
+      if(!ctx) throw new Error('เบราว์เซอร์ไม่รองรับการปรับขนาดรูปภาพ');
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.drawImage(img,0,0,canvas.width,canvas.height);
+      // Require at least one transparent pixel. PNG does not automatically imply a transparent background.
+      const pixels=ctx.getImageData(0,0,canvas.width,canvas.height).data;
+      let transparent=false;
+      for(let i=3;i<pixels.length;i+=4){if(pixels[i]<250){transparent=true;break;}}
+      if(!transparent) throw new Error('ไฟล์นี้ไม่มีพื้นที่โปร่งใส กรุณาใช้ PNG ที่ลบพื้นหลังแล้ว');
+      const data=canvas.toDataURL('image/png');
+      if(data.length>280000) throw new Error('ไฟล์ตราหลังปรับขนาดยังใหญ่เกินไป กรุณาลดรายละเอียดหรือขนาดภาพ');
+      setForm(prev=>({...prev,schoolLogoData:data}));
+      showToast('เลือกตราโรงเรียนแล้ว กรุณากดบันทึกการตั้งค่าเพื่อใช้งาน');
+    } catch(err) { showToast(err.message||'อ่านไฟล์ตราไม่สำเร็จ','error'); }
+    finally {setLogoBusy(false);}
+  };
   // Step 0: indicate a server-verified backup is in progress.
   const [isBackingUp, setIsBackingUp] = useState(false);
   useEffect(() => { setForm(schoolSettings); }, [schoolSettings]);
@@ -2179,6 +2296,16 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
         <h2 className="text-2xl font-bold text-[#081a39] mb-8 flex items-center gap-3"><div className="p-2 bg-[#081a39] rounded-lg shadow-md"><Settings className="text-[#d4af37]"/></div> ตั้งค่าระบบหลัก</h2>
         <div className="space-y-6">
           <div><label className="block text-sm font-bold text-[#081a39] mb-2">ชื่อโรงเรียน</label><input type="text" value={form.schoolName || ''} onChange={e => setForm({...form, schoolName: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#081a39] bg-slate-50 focus:bg-white" /></div>
+          <div className="border border-slate-200 rounded-xl p-4 space-y-3">
+            <label className="block font-bold text-sm text-[#081a39]">ตราโรงเรียนสำหรับพิมพ์เอกสาร</label>
+            <div className="flex items-center gap-4 flex-wrap">
+              {form.schoolLogoData ? <img src={form.schoolLogoData} alt="ตัวอย่างตราโรงเรียน" className="h-20 w-20 object-contain"/> : <span className="w-20 h-20 border border-dashed rounded-xl grid place-items-center text-xs text-slate-500">ยังไม่มีตรา</span>}
+              <button type="button" disabled={logoBusy} onClick={()=>logoInputRef.current?.click()} className="border rounded-xl p-3 font-semibold bg-slate-50 disabled:opacity-50">{logoBusy?'กำลังอ่านรูปภาพ...':'อัปโหลด PNG พื้นหลังโปร่งใส'}</button>
+              {form.schoolLogoData && <button type="button" onClick={()=>setForm(prev=>({...prev,schoolLogoData:''}))} className="border rounded-xl p-3 text-rose-700">ลบตรา</button>}
+              <input ref={logoInputRef} type="file" accept="image/png" className="hidden" onChange={handleLogoUpload}/>
+            </div>
+            <p className="text-xs text-slate-500">แสดงตราขนาดเล็กกึ่งกลางเหนือชื่อโรงเรียนในเอกสารทุกชุด · เก็บในตั้งค่าระบบเดิม · กดบันทึกการตั้งค่าหลังเพิ่ม/ลบรูป</p>
+          </div>
           <div className="grid grid-cols-2 gap-6 p-4 bg-amber-50 rounded-xl border border-amber-100">
             <div className="col-span-2"><p className="text-xs font-bold text-amber-600 mb-2">* ข้อมูลตารางสอนจะแยกตามภาคเรียน หากแก้ไขค่าด้านล่างระบบจะเปลี่ยนไปโหลดข้อมูลใหม่ทันที</p></div>
             <div><label className="block text-sm font-bold text-[#081a39] mb-2">ภาคเรียนที่</label><select value={form.semester || '1'} onChange={e => setForm({...form, semester: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#081a39] bg-white font-bold"><option value="1">ภาคเรียนที่ 1</option><option value="2">ภาคเรียนที่ 2</option></select></div>
@@ -2205,7 +2332,7 @@ const TeachersView = ({ teachers, dbAction, showToast, handleRequestDelete }) =>
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [form, setForm] = useState({ id: '', name: '', subjectArea: 'ไม่มีกลุ่มสาระการเรียนรู้' });
   const [isEditing, setIsEditing] = useState(false);
-  const { items: sortedTeachers, requestSort, sortConfig } = useSortableData(teachers);
+  const { items: sortedTeachers, requestSort, sortConfig } = useSortableData(sortTeachersByArea(teachers));
 
   const saveForm = async () => {
     if (!form.id || !form.name) return showToast("กรอกข้อมูลให้ครบ", "error");
@@ -2502,7 +2629,9 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
     classroomSortKey: (getClassroom(load.classroomId).name || '').replace(/\d+/g, digits => digits.padStart(5, '0')),
     periods: Number(load.periods) || 0
   }));
-  const { items: sortedLoadRows, requestSort: sortLoads, sortConfig: loadSortConfig } = useSortableData(loadDisplayRows, { key: 'teacherName', direction: 'asc' });
+  const subjectAreaTeacherIds=sortTeachersByArea(teachers).map(t=>t.id);
+  const loadRowsByArea=[...loadDisplayRows].sort((a,b)=>(subjectAreaTeacherIds.indexOf(a.load.teacherId)<0?999:subjectAreaTeacherIds.indexOf(a.load.teacherId))-(subjectAreaTeacherIds.indexOf(b.load.teacherId)<0?999:subjectAreaTeacherIds.indexOf(b.load.teacherId)) || a.subjectName.localeCompare(b.subjectName,'th'));
+  const { items: sortedLoadRows, requestSort: sortLoads, sortConfig: loadSortConfig } = useSortableData(loadRowsByArea);
   const displayedLoadRows = selectedTeacherId === 'all'
     ? sortedLoadRows : sortedLoadRows.filter(row => row.load.teacherId === selectedTeacherId);
   const displayedPeriods = displayedLoadRows.reduce((sum, row) => sum + row.periods, 0);
@@ -2782,13 +2911,13 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
          <div className="px-4 py-4 border-b border-slate-100 flex flex-wrap gap-4 items-end justify-between">
            <div className="flex flex-wrap gap-3 items-end">
              <label className="text-sm font-bold text-[#081a39]">ดูภาระสอน
-               <select value={selectedTeacherId === 'all' ? 'all' : 'one'} onChange={e=>setSelectedTeacherId(e.target.value === 'all' ? 'all' : (teachers[0]?.id || 'all'))} className="block mt-1 p-2.5 border border-slate-200 rounded-lg min-w-[150px] bg-white">
+               <select value={selectedTeacherId === 'all' ? 'all' : 'one'} onChange={e=>setSelectedTeacherId(e.target.value === 'all' ? 'all' : (sortTeachersByArea(teachers)[0]?.id || 'all'))} className="block mt-1 p-2.5 border border-slate-200 rounded-lg min-w-[150px] bg-white">
                  <option value="all">ครูทั้งหมด</option><option value="one">รายบุคคล</option>
                </select>
              </label>
              {selectedTeacherId !== 'all' && <label className="text-sm font-bold text-[#081a39]">เลือกครู
                <select value={selectedTeacherId} onChange={e=>setSelectedTeacherId(e.target.value)} className="block mt-1 p-2.5 border border-slate-200 rounded-lg min-w-[220px] bg-white">
-                 {teachers.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+                 <TeacherOptionsByArea teachers={teachers}/>
                </select>
              </label>}
            </div>
@@ -2819,7 +2948,7 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
       </div>
       <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={isEditing ? "แก้ไขภาระการสอน" : "เพิ่มภาระการสอน"}>
         <div className="space-y-4">
-          <div><label className="block text-sm font-bold text-[#081a39] mb-1">ครูผู้สอน</label><select value={form.teacherId} onChange={e => setForm({...form, teacherId: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
+          <div><label className="block text-sm font-bold text-[#081a39] mb-1">ครูผู้สอน</label><select value={form.teacherId} onChange={e => setForm({...form, teacherId: e.target.value})} className="w-full p-3 border border-slate-200 rounded-xl bg-slate-50"><option value="">-- เลือกครูผู้สอน --</option><TeacherOptionsByArea teachers={teachers}/></select></div>
           <div><label className="block text-sm font-bold text-[#081a39] mb-1">รายวิชา</label>
             <select value={createNewSubject ? '__CREATE_NEW_SUBJECT__' : form.subjectId} onChange={e => {
               if (e.target.value === '__CREATE_NEW_SUBJECT__') { setCreateNewSubject(true); setForm(prev => ({ ...prev, subjectId: '' })); }
@@ -3025,7 +3154,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
           <h2 className="text-lg font-bold text-[#081a39] mb-4 flex items-center gap-2">เพิ่มข้อมูลใหม่</h2>
           {activeSubTab === 'teacher' && (
             <div className="space-y-4">
-              <select value={tForm.teacherId} onChange={e => setTForm({...tForm, teacherId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+              <select value={tForm.teacherId} onChange={e => setTForm({...tForm, teacherId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50"><option value="">-- เลือกครูผู้สอน --</option><TeacherOptionsByArea teachers={teachers}/></select>
               <div className="grid grid-cols-2 gap-3"><select value={tForm.day} onChange={e => setTForm({...tForm, day: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50">{DAYS.map(d => <option key={d} value={d}>{d}</option>)}</select><select value={tForm.periodId} onChange={e => setTForm({...tForm, periodId: e.target.value})} className="w-full p-3 border rounded-xl bg-slate-50">{periods.filter(p=>!p.isBreak).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
               <button onClick={() => handleAdd('teacher')} className="w-full bg-[#081a39] text-white py-3 rounded-xl font-bold">บันทึก</button>
             </div>
@@ -3076,7 +3205,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
                 <div className="flex flex-wrap items-center justify-between gap-2"><strong className="text-sm">ครูผู้รับผิดชอบ ({fForm.teacherIds.length} คน)</strong>
                   <div className="flex gap-3 text-xs"><button type="button" className="underline text-indigo-700" onClick={()=>setFForm(old=>({...old,teacherIds:teachers.map(t=>t.id)}))}>เลือกครูทั้งหมด</button>
                     <button type="button" className="underline text-rose-700" onClick={()=>setFForm(old=>({...old,teacherIds:[]}))}>ล้างการเลือก</button></div></div>
-                <div className="max-h-44 overflow-auto grid grid-cols-1 sm:grid-cols-2 gap-1">{teachers.map(t=><label key={t.id} className="text-xs flex items-center gap-2 p-1">
+                <div className="max-h-44 overflow-auto grid grid-cols-1 sm:grid-cols-2 gap-1">{sortTeachersByArea(teachers).map(t=><label key={t.id} className="text-xs flex items-center gap-2 p-1">
                   <input type="checkbox" checked={fForm.teacherIds.includes(t.id)} onChange={e=>setFForm(old=>({...old,teacherIds:e.target.checked?[...old.teacherIds,t.id]:old.teacherIds.filter(id=>id!==t.id)}))}/>{t.name}</label>)}</div>
                 <p className="text-xs text-slate-500">กิจกรรมแสดงในตารางครูที่เลือกทุกคน โดยนับคาบกิจกรรมเพียงคนละหนึ่งครั้ง</p>
               </div>
@@ -3120,7 +3249,7 @@ const ConstraintsView = ({ activityGroups, unavailabilities, classroomUnavailabi
                     {editingFixedTeachers===f.id && <div className="mt-3 border border-indigo-200 bg-indigo-50 rounded-xl p-3 space-y-2">
                       <div className="flex gap-4 text-xs"><button type="button" onClick={()=>setFixedTeacherDraft(teachers.map(t=>t.id))} className="underline">เลือกทั้งหมด</button>
                         <button type="button" onClick={()=>setFixedTeacherDraft([])} className="underline">ล้างการเลือก</button></div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 max-h-44 overflow-y-auto gap-1">{teachers.map(t=><label key={t.id} className="text-xs flex items-center gap-2">
+                      <div className="grid grid-cols-1 md:grid-cols-2 max-h-44 overflow-y-auto gap-1">{sortTeachersByArea(teachers).map(t=><label key={t.id} className="text-xs flex items-center gap-2">
                         <input type="checkbox" checked={fixedTeacherDraft.includes(t.id)} onChange={e=>setFixedTeacherDraft(old=>e.target.checked?[...old,t.id]:old.filter(id=>id!==t.id))}/>{t.name}</label>)}</div>
                       <div className="flex gap-2"><button type="button" className="bg-indigo-800 text-white rounded-lg px-3 py-2 text-xs" onClick={()=>saveExistingFixedTeachers(f)}>บันทึกครู</button>
                       <button type="button" className="bg-white border rounded-lg px-3 py-2 text-xs" onClick={()=>setEditingFixedTeachers('')}>ยกเลิก</button></div>
@@ -3319,7 +3448,7 @@ const ActivityGroupsView = ({activityGroups, fixedSchedules, classrooms, teacher
       <select className="w-full border rounded-xl p-3" value={form.fixedId} onChange={e=>setForm({...form,fixedId:e.target.value})}><option value="">-- เลือกกิจกรรมหลักที่ล็อกทุกห้อง --</option>{roots.map(f=><option key={f.id} value={f.id}>{f.day} คาบ {f.periodId} · {fixedActivityDisplayName(f,getSubject)}</option>)}</select>
       <select className="w-full border rounded-xl p-3" value={form.classroomId} onChange={e=>setForm({...form,classroomId:e.target.value})}><option value="">-- เลือกห้องเรียน --</option>{classrooms.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
       <input className="w-full border rounded-xl p-3" placeholder="ชื่อกิจกรรม เช่น ชุมนุมดนตรี" value={form.name} onChange={e=>setForm({...form,name:e.target.value})}/>
-      <select className="w-full border rounded-xl p-3" value={form.teacherId} onChange={e=>setForm({...form,teacherId:e.target.value})}><option value="">-- ครูผู้รับผิดชอบ (ไม่ระบุได้) --</option>{teachers.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select>
+      <select className="w-full border rounded-xl p-3" value={form.teacherId} onChange={e=>setForm({...form,teacherId:e.target.value})}><option value="">-- ครูผู้รับผิดชอบ (ไม่ระบุได้) --</option><TeacherOptionsByArea teachers={teachers}/></select>
       <button onClick={save} disabled={busy||!roots.length||!rulesReady} className="px-6 py-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">บันทึกกิจกรรมกลุ่ม</button>
     </div>
     <div className="bg-white rounded-2xl p-5 border space-y-3"><h3 className="font-bold">รายการกิจกรรมย่อย ({activityGroups.length})</h3>
@@ -3615,7 +3744,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
   const teacherActivitySlots = useMemo(() => activityTeacherEntries(activityGroups,fixedSchedules), [activityGroups,fixedSchedules]);
   const teacherPLCSlots = useMemo(() => buildPLCReservations(plcSessions,teachers), [plcSessions,teachers]);
   const displayedEntities = useMemo(() => {
-    const source = viewMode === 'room' ? classrooms : teachers;
+    const source = viewMode === 'room' ? classrooms : sortTeachersByArea(teachers);
     return selectedId === ALL_TIMETABLE_VIEW_ID ? source : source.filter(item => item.id === selectedId);
   }, [viewMode, selectedId, classrooms, teachers]);
   const clearDragVisuals = () => {
@@ -3627,12 +3756,20 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
   };
   useEffect(() => { if (initialRoomId) { setViewMode('room'); setSelectedId(initialRoomId); } }, [initialRoomId]);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
-  const [feasibility, setFeasibility] = useState(null);
+  const [repairResults,setRepairResults] = useState(null);
+  const [repairWorking,setRepairWorking] = useState(false);
+  useEffect(()=>{setRepairResults(null);},[schoolSettings.academicYear,schoolSettings.semester]);
   const [editingRows,setEditingRows] = useState(false);
   const [clearModalOpen,setClearModalOpen] = useState(false);
   const [clearRoomId,setClearRoomId] = useState('');
   const resetPreview = useMemo(() => planUnlockedScheduleClear(schedules, clearRoomId), [schedules, clearRoomId]);
   const [addForm, setAddForm] = useState({ teacherId: '', subjectId: '', classroomId: '', day: 'จันทร์', periodId: '1' });
+  const availableRoomTeachers = useMemo(() => {
+    if (viewMode !== 'room' || !addForm.classroomId) return sortTeachersByArea(teachers);
+    const ids=new Set(teachingLoads.filter(l=>l.classroomId===addForm.classroomId && Number(l.periods)>0).map(l=>l.teacherId));
+    return sortTeachersByArea(teachers).filter(t=>ids.has(t.id));
+  },[viewMode,addForm.classroomId,teachingLoads,teachers]);
+
 
   // จำกัดรายวิชาในหน้าต่างเพิ่มตารางสอนด้วยมือ ให้ตรงตามภาระสอนของครู/ห้องที่เลือก
   const availableManualSubjects = useMemo(() => {
@@ -3704,11 +3841,58 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     setIsAddModalOpen(true);
   };
 
-  const handleFeasibilityClick = () => {
-    if (!rulesReady) return showToast('ยังโหลดเงื่อนไขเพิ่มเติมไม่สำเร็จ กรุณาลองใหม่', 'error');
-    setFeasibility(analyzeScheduleFeasibility({ teachingLoads, teachers, subjects:activeSubjects,
-      classrooms, periods, schedules, fixedSchedules, unavailabilities,
-      classroomUnavailabilities, customRules, semester:schoolSettings.semester, activityGroups, plcSessions }));
+  const repairArgs=()=>({schedules,teachingLoads,fixedSchedules,activityGroups,periods,
+    plcSessions,unavailabilities,classroomUnavailabilities,customRules,subjects:activeSubjects,classrooms,teachers});
+  const handleRepairAnalysis=()=>{
+    if(!rulesReady || isScheduling || editingRows)return showToast('กรุณารอให้ข้อมูลและเงื่อนไขโหลดครบก่อน','error');
+    setRepairWorking(true);
+    try {setRepairResults(findMissingLessonRepairs(repairArgs()));}
+    catch(error){console.error('Repair analysis failed',error);showToast('วิเคราะห์คาบที่ขาดไม่สำเร็จ กรุณาตรวจข้อมูล','error');}
+    finally{setRepairWorking(false);}
+  };
+  const confirmRepair=async proposal=>{
+    if(isScheduling || editingRows || repairWorking)return;
+    const lines=proposal.moves.map(m=>{
+      const subject=getSubject(m.subjectId)?.name||m.subjectId;
+      return `ย้าย ${subject} ห้อง ${getClassroom(m.classroomId).name} วัน${m.from.day} ${getPeriodDisplayName(periods,m.from.periodId)} → วัน${m.to.day} ${getPeriodDisplayName(periods,m.to.periodId)}`;
+    });
+    lines.push(`เพิ่ม ${getSubject(proposal.load.subjectId).name} ห้อง ${getClassroom(proposal.load.classroomId).name} วัน${proposal.location.day} ${getPeriodDisplayName(periods,proposal.location.periodId)}`);
+    if(!window.confirm(`ยืนยันวิธีช่วยจัดคาบที่ขาดนี้หรือไม่?\n\n${lines.join('\n')}\n\nคาบล็อกจะไม่ถูกย้าย และระบบจะตรวจตารางใหม่ก่อนบันทึก`))return;
+    setEditingRows(true);
+    try {
+      const termPath=`school_data/${appId}/terms/${getTermKey(schoolSettings)}`;
+      const schedulePath=`${termPath}/schedules`;
+      const serverSnap=await getDocsFromServer(collection(db,schedulePath));
+      const liveRows=serverSnap.docs.map(d=>({...d.data(),id:d.id}));
+      if(fingerprintScheduleRows(liveRows)!==fingerprintScheduleRows(schedules)) throw new Error('ตารางเปลี่ยนจากเครื่องอื่น กรุณาวิเคราะห์ใหม่');
+      const fresh=findMissingLessonRepairs({...repairArgs(),schedules:liveRows});
+      const same=fresh.proposals.find(candidate=>candidate.load.id===proposal.load.id &&
+        candidate.location.day===proposal.location.day && String(candidate.location.periodId)===String(proposal.location.periodId) &&
+        JSON.stringify(candidate.moves.map(m=>[m.id,m.to.day,String(m.to.periodId)]))===
+        JSON.stringify(proposal.moves.map(m=>[m.id,m.to.day,String(m.to.periodId)])));
+      if(!same) throw new Error('ข้อเสนอไม่ตรงกับตารางล่าสุด กรุณาวิเคราะห์ใหม่');
+      const snapshotId=saveScheduleVersion?await saveScheduleVersion('before_repair_missing_lessons'):true;
+      if(!snapshotId)throw new Error('บันทึกประวัติก่อนช่วยจัดคาบไม่สำเร็จ');
+      // Transaction checks every existing schedule row, then writes all changes together.
+      // No partially applied move may be persisted.
+      const createRef=doc(collection(db,schedulePath));
+      await runTransaction(db,async tx=>{
+        const reads=await Promise.all(liveRows.map(row=>tx.get(doc(db,schedulePath,row.id))));
+        if(reads.some((snap,i)=>!snap.exists() || stableSerializeData(snap.data())!==stableSerializeData(serverSnap.docs.find(d=>d.id===liveRows[i].id).data())))
+          throw new Error('ตารางเปลี่ยนก่อนบันทึก กรุณาวิเคราะห์ใหม่');
+        same.moves.forEach(m=>{
+          const old=liveRows.find(x=>x.id===m.id);
+          if(!old || isScheduleProtectedFromAuto(old))throw new Error('คาบที่เสนอเปลี่ยนสถานะล็อกแล้ว');
+          tx.update(doc(db,schedulePath,m.id),{day:m.to.day,periodId:m.to.periodId});
+        });
+        tx.set(createRef,{id:createRef.id,teacherId:same.load.teacherId,subjectId:same.load.subjectId,
+          classroomId:same.load.classroomId,day:same.location.day,periodId:same.location.periodId,
+          source:'auto',keepOnRegenerate:false});
+      });
+      setRepairResults(null);
+      showToast(`ช่วยจัดคาบที่ขาดเพิ่มได้ 1 คาบ โดยย้าย ${same.moves.length} คาบที่ไม่ล็อก`);
+    }catch(error){console.error('Repair apply failed',error);showToast(`บันทึกวิธีสลับไม่ได้: ${translateUserMessage(error)}`,'error');}
+    finally{setEditingRows(false);}
   };
 
   const handleManualAdd = async () => {
@@ -3919,13 +4103,13 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
           <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId(''); setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">ตารางเรียน (รายห้อง)</option><option value="teacher">ตารางสอน (รายครู)</option></select>
-          <select value={selectedId} onChange={e => {setSelectedId(e.target.value);setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option><option value={ALL_TIMETABLE_VIEW_ID}>{viewMode === 'room' ? `ทุกห้องเรียน (${classrooms.length} ห้อง)` : `ครูทั้งหมด (${teachers.length} คน)`}</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+          <select value={selectedId} onChange={e => {setSelectedId(e.target.value);setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option><option value={ALL_TIMETABLE_VIEW_ID}>{viewMode === 'room' ? `ทุกห้องเรียน (${classrooms.length} ห้อง)` : `ครูทั้งหมด (${teachers.length} คน)`}</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers}/>}</select>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button onClick={handleFeasibilityClick} disabled={isScheduling || !rulesReady} className="flex items-center gap-2 px-4 py-3 bg-slate-100 text-[#081a39] border border-slate-200 rounded-xl font-bold disabled:opacity-50"><Search size={17}/> ตรวจความเป็นไปได้</button>
           <button type="button" onClick={() => { setClearRoomId(''); setClearModalOpen(true); }} disabled={isScheduling || editingRows || !rulesReady || !schedules.length} className="flex items-center gap-2 px-4 py-3 border border-rose-200 bg-white text-rose-700 rounded-xl font-bold hover:bg-rose-50 disabled:opacity-50"><Trash2 size={17}/> ล้างคาบไม่ล็อก</button>
         <button onClick={publishDraftSchedule} disabled={isScheduling||!rulesReady} className="flex items-center gap-2 px-4 py-3 bg-emerald-700 text-white rounded-xl font-bold disabled:opacity-50">ประกาศใช้ฉบับร่าง</button>
         <button onClick={runSmartSchedule} disabled={isScheduling} className={`flex items-center gap-2 px-6 py-3 text-white rounded-xl shadow-md font-bold transition-all ${isScheduling ? 'bg-slate-400 cursor-not-allowed' : 'bg-gradient-to-r from-[#d4af37] to-[#b8952b] hover:shadow-lg'}`}><RefreshCw size={18} className={isScheduling ? "animate-spin" : ""} /> {isScheduling ? "กำลังจัดตาราง (AI)..." : "จัดตารางอัตโนมัติ"}</button>
+        <button type="button" onClick={handleRepairAnalysis} disabled={isScheduling || editingRows || repairWorking || !rulesReady || !schedules.length} title="ค้นหาวิธีจัดคาบที่ขาด โดยย้ายคาบไม่ล็อกสูงสุด 2 คาบต่อวิธี" className="flex items-center gap-2 px-4 py-3 border border-blue-200 bg-blue-50 text-blue-900 rounded-xl font-bold hover:bg-blue-100 disabled:opacity-50"><Search size={18}/> {repairWorking?'กำลังวิเคราะห์...':'ช่วยจัดคาบที่ขาด'}</button>
         </div>
       </div>
       <div className="text-xs text-slate-600">กำลังแก้ไข: <strong>ฉบับร่าง</strong> · {publishedLoading?'กำลังตรวจฉบับประกาศ...':publishedError||(
@@ -4036,21 +4220,28 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
           </div>
         </div>
       </Modal>
-      <Modal isOpen={!!feasibility} onClose={() => setFeasibility(null)} title="วิเคราะห์ความเป็นไปได้ก่อนจัดตาราง">
-        {feasibility && <div className="space-y-4 text-sm">
-          <p className="text-slate-700">ภาระสอน {feasibility.totalRequired} คาบ · {feasibility.teacherCount} ครู · {feasibility.roomCount} ห้อง · {feasibility.activePeriods} คาบเรียนต่อวัน</p>
-          {feasibility.invalidInputs.length > 0 ? <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg"><strong>ข้อมูลต้องแก้ก่อนจัดตาราง</strong><ul className="list-disc pl-5 mt-2 space-y-1">{feasibility.invalidInputs.map((msg,i)=><li key={i}>{msg}</li>)}</ul></div> :
-           feasibility.blocking.length > 0 ? <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg"><strong>พบข้อจำกัดด้านความจุที่ทำให้จัดครบไม่ได้</strong><ul className="list-disc pl-5 mt-2 space-y-1">{feasibility.blocking.map((msg,i)=><li key={i}>{msg}</li>)}</ul></div> :
-           <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg font-medium text-emerald-800">ยังไม่พบข้อจำกัดด้านความจุที่ยืนยันว่าจัดไม่ครบ</div>}
-          {feasibility.advisories.length > 0 && <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg"><strong>ข้อสังเกตเพิ่มเติม</strong><ul className="list-disc pl-5 mt-2 space-y-1">{feasibility.advisories.map((msg,i)=><li key={i}>{msg}</li>)}</ul></div>}
-          <p className="text-slate-500">การวิเคราะห์นี้เป็นการคัดกรองเบื้องต้น ไม่ใช่การทดลองแก้โจทย์ครบทุกความเป็นไปได้ และไม่รับประกันว่าการจัดตารางอัตโนมัติจะจัดได้ครบ</p>
-          <button onClick={()=>setFeasibility(null)} className="w-full p-3 bg-[#081a39] text-white rounded-xl font-bold">ปิดรายงาน</button>
+      <Modal isOpen={!!repairResults} onClose={()=>setRepairResults(null)} title="ช่วยจัดคาบที่ขาด — เสนอวิธีสลับคาบ">
+        {repairResults && <div className="space-y-4 text-sm max-h-[65vh] overflow-y-auto">
+          <p className="text-slate-700">พบภาระสอนยังขาด {repairResults.missingLoads.reduce((n,l)=>n+l.missing,0)} คาบ · ค้นหาวิธีเพิ่ม 1 คาบต่อครั้ง โดยย้ายคาบ Auto ที่ไม่ล็อกไม่เกิน 2 คาบ</p>
+          {!!repairResults.missingLoads.length && <div className="p-3 rounded-xl bg-slate-50 border space-y-1"><strong>รายวิชาที่ยังขาด</strong>
+            {repairResults.missingLoads.map(l=><p key={l.id}>{getSubject(l.subjectId).name} · {getClassroom(l.classroomId).name} · {getTeacher(l.teacherId).name} — ขาด {l.missing} คาบ</p>)}
+          </div>}
+          {!repairResults.missingLoads.length && <p className="p-3 rounded-lg bg-emerald-50 text-emerald-900">ภาระสอนครบแล้ว ไม่จำเป็นต้องสลับคาบ</p>}
+          {repairResults.proposals.map((item,i)=><div key={i} className="border border-blue-200 rounded-xl p-3 space-y-2">
+            <strong className="text-blue-900">วิธีที่ {i+1}: ย้าย {item.moves.length} คาบ · เติมได้ 1 คาบ</strong>
+            {item.moves.map(m=><p key={m.id}>ย้าย {getSubject(m.subjectId).name} ห้อง {getClassroom(m.classroomId).name}: วัน{m.from.day} {getPeriodDisplayName(periods,m.from.periodId)} → วัน{m.to.day} {getPeriodDisplayName(periods,m.to.periodId)}</p>)}
+            <p className="text-emerald-800 font-semibold">+ เพิ่ม {getSubject(item.load.subjectId).name} ห้อง {getClassroom(item.load.classroomId).name}: วัน{item.location.day} {getPeriodDisplayName(periods,item.location.periodId)}</p>
+            <button type="button" disabled={editingRows || isScheduling} onClick={()=>confirmRepair(item)} className="w-full p-3 rounded-xl bg-[#081a39] text-white font-bold disabled:opacity-50">ตรวจสอบและยืนยันวิธีนี้</button>
+          </div>)}
+          {!!repairResults.missingLoads.length && !repairResults.proposals.length && <p className="p-3 bg-amber-50 border border-amber-200 rounded-lg">ไม่พบวิธีที่ผ่านเงื่อนไขในขอบเขตการค้นหานี้ (0–2 คาบ) อาจมีคาบคู่หรือข้อจำกัดที่ต้องแก้ด้วยมือ ไม่ได้หมายความว่าไม่มีวิธีอื่นเลย</p>}
+          {repairResults.limited && <p className="text-xs text-amber-800">จำกัดจำนวนทางเลือกที่ทดลอง เพื่อไม่ให้หน้าเว็บค้าง</p>}
+          <p className="text-xs text-slate-500">ไม่ย้ายคาบล็อก · รักษาข้อบังคับ Auto · ยังไม่เปลี่ยนตารางจนกว่าจะยืนยัน · บันทึกประวัติก่อนเปลี่ยน</p>
         </div>}
       </Modal>
       <Modal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} title="เพิ่มตารางสอน (รายคาบ)">
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">วัน</label><input value={addForm.day} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div><div><label className="block text-sm font-bold mb-1">คาบที่</label><input value={periods.find(p=>p.id===addForm.periodId)?.name} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div></div>
-          <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm(prev => ({ ...prev, teacherId: e.target.value, subjectId: '' }))} disabled={viewMode === 'teacher'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option>{teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
+          <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm(prev => ({ ...prev, teacherId: e.target.value, subjectId: '' }))} disabled={viewMode === 'teacher'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option><TeacherOptionsByArea teachers={availableRoomTeachers}/></select>{viewMode==='room' && addForm.classroomId && <p className="text-xs text-slate-500 mt-1">ครูที่มีภาระสอนห้องนี้ {availableRoomTeachers.length} คน</p>}</div>
           <div><label className="block text-sm font-bold mb-1">รายวิชา</label><select value={addForm.subjectId} onChange={e => setAddForm({...addForm, subjectId: e.target.value})} disabled={!addForm.teacherId || selectableManualSubjects.length === 0} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">{!addForm.teacherId ? '-- กรุณาเลือกครูผู้สอนก่อน --' : availableManualSubjects.length === 0 ? '-- ไม่พบรายวิชาในภาระสอน --' : selectableManualSubjects.length === 0 ? '-- รายวิชาของครู/ห้องนี้จัดครบแล้ว --' : '-- เลือกรายวิชา --'}</option>{availableManualSubjects.map(s => <option key={s.id} value={s.id} disabled={!!s.isComplete}>{s.optionLabel}</option>)}</select>{addForm.teacherId && availableManualSubjects.length === 0 && <p role="status" className="text-sm text-amber-700 mt-2">{addForm.classroomId ? 'ไม่พบภาระสอนสำหรับครูและห้องเรียนนี้' : 'ไม่พบภาระสอนสำหรับครูคนนี้'} กรุณาตรวจสอบเมนูภาระสอน</p>}{addForm.teacherId && addForm.classroomId && availableManualSubjects.length > 0 && selectableManualSubjects.length === 0 && <p role="status" className="text-sm text-emerald-700 mt-2">รายวิชาในภาระสอนของครูและห้องนี้จัดครบทุกคาบแล้ว</p>}</div>
           <div><label className="block text-sm font-bold mb-1">ห้องเรียน</label>
             <select value={addForm.classroomId} onChange={e => handleManualRoomChange(e.target.value)} disabled={viewMode === 'room'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100">
@@ -4385,7 +4576,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
           <table className="w-full text-left text-sm">
             <thead className="bg-[#081a39] text-white"><tr><th className="p-3">ชื่อครู</th><th className="p-3 text-center">ภาระสอน</th><th className="p-3 text-center">จัดสอน</th><th className="p-3 text-center">กิจกรรม/คาบล็อก</th><th className="p-3 text-center">PLC</th><th className="p-3 text-center">รวมภาระจริง</th><th className="p-3 text-center">วันที่ภาระรวม 4–5 คาบ</th><th className="p-3 text-center">สถานะ</th><th className="p-3 text-center">Gap</th><th className="p-3 text-center">ติดกันสูงสุด</th><th className="p-3 text-center">การกระจาย จ–ศ</th></tr></thead>
             <tbody>
-              {teachers.map((t, i) => {
+              {sortTeachersByArea(teachers).map((t, i) => {
                 const st = health.teacherStats[t.id] || { req: 0, sch: 0, gaps: 0, maxConsec: 0 };
                 return (
                   <tr key={i} className="border-b hover:bg-slate-50">
@@ -4504,9 +4695,11 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   const PrintPage = ({ id, mode }) => (
     <div className="bg-white p-10 rounded-xl border border-slate-200 text-black shadow-sm print-page mb-6">
       <div className="text-center mb-8 print-header">
+        {schoolSettings?.schoolLogoData && <img src={schoolSettings.schoolLogoData} alt="ตราโรงเรียน" className="mx-auto mb-2 object-contain print-school-logo" style={{width:'16mm',height:'16mm'}}/>}
         <h1 className="text-3xl font-bold mb-2">{String(schoolSettings?.schoolName || 'โรงเรียน')}</h1>
         <h2 className="text-xl mb-1">ตาราง{mode === 'room' ? 'เรียน' : 'สอน'} ภาคเรียนที่ {String(schoolSettings?.semester || '1')} ปีการศึกษา {String(schoolSettings?.academicYear || '2569')}</h2>
         <h3 className="text-lg font-bold">{mode === 'room' ? `ชั้น ${getClassroom(id).name}` : `ชื่อครูผู้สอน: ${getTeacher(id).name}`}</h3>
+        {mode==='teacher' && <p className="text-base">{teacherAreaLabel(getTeacher(id))}</p>}
       </div>
       <table className="w-full text-left border-collapse border-2 border-black mb-12 print-table table-fixed">
         <thead><tr><th className="border-2 border-black p-3 text-center text-sm w-24 font-bold">วัน/เวลา</th>{periods.map(p => <th key={p.id} className="border-2 border-black p-2 text-center text-xs"><div className="font-bold">{p.name}</div><div className="font-normal text-[11px]">{p.start}-{p.end}</div></th>)}</tr></thead>
@@ -4530,7 +4723,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId('');}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">พิมพ์ตารางเรียน (รายห้อง)</option><option value="teacher">พิมพ์ตารางสอน (รายครู)</option></select>
         <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium">
           <option value="">-- เลือกเพื่อดูตัวอย่างพิมพ์ --</option><option value="ALL_PRINT" className="font-bold text-[#081a39]">-- พิมพ์ทั้งหมด --</option>
-          {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : teachers.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : sortTeachersByArea(teachers).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
         </select>
         <select value={printMode} onChange={e=>{setPrintMode(e.target.value);setSelectedId('');}} className="border rounded-xl p-3 font-bold">
           <option value="draft">พิมพ์ฉบับร่าง</option>{publishedSnapshot&&<option value="published">พิมพ์ฉบับประกาศใช้</option>}
@@ -4546,7 +4739,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
       {publishedLoading&&<p className="no-print mb-4 text-xs text-blue-800 bg-blue-50 p-3 rounded-lg">กำลังตรวจสอบฉบับประกาศใช้ กรุณารอสักครู่ก่อนพิมพ์</p>}
       {publishedError&&<p className="no-print mb-4 text-xs text-rose-800 bg-rose-50 p-3 rounded-lg">{publishedError} · โปรดตรวจสอบสถานะก่อนเลือกพิมพ์</p>}
       {showingPublished&&!references&&<p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">หมายเหตุ: ฉบับประกาศเก่าไม่มีข้อมูลอ้างอิง ณ วันที่ประกาศ ชื่อครู/วิชาอาจแสดงตามข้อมูลปัจจุบัน</p>}
-      <div id="print-area">{selectedId === 'ALL_PRINT' ? (viewMode === 'room' ? classrooms : teachers).map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />) : (selectedId && <PrintPage id={selectedId} mode={viewMode} />)}</div>
+      <div id="print-area">{selectedId === 'ALL_PRINT' ? (viewMode === 'room' ? classrooms : sortTeachersByArea(teachers)).map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />) : (selectedId && <PrintPage id={selectedId} mode={viewMode} />)}</div>
     </div>
   );
 };
@@ -6144,7 +6337,7 @@ export default function App() {
     { id: 'settings', name: 'ตั้งค่าระบบ', icon: Settings }
   ];
 
-  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, bulkDeleteFixedSchedules, clearUnlockedSchedules, renameSubjectId, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, teachers, subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, saveSubjectTimeWindows, activityGroups, plcSessions, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups, plcSessions } };
+  const commonProps = { user, appId, db, dbAction, bulkUpsertTeachingLoads, saveTeachingLoadsWithSubjects, setConfirmData, bulkDeleteSubjects, bulkDeleteFixedSchedules, clearUnlockedSchedules, renameSubjectId, blockClassroomDay, blockClassroomDays, showToast, handleRequestDelete, saveScheduleVersion, readScheduleVersion, restoreScheduleVersion, getTermKey, getTeacher, getSubject, getClassroom, getShortTeacherName, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, teachers: sortTeachersByArea(teachers), subjects, activeSubjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, customRules, rulesReady, saveSubjectTimeWindows, activityGroups, plcSessions, schoolSettings, health, fullDataForBackup: { teachers, subjects, classrooms, periods, teachingLoads, unavailabilities, classroomUnavailabilities, fixedSchedules, schedules, scheduleRules: customRules, activityGroups, plcSessions } };
 
   if (isInitialLoading) return <div className="flex h-screen w-full items-center justify-center bg-slate-50"><div className="animate-spin text-[#d4af37]"><RefreshCw size={48}/></div></div>;
 
@@ -6178,7 +6371,8 @@ export default function App() {
             break-after: page; page-break-after: always;
           }
           #print-area .print-page:last-child { break-after: auto !important; page-break-after: auto !important; }
-          #print-area .print-header { margin: 0 0 4mm !important; line-height: 1.2 !important; }
+          #print-area .print-header { margin: 0 0 3mm !important; line-height: 1.2 !important; }
+          #print-area .print-school-logo { width: 16mm !important; height: 16mm !important; margin: 0 auto 1mm !important; }
           #print-area .print-header h1 { font-size: 17pt !important; margin: 0 0 1.5mm !important; }
           #print-area .print-header h2 { font-size: 11.5pt !important; margin: 0 0 1mm !important; }
           #print-area .print-header h3 { font-size: 11pt !important; margin: 0 !important; }
@@ -6198,15 +6392,15 @@ export default function App() {
           #print-area .print-table th:first-child { width: 19mm !important; }
           #print-area .print-table thead th { height: 13mm !important; font-size: 9pt !important; }
           #print-area .print-table thead th div { font-size: 8.5pt !important; line-height: 1.15 !important; }
-          #print-area .print-table tbody tr { height: 22mm !important; break-inside: avoid !important; page-break-inside: avoid !important; }
-          #print-area .print-table tbody td { height: 22mm !important; }
+          #print-area .print-table tbody tr { height: 20mm !important; break-inside: avoid !important; page-break-inside: avoid !important; }
+          #print-area .print-table tbody td { height: 20mm !important; }
           #print-area .print-table .truncate {
             overflow: visible !important; text-overflow: clip !important; white-space: normal !important;
           }
           #print-area .print-table td div { max-width: 100% !important; overflow-wrap: anywhere !important; }
           #print-area .print-signatures {
             display: flex !important; justify-content: space-between !important;
-            margin: 8mm 0 0 !important; padding: 0 10mm !important;
+            margin: 5mm 0 0 !important; padding: 0 10mm !important;
             font-size: 10pt !important; line-height: 1.25 !important;
             break-inside: avoid !important;
           }
