@@ -4678,6 +4678,42 @@ const ScheduleHistoryView = ({ db, appId, schoolSettings, getTermKey, getSubject
   </div>;
 };
 
+// Export one Excel row for every *scheduled teacher lesson*, not a timetable grid.
+// Use displayed lesson ordinals (1–7), never internal periodIds (which include lunch).
+// Fixed activities and PLC have no subject code; the existing complete-timetable
+// Excel export remains available alongside this code-based lesson list.
+const buildTeacherPeriodExcelRows = ({ schedules = [], teachers = [], subjects = [], classrooms = [], periods = [] }) => {
+  const teacherById = new Map(teachers.map(t => [String(t.id), t]));
+  const subjectById = new Map(subjects.map(x => [String(x.id), x]));
+  const classroomById = new Map(classrooms.map(x => [String(x.id), x]));
+  const teacherRanks = new Map(sortTeachersByArea(teachers).map((t, index) => [String(t.id), index]));
+  const periodNumbers = new Map(periods.filter(p => !p.isBreak)
+    .map((p, index) => [String(p.id), index + 1]));
+  const developmentIds = developmentSubjectIds(subjects);
+  const rows = (schedules || []).filter(s => s.teacherId && s.subjectId && s.classroomId &&
+    !isDevelopmentDuty(s, developmentIds))
+    .map(s => ({
+      teacherId: String(s.teacherId),
+      teacher: teacherById.get(String(s.teacherId))?.name || `ครู (${s.teacherId})`,
+      day: String(s.day || ''),
+      period: periodNumbers.get(String(s.periodId)) ?? String(s.periodId || ''),
+      subjectCode: subjectById.get(String(s.subjectId))?.id || String(s.subjectId),
+      classroom: classroomById.get(String(s.classroomId))?.name || String(s.classroomId)
+    }));
+  rows.sort((a, b) =>
+    (teacherRanks.get(a.teacherId) ?? 99999) - (teacherRanks.get(b.teacherId) ?? 99999) ||
+    a.teacher.localeCompare(b.teacher, 'th') ||
+    (DAYS.indexOf(a.day) < 0 ? 99 : DAYS.indexOf(a.day)) - (DAYS.indexOf(b.day) < 0 ? 99 : DAYS.indexOf(b.day)) ||
+    (Number(a.period) || 99) - (Number(b.period) || 99) ||
+    a.classroom.localeCompare(b.classroom, 'th') ||
+    String(a.subjectCode).localeCompare(String(b.subjectCode), 'th'));
+  return [
+    ['ชื่อครู', 'วัน', 'คาบ', 'รหัสวิชา', 'ห้อง'],
+    ...rows.map(r => [sanitizeExcelInput(r.teacher), sanitizeExcelInput(r.day), r.period,
+      sanitizeExcelInput(r.subjectCode), sanitizeExcelInput(r.classroom)])
+  ];
+};
+
 const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draftSubjects,
   classrooms:draftClassrooms, periods:draftPeriods, schoolSettings:draftSettings,
   teachingLoads, unavailabilities, classroomUnavailabilities, customRules,
@@ -4718,6 +4754,29 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
     if (filterLvl !== 'all') list = list.filter(m => getClassroom(m.classroomId).name.includes(filterLvl));
     return list.sort((a,b) => b.missing - a.missing);
   }, [health.missingLoads, filterLvl]);
+
+  // Five-column teacher lesson list for external timetable analysis/import.
+  // A teacher with two classes in the same time receives two rows, rather than
+  // losing either row (published schedules can contain confirmed warnings).
+  const exportTeacherPeriodsExcel = () => {
+    try {
+      const rows = buildTeacherPeriodExcelRows({ schedules, teachers, subjects, classrooms, periods });
+      if (rows.length === 1) {
+        window.alert('ยังไม่มีคาบรายวิชาที่จัดลงตารางสำหรับส่งออก');
+        return;
+      }
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws['!cols'] = [{wch:34}, {wch:16}, {wch:9}, {wch:18}, {wch:18}];
+      ws['!autofilter'] = {ref:`A1:E${rows.length}`};
+      XLSX.utils.book_append_sheet(wb, ws, 'ตารางสอนรายคาบ');
+      XLSX.writeFile(wb,
+        `BHS-Teacher-Periods-${showingPublished?'Published':'Draft'}-${schoolSettings.academicYear}-T${schoolSettings.semester}.xlsx`);
+    } catch (error) {
+      console.error(error);
+      window.alert(translateUserMessage('ส่งออก Excel รายคาบไม่สำเร็จ: '+error.message));
+    }
+  };
 
   const exportFormattedExcel = () => {
     try {
@@ -4914,7 +4973,7 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
       {activeSubTab === 'grid' && (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto p-4">
            <div className="p-2 mb-4 bg-blue-50 text-blue-800 rounded-lg text-sm font-bold flex justify-between items-center">
-             ตารางรวมโรงเรียน (โหมดห้องเรียน) <div className="flex gap-2"><button onClick={exportFormattedExcel} className="bg-indigo-700 text-white px-3 py-1 rounded">Export Excel (รายห้อง+รายครู)</button><button onClick={() => handleExportCSV('all')} className="bg-emerald-600 text-white px-3 py-1 rounded">Export CSV</button></div>
+             ตารางรวมโรงเรียน (โหมดห้องเรียน) <div className="flex flex-wrap gap-2"><button onClick={exportTeacherPeriodsExcel} className="bg-blue-800 text-white px-3 py-1 rounded">Export Excel (รายคาบ 5 คอลัมน์)</button><button onClick={exportFormattedExcel} className="bg-indigo-700 text-white px-3 py-1 rounded">Export Excel (รายห้อง+รายครู)</button><button onClick={() => handleExportCSV('all')} className="bg-emerald-600 text-white px-3 py-1 rounded">Export CSV</button></div>
            </div>
            {DAYS.map(day => (
              <div key={day} className="mb-8">
