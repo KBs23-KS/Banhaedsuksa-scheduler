@@ -892,6 +892,8 @@ const SortIcon = ({ column, sortConfig }) => {
 const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, teachers, subjects, classrooms, periods, customRules = [], activityGroups = [], plcSessions = []) => {
   const health = {
     status: 'ready', totalRequired: 0, scheduledForLoads: 0, missing: 0, overScheduled: 0, completionPercent: 0,
+    subjectRequired: 0, subjectScheduled: 0, subjectMissing: 0, subjectOverScheduled: 0,
+    developmentRequired: 0, developmentScheduled: 0, developmentMissing: 0,
     teacherConflicts: [], roomConflicts: [], unavailConflicts: [], cUnavailConflicts: [], breakConflicts: [], blockConflicts: [], teacherLimitConflicts: [], teacherFivePeriodWarnings: [], teacherActivityConsecutiveWarnings: [], teacherManualConsecutiveWarnings: [], customRuleConflicts: [], subjectDailyConflicts: [], orphans: [], fixedConflicts: [], missingLoads: [], overloads: [],
     teacherStats: {}, roomStats: {}, plcConflicts: [], 
   };
@@ -910,16 +912,22 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
       health.orphans.push(`ภาระสอนครู ${l.teacherId || '-'} วิชา ${l.subjectId || '-'} มีจำนวนคาบไม่ถูกต้อง`);
     }
     health.totalRequired += req;
+    // A development activity can still be placed by Auto, but is not a subject load.
+    const isDevelopmentLoad = isGuidanceSubject(subjectMap.get(l.subjectId));
+    if (isDevelopmentLoad) health.developmentRequired += req;
+    else health.subjectRequired += req;
     const lKey = `${l.teacherId}_${l.subjectId}_${l.classroomId}`;
     if (loadTracker[lKey]) {
       // ห้ามให้รายการซ้ำเขียนทับจำนวนคาบเดิม เพราะจะทำให้ Health Check แสดงผลผิด
       loadTracker[lKey].required += req;
       health.orphans.push(`พบภาระสอนซ้ำสำหรับครู ${l.teacherId} วิชา ${l.subjectId} ห้อง ${l.classroomId}`);
     } else {
-      loadTracker[lKey] = { ...l, required: req, scheduled: 0 };
+      loadTracker[lKey] = { ...l, required: req, scheduled: 0, isDevelopmentLoad };
     }
     if (!health.teacherStats[l.teacherId]) health.teacherStats[l.teacherId] = { req: 0, sch: 0, days: {}, gaps: 0, maxConsec: 0, subjects: new Set() };
     health.teacherStats[l.teacherId].req += req;
+    health.teacherStats[l.teacherId].subjectReq = (health.teacherStats[l.teacherId].subjectReq || 0) + (isDevelopmentLoad ? 0 : req);
+    health.teacherStats[l.teacherId].developmentReq = (health.teacherStats[l.teacherId].developmentReq || 0) + (isDevelopmentLoad ? req : 0);
     health.teacherStats[l.teacherId].subjects.add(l.subjectId);
   });
 
@@ -963,6 +971,10 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
       matchedLoad.scheduled += 1;
       if (!health.teacherStats[sch.teacherId]) health.teacherStats[sch.teacherId] = { req: 0, sch: 0, days: {}, gaps: 0, maxConsec: 0, subjects: new Set() };
       health.teacherStats[sch.teacherId].sch += 1;
+      if (matchedLoad.isDevelopmentLoad)
+        health.teacherStats[sch.teacherId].developmentSch = (health.teacherStats[sch.teacherId].developmentSch || 0) + 1;
+      else
+        health.teacherStats[sch.teacherId].subjectSch = (health.teacherStats[sch.teacherId].subjectSch || 0) + 1;
       if (!health.teacherStats[sch.teacherId].days[sch.day]) health.teacherStats[sch.teacherId].days[sch.day] = [];
       health.teacherStats[sch.teacherId].days[sch.day].push(sch.periodId);
       health.teacherStats[sch.teacherId].subjects.add(sch.subjectId);
@@ -1019,6 +1031,15 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   let cappedScheduled = 0;
   Object.values(loadTracker).forEach(l => {
     const diff = l.required - l.scheduled;
+    const assigned = Math.min(l.required, l.scheduled);
+    if (l.isDevelopmentLoad) {
+      health.developmentScheduled += assigned;
+      health.developmentMissing += Math.max(0, diff);
+    } else {
+      health.subjectScheduled += assigned;
+      health.subjectMissing += Math.max(0, diff);
+      health.subjectOverScheduled += Math.max(0, -diff);
+    }
     if (diff > 0) { health.missingLoads.push({ ...l, missing: diff }); health.missing += diff; cappedScheduled += l.scheduled; } 
     else if (diff < 0) { health.overloads.push(`จัดเกินโควตา: ${subjectMap.get(l.subjectId)?.name || l.subjectId} ห้อง ${roomMap.get(l.classroomId)?.name || l.classroomId} (เกิน ${Math.abs(diff)} คาบ)`); health.overScheduled += Math.abs(diff); cappedScheduled += l.required; } 
     else { cappedScheduled += l.required; }
@@ -1054,7 +1075,10 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   const occupied = buildTeacherOccupancy(schedules, fixed, activityGroups);
   const weeklyStats = summarizeTeacherWeek(occupied, periods);
   const byTeacherTeaching = new Map(), byTeacherActivities = new Map();
-  schedules.forEach(item => { if (item.teacherId) byTeacherTeaching.set(item.teacherId, (byTeacherTeaching.get(item.teacherId) || 0) + 1); });
+  schedules.forEach(item => { if (!item.teacherId) return;
+    const target = isGuidanceSubject(subjectMap.get(item.subjectId)) ? byTeacherActivities : byTeacherTeaching;
+    target.set(item.teacherId, (target.get(item.teacherId) || 0) + 1);
+  });
   [...fixed, ...groupTeacherItems].forEach(item => { if (item.teacherId) byTeacherActivities.set(item.teacherId, (byTeacherActivities.get(item.teacherId) || 0) + 1); });
   teachers.forEach(t => {
     const stat = health.teacherStats[t.id] || (health.teacherStats[t.id] = {req:0,sch:0,days:{},gaps:0,maxConsec:0,subjects:new Set()});
@@ -1949,7 +1973,9 @@ const buildDashboardOverview = ({ teachers = [], activeSubjects = [], classrooms
   }]));
   const keyOf = item => JSON.stringify([String(item.teacherId || ''), String(item.subjectId || ''), String(item.classroomId || '')]);
   const loadMap = new Map();
+  const dashboardSubjectMap = new Map(activeSubjects.map(item => [String(item.id), item]));
   teachingLoads.forEach(load => {
+    if (isGuidanceSubject(dashboardSubjectMap.get(String(load.subjectId)))) return;
     const key = keyOf(load);
     const req = Number(load.periods);
     if (!Number.isFinite(req) || req <= 0) return;
@@ -2061,7 +2087,8 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
     empty: 'ยังไม่มีข้อมูลภาระสอน', error: 'พบข้อขัดแย้งของตาราง'
   };
   const currentStatus = health.status || 'empty';
-  const progress = Number(health.completionPercent) || 0;
+  const progress = health.subjectRequired > 0
+    ? Math.min(100, Math.round((health.subjectScheduled / health.subjectRequired) * 100)) : 0;
   const allAlerts = [
     ...summary.fiveDays.map(item => ({ type: 'five', key: `five_${item.teacherId}_${item.day}`,
       title: `${item.teacherName} · วัน${item.day}`, message: '5 คาบ/วัน — ข้อยกเว้นที่ควรตรวจสอบ' })),
@@ -2080,7 +2107,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
           <div className="bg-white/10 p-4 rounded-2xl border border-white/20 md:min-w-[215px]">
             <p className="text-sm font-bold flex items-center gap-2"><span className={`w-2.5 h-2.5 rounded-full ${currentStatus === 'ready' ? 'bg-emerald-400' : currentStatus === 'empty' ? 'bg-slate-300' : 'bg-amber-400'}`}></span>{statusLabels[currentStatus] || 'กำลังตรวจสอบ'}</p>
             <p className="text-4xl font-bold text-[#e6c55c] mt-2">{progress}%</p>
-            <p className="text-xs text-slate-200 mt-1">จัดภาระสอนรายวิชา {health.scheduledForLoads || 0} / {health.totalRequired || 0} คาบ</p>
+            <p className="text-xs text-slate-200 mt-1">จัดภาระสอนรายวิชา {health.subjectScheduled || 0} / {health.subjectRequired || 0} คาบ (ไม่รวมกิจกรรม)</p>
           </div>
         </div>
         <div className="mt-5 h-2.5 rounded-full bg-white/15 overflow-hidden" role="progressbar" aria-label="ความคืบหน้าการจัดภาระสอน" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
@@ -2098,7 +2125,7 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
           {label:'ครูทั้งหมด', count: summary.teacherCount, unit:'คน', icon: Users},
           {label:'ห้องเรียนทั้งหมด', count: summary.roomCount, unit:'ห้อง', icon: Home},
           {label:'รายวิชาในภาคเรียน', count: summary.subjectCount, unit:'วิชา', icon: BookOpen},
-          {label:'คาบรายวิชาที่ยังไม่จัด', count: health.missing || 0, unit:'คาบ', icon: CalendarDays}
+          {label:'คาบรายวิชาที่ยังไม่จัด', count: health.subjectMissing || 0, unit:'คาบ', icon: CalendarDays}
         ].map(item => {
           const Icon = item.icon;
           return <div key={item.label} className="bg-white p-4 sm:p-5 rounded-2xl shadow-sm border border-slate-100">
@@ -2153,7 +2180,8 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
             </div>
             {!!summary.heavyPatterns.length && <p className="text-sm text-amber-700 mt-3">พบรูปแบบคาบที่ควรกระจายใหม่ {summary.heavyPatterns.length} วัน-ครู</p>}
             {summary.conflictCount === 0 && allAlerts.length === 0 && health.missing === 0 && teachingLoads.length > 0 && <p className="text-sm text-emerald-700 mt-3 flex gap-2 items-center"><CheckCircle2 size={17}/> ไม่พบรายการเตือนจากข้อมูลปัจจุบัน</p>}
-            {health.missing > 0 && <p className="text-sm text-amber-700 mt-3">ยังเหลือภาระสอน {health.missing} คาบที่ต้องจัด</p>}
+            {health.subjectMissing > 0 && <p className="text-sm text-amber-700 mt-3">ยังเหลือคาบรายวิชา {health.subjectMissing} คาบที่ต้องจัด</p>}
+            {health.developmentMissing > 0 && <p className="text-sm text-indigo-700 mt-2">ยังเหลือกิจกรรมพัฒนาผู้เรียน {health.developmentMissing} คาบที่ต้องจัด (ไม่รวมในยอดภาระรายวิชา)</p>}
             <div className="space-y-2 mt-3">
               {(showAllAlerts ? allAlerts : allAlerts.slice(0, 4)).map(alert => <div key={alert.key} className="border-l-2 border-amber-400 pl-3 py-1"><p className="text-sm font-semibold text-slate-800">{alert.title}</p><p className="text-xs text-slate-600">{alert.message}</p></div>)}
               {allAlerts.length > 4 && <button onClick={() => setShowAllAlerts(s => !s)} className="text-sm text-blue-700 font-semibold hover:underline">{showAllAlerts ? 'แสดงน้อยลง' : `ดูทั้งหมด ${allAlerts.length} รายการ`}</button>}
@@ -2634,7 +2662,8 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
   const { items: sortedLoadRows, requestSort: sortLoads, sortConfig: loadSortConfig } = useSortableData(loadRowsByArea);
   const displayedLoadRows = selectedTeacherId === 'all'
     ? sortedLoadRows : sortedLoadRows.filter(row => row.load.teacherId === selectedTeacherId);
-  const displayedPeriods = displayedLoadRows.reduce((sum, row) => sum + row.periods, 0);
+  const displayedPeriods = displayedLoadRows.reduce((sum, row) =>
+    sum + (isGuidanceSubject(getSubject(row.load.subjectId)) ? 0 : row.periods), 0);
   useEffect(() => {
     if (selectedTeacherId !== 'all' && !teachers.some(t => t.id === selectedTeacherId)) setSelectedTeacherId('all');
   }, [selectedTeacherId, teachers]);
@@ -2937,7 +2966,7 @@ const LoadsView = ({ teachingLoads, teachers, subjects, activeSubjects, classroo
               <tbody>
                 {displayedLoadRows.map(({ load: l }) => (
                   <tr key={l.id} className="border-b border-slate-50 hover:bg-[#081a39]/5">
-                    <td className="p-4 font-medium text-[#081a39]">{getTeacher(l.teacherId).name}</td><td className="p-4 text-slate-600"><span className="text-xs font-mono bg-slate-100 text-slate-500 px-2 py-1 rounded mr-2">{l.subjectId}</span>{getSubject(l.subjectId).name}</td><td className="p-4 text-center font-bold text-[#d4af37]">{getClassroom(l.classroomId).name}</td><td className="p-4 text-center font-medium">{l.periods}</td>
+                    <td className="p-4 font-medium text-[#081a39]">{getTeacher(l.teacherId).name}</td><td className="p-4 text-slate-600"><span className="text-xs font-mono bg-slate-100 text-slate-500 px-2 py-1 rounded mr-2">{l.subjectId}</span>{getSubject(l.subjectId).name}{isGuidanceSubject(getSubject(l.subjectId)) && <span className="text-xs text-indigo-700 ml-2">(กิจกรรม · ไม่รวมภาระรายวิชา)</span>}</td><td className="p-4 text-center font-bold text-[#d4af37]">{getClassroom(l.classroomId).name}</td><td className="p-4 text-center font-medium">{l.periods}</td>
                     <td className="p-4 text-center"><div className="flex items-center justify-center gap-2"><button onClick={() => { setForm(l); resetNewSubject(); setOriginalLoad({...l}); setIsEditing(true); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-[#081a39] rounded-lg"><Edit size={18}/></button><button onClick={() => handleRequestDelete('load', l)} className="p-2 text-slate-400 hover:text-rose-500 rounded-lg"><Trash2 size={18}/></button></div></td>
                   </tr>
                 ))}
@@ -3688,8 +3717,9 @@ const buildRoomCourseSummary = (roomId, teachingLoads, schedules, fixedSchedules
       teacherName:teacherIds.map(id=>teachersById.get(String(id))||id).join(', ') || 'ไม่ระบุครู',
       assigned:1,required:1});
   });
-  return {courses,activities,required:courses.reduce((n,r)=>n+r.required,0),
-    assigned:courses.reduce((n,r)=>n+r.assigned,0)};
+  const subjectRows = courses.filter(row => !row.development);
+  return {courses,activities,required:subjectRows.reduce((n,r)=>n+r.required,0),
+    assigned:subjectRows.reduce((n,r)=>n+r.assigned,0)};
 };
 
 const RoomTimetableSummary = ({room,teachingLoads,schedules,fixedSchedules,activityGroups,
@@ -3706,7 +3736,7 @@ const RoomTimetableSummary = ({room,teachingLoads,schedules,fixedSchedules,activ
       <span className="text-xs text-slate-600">{summary.assigned}/{summary.required} คาบรายวิชา {open?'▲':'▼'}</span>
     </button>
     {open && <div className="p-3 space-y-4">
-      <p className="text-xs text-slate-500">ดึงจากภาระสอนและตารางฉบับร่างจริง · จำนวนคาบกิจกรรมล็อกแสดงแยก ไม่รวมในยอดภาระสอน</p>
+      <p className="text-xs text-slate-500">ยอดคาบรายวิชาไม่รวมกิจกรรมพัฒนาผู้เรียนหรือ PLC แต่กิจกรรมยังแสดงแยกและจัดลงตารางได้ตามปกติ</p>
       {groups.map(group=><div key={group.title}>
         <h4 className="font-bold text-sm text-[#081a39] mb-2">{group.title}</h4>
         {group.items.length ? <div className="overflow-x-auto"><table className="min-w-[560px] w-full text-sm border-collapse">
@@ -4108,7 +4138,9 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
            </div>
          ))}
          {cellGroups.map(g=><div key={g.id} className="text-indigo-700 font-bold border-t pt-1">{g.name}</div>)}
-         {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1">{plcDisplayName(item.subjectArea)}</div>)}
+         {cellPLC.map(item=><div key={item.id} className="text-blue-800 font-bold border-t pt-1 leading-tight text-center">
+           <div>PLC กลุ่มสาระฯ</div><div>{item.subjectArea || '-'}</div>
+         </div>)}
          {cellSch.map((sch, idx) => (
            <div key={sch.id} draggable={!isScheduling&&!editingRows&&rulesReady} onDragStart={e=>{
                // IMPORTANT: do not trigger React re-render on dragstart; a synchronous
@@ -4766,18 +4798,18 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
       {activeSubTab === 'workload' && (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
           <table className="w-full text-left text-sm">
-            <thead className="bg-[#081a39] text-white"><tr><th className="p-3">ชื่อครู</th><th className="p-3 text-center">ภาระสอน</th><th className="p-3 text-center">จัดสอน</th><th className="p-3 text-center">กิจกรรม/คาบล็อก</th><th className="p-3 text-center">PLC</th><th className="p-3 text-center">รวมภาระจริง</th><th className="p-3 text-center">วันที่ภาระรวม 4–5 คาบ</th><th className="p-3 text-center">สถานะ</th><th className="p-3 text-center">Gap</th><th className="p-3 text-center">ติดกันสูงสุด</th><th className="p-3 text-center">การกระจาย จ–ศ</th></tr></thead>
+            <thead className="bg-[#081a39] text-white"><tr><th className="p-3">ชื่อครู</th><th className="p-3 text-center">ภาระรายวิชา</th><th className="p-3 text-center">จัดรายวิชา</th><th className="p-3 text-center">กิจกรรม/คาบล็อก</th><th className="p-3 text-center">PLC</th><th className="p-3 text-center">รวมภาระจริง</th><th className="p-3 text-center">วันที่ภาระรวม 4–5 คาบ</th><th className="p-3 text-center">สถานะ</th><th className="p-3 text-center">Gap</th><th className="p-3 text-center">ติดกันสูงสุด</th><th className="p-3 text-center">การกระจาย จ–ศ</th></tr></thead>
             <tbody>
               {sortTeachersByArea(teachers).map((t, i) => {
                 const st = health.teacherStats[t.id] || { req: 0, sch: 0, gaps: 0, maxConsec: 0 };
                 return (
                   <tr key={i} className="border-b hover:bg-slate-50">
-                    <td className="p-3 font-bold">{t.name}</td><td className="p-3 text-center">{st.req}</td><td className="p-3 text-center font-bold">{st.regularPeriods||0}</td>
+                    <td className="p-3 font-bold">{t.name}</td><td className="p-3 text-center">{st.subjectReq||0}</td><td className="p-3 text-center font-bold">{st.regularPeriods||0}</td>
                     <td className="p-3 text-center">{st.activityPeriods||0}</td>
                     <td className="p-3 text-center">{buildPLCReservations(displayedPLC,teachers).filter(x=>x.teacherId===t.id).length}</td>
                     <td className="p-3 text-center font-bold">{st.totalWeeklyPeriods||0}</td>
                     <td className="p-3 text-center">{st.heavyDays||0}{st.fiveDays?.length ? ` (5 คาบ: ${st.fiveDays.join(', ')})` : ''}</td>
-                    <td className="p-3 text-center">{st.sch < st.req ? <span className="text-amber-600 bg-amber-50 px-2 py-1 rounded text-xs">ขาด {st.req - st.sch}</span> : st.sch > st.req ? <span className="text-rose-600 bg-rose-50 px-2 py-1 rounded text-xs">เกิน {st.sch - st.req}</span> : <span className="text-emerald-600 text-xs">ครบ</span>}</td>
+                    <td className="p-3 text-center">{(st.subjectSch||0) < (st.subjectReq||0) ? <span className="text-amber-600 bg-amber-50 px-2 py-1 rounded text-xs">ขาด {(st.subjectReq||0) - (st.subjectSch||0)}</span> : (st.subjectSch||0) > (st.subjectReq||0) ? <span className="text-rose-600 bg-rose-50 px-2 py-1 rounded text-xs">เกิน {(st.subjectSch||0) - (st.subjectReq||0)}</span> : <span className="text-emerald-600 text-xs">ครบ</span>}</td>
                     <td className="p-3 text-center">{st.gaps}</td><td className="p-3 text-center">{st.maxConsec}</td><td className="p-3 text-center text-xs">{DAYS.map(d=>st.dailyCounts?.[d]||0).join(' / ')}</td>
                   </tr>
                 );
@@ -4890,7 +4922,9 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
     return (
       <div className="flex flex-col items-center justify-center text-[11px] text-center w-full h-full">
         {combined.map((sch, idx) => (
-          sch.__isPLC ? <div key={sch.id} className="font-bold text-[10px] leading-tight break-words">{plcDisplayName(sch.subjectArea)}</div> : <div key={sch.id} className={`w-full ${idx > 0 ? 'mt-1 pt-1 border-t border-black/20' : ''}`}>
+          sch.__isPLC ? <div key={sch.id} className="font-bold text-[10px] leading-tight break-words text-center">
+            <div>PLC กลุ่มสาระฯ</div><div>{sch.subjectArea || '-'}</div>
+          </div> : <div key={sch.id} className={`w-full ${idx > 0 ? 'mt-1 pt-1 border-t border-black/20' : ''}`}>
             {(cellFixed.includes(sch) || sch.__activityTeacherOnly || isDevelopmentActivity(sch)) ? <div className="font-bold text-[11px] leading-tight break-words">{sch.groupLabel || (vMode==='room' ? fixedActivityDisplayName(sch,getSubject,activityGroups,targetId) : fixedActivityDisplayName(sch,getSubject))}</div> : <>
             <div className={`font-bold truncate text-[11px] ${cellFixed.includes(sch) ? 'text-amber-800' : ''}`}>{sch.subjectId}</div>
             {vMode === 'room' ? (
