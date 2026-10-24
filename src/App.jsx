@@ -6750,7 +6750,8 @@ export default function App() {
         }
         #print-area .print-header p {
           font-size: 13pt !important; line-height: 1.3 !important;
-          margin: 0 !important;
+          /* One millimetre between the teacher's name and subject area. */
+          margin: 1mm 0 0 !important;
         }
         #print-area .print-table {
           width: 100% !important; max-width: 100% !important;
