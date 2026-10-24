@@ -4819,13 +4819,12 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
   );
 };
 
-// Count occupied teaching periods exactly as shown in the printed timetable.
-// A period is counted once, even when several records appear in the same cell.
-// Student timetables include fixed/development activities; teacher timetables
-// include only activities assigned to that teacher. PLC and lunch are excluded.
-const countPrintedTimetablePeriods = ({ mode, targetId, periods, schedules, fixedSchedules, activityGroups }) => {
+// Count every occupied period shown in the printed timetable (including activities and teacher PLC).
+// Each day/period counts once even if several entries appear in the same cell; lunch is not a lesson.
+const countPrintedTimetablePeriods = ({ mode, targetId, periods, schedules, fixedSchedules, activityGroups, plcSessions, teachers }) => {
   const activityTeacherSlots = mode === 'teacher'
     ? activityTeacherEntries(activityGroups, fixedSchedules) : [];
+  const teacherPLCSlots = mode === 'teacher' ? buildPLCReservations(plcSessions, teachers) : [];
   return DAYS.reduce((total, day) => total + periods.reduce((dayTotal, period) => {
     if (period.isBreak) return dayTotal;
     const matchesSlot = row => row.day === day && row.periodId === period.id;
@@ -4835,7 +4834,9 @@ const countPrintedTimetablePeriods = ({ mode, targetId, periods, schedules, fixe
       (mode === 'room' ? fixedAppliesToClassroom(row, targetId) : row.teacherId === targetId));
     const hasTeacherActivity = mode === 'teacher' && activityTeacherSlots.some(row =>
       matchesSlot(row) && row.teacherId === targetId);
-    return dayTotal + (hasScheduledLesson || hasFixedActivity || hasTeacherActivity ? 1 : 0);
+    const hasTeacherPLC = mode === 'teacher' && teacherPLCSlots.some(row =>
+      matchesSlot(row) && row.teacherId === targetId);
+    return dayTotal + (hasScheduledLesson || hasFixedActivity || hasTeacherActivity || hasTeacherPLC ? 1 : 0);
   }, 0), 0);
 };
 
@@ -4922,7 +4923,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         </tbody>
       </table>
       <div className="print-total-periods text-right font-semibold">
-        รวมคาบ{mode === 'room' ? 'เรียน' : 'สอน'}ทั้งหมด {countPrintedTimetablePeriods({ mode, targetId:id, periods, schedules, fixedSchedules, activityGroups })} คาบ/สัปดาห์
+        รวมคาบ{mode === 'room' ? 'เรียน' : 'สอน'}ทั้งหมด {countPrintedTimetablePeriods({ mode, targetId:id, periods, schedules, fixedSchedules, activityGroups, plcSessions:printPLC, teachers })} คาบ/สัปดาห์
       </div>
       <div className="flex justify-between px-28 mt-24 text-sm font-medium print-signatures">
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.deputyName || '')})</p><p className="mt-1">รองผู้อำนวยการ</p></div>
