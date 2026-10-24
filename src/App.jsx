@@ -3735,6 +3735,10 @@ const RoomTimetableSummary = ({room,teachingLoads,schedules,fixedSchedules,activ
 const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, teachers, activeSubjects, periods, unavailabilities, classroomUnavailabilities, fixedSchedules, customRules, rulesReady, getSubject, getShortTeacherName, getClassroom, getTeacher, runSmartSchedule, clearUnlockedSchedules, dbAction, showToast, handleRequestDelete, isScheduling, db, appId, getTermKey, schoolSettings, saveScheduleVersion, publishDraftSchedule, publishedSnapshot, publishedLoading, publishedError, plcSessions = [], initialRoomId = '' }) => {
   const [viewMode, setViewMode] = useState('room');
   const [selectedId, setSelectedId] = useState(initialRoomId);
+  // Comparison is a third view over the same draft schedules, not a separate timetable.
+  const [compareTeacherA, setCompareTeacherA] = useState('');
+  const [compareTeacherB, setCompareTeacherB] = useState('');
+  const [compareAddTarget, setCompareAddTarget] = useState(null);
   const [hoveredSlot, setHoveredSlot] = useState(null);
   const [draggedScheduleId, setDraggedScheduleId] = useState('');
   const [dropFeedback, setDropFeedback] = useState(null);
@@ -3743,7 +3747,28 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
   const dropOutcomeRef = useRef(null);
   const teacherActivitySlots = useMemo(() => activityTeacherEntries(activityGroups,fixedSchedules), [activityGroups,fixedSchedules]);
   const teacherPLCSlots = useMemo(() => buildPLCReservations(plcSessions,teachers), [plcSessions,teachers]);
+  const teacherSlotBusy = (teacherId, day, periodId) => !!teacherId && (
+    schedules.some(s => s.teacherId === teacherId && s.day === day && String(s.periodId) === String(periodId)) ||
+    fixedSchedules.some(f => f.teacherId === teacherId && f.day === day && String(f.periodId) === String(periodId)) ||
+    teacherActivitySlots.some(a => a.teacherId === teacherId && a.day === day && String(a.periodId) === String(periodId)) ||
+    teacherPLCSlots.some(p => p.teacherId === teacherId && p.day === day && String(p.periodId) === String(periodId))
+  );
+  const compareReady = viewMode === 'compare' && !!compareTeacherA && !!compareTeacherB && compareTeacherA !== compareTeacherB &&
+    teachers.some(t=>t.id===compareTeacherA) && teachers.some(t=>t.id===compareTeacherB);
+  const comparisonCounts = useMemo(() => {
+    const counts = {a:0,b:0,both:0,free:0};
+    if (!compareTeacherA || !compareTeacherB || compareTeacherA === compareTeacherB) return counts;
+    DAYS.forEach(day => periods.filter(p=>!p.isBreak).forEach(p => {
+      const a=teacherSlotBusy(compareTeacherA,day,p.id), b=teacherSlotBusy(compareTeacherB,day,p.id);
+      if (a) counts.a++;
+      if (b) counts.b++;
+      if (a&&b) counts.both++;
+      if (!a&&!b) counts.free++;
+    }));
+    return counts;
+  },[compareTeacherA,compareTeacherB,schedules,fixedSchedules,teacherActivitySlots,teacherPLCSlots,periods]);
   const displayedEntities = useMemo(() => {
+    if (viewMode === 'compare') return [];
     const source = viewMode === 'room' ? classrooms : sortTeachersByArea(teachers);
     return selectedId === ALL_TIMETABLE_VIEW_ID ? source : source.filter(item => item.id === selectedId);
   }, [viewMode, selectedId, classrooms, teachers]);
@@ -3837,10 +3862,20 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
 
   const handleCellClick = (day, periodId, entityId) => {
     if (!entityId || isScheduling || editingRows) return;
-    setAddForm({ teacherId: viewMode === 'teacher' ? entityId : '', subjectId: '', classroomId: viewMode === 'room' ? entityId : '', day, periodId });
+    setAddForm({ teacherId: viewMode !== 'room' ? entityId : '', subjectId: '', classroomId: viewMode === 'room' ? entityId : '', day, periodId });
     setIsAddModalOpen(true);
   };
 
+  const openCompareAdd = (day, periodId, teacherId = '') => {
+    if (!compareReady || isScheduling || editingRows || !rulesReady) return;
+    const freeTeachers = [compareTeacherA,compareTeacherB].filter(id=>!teacherSlotBusy(id,day,periodId));
+    if (!freeTeachers.length) return showToast('ครูทั้งสองคนมีคาบในช่วงเวลานี้แล้ว','error');
+    // Clicking a specific empty teacher lane chooses that teacher immediately;
+    // the general Add button asks when two teachers are simultaneously free.
+    if (teacherId && freeTeachers.includes(teacherId)) return handleCellClick(day,periodId,teacherId);
+    if (freeTeachers.length === 1) return handleCellClick(day,periodId,freeTeachers[0]);
+    setCompareAddTarget({day,periodId,teacherIds:freeTeachers});
+  };
   const repairArgs=()=>({schedules,teachingLoads,fixedSchedules,activityGroups,periods,
     plcSessions,unavailabilities,classroomUnavailabilities,customRules,subjects:activeSubjects,classrooms,teachers});
   const handleRepairAnalysis=()=>{
@@ -4014,7 +4049,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     const source = schedules.find(item => item.id === scheduleId);
     if (!source) return {status:'blocked', message:'ไม่พบคาบต้นทาง'};
     if ((viewMode === 'room' && source.classroomId !== entityId) ||
-        (viewMode === 'teacher' && source.teacherId !== entityId)) {
+        ((viewMode === 'teacher' || viewMode === 'compare') && source.teacherId !== entityId)) {
       return {status:'blocked',message:'ย้ายข้ามห้องหรือข้ามครูด้วยการลากไม่ได้ ต้องใช้ห้อง/ครูเดิม'};
     }
     let plan;
@@ -4054,14 +4089,14 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
      if (!entityId) return null;
      const cellSch = schedules.filter(s => viewMode === 'room' ? s.classroomId === entityId && s.day === day && s.periodId === periodId : s.teacherId === entityId && s.day === day && s.periodId === periodId);
      const cellFix = fixedSchedules.filter(f => viewMode === 'room' ? fixedAppliesToClassroom(f, entityId) && f.day === day && f.periodId === periodId : f.teacherId === entityId && f.day === day && f.periodId === periodId);
-     const cellGroups = viewMode==='teacher' ? teacherActivitySlots.filter(x=>x.teacherId===entityId&&x.day===day&&x.periodId===periodId).map(x=>({...x,name:x.__activityName || fixedActivityDisplayName(x,getSubject)})) : [];
-     const cellPLC = viewMode==='teacher' ? teacherPLCSlots
+     const cellGroups = viewMode!=='room' ? teacherActivitySlots.filter(x=>x.teacherId===entityId&&x.day===day&&x.periodId===periodId).map(x=>({...x,name:x.__activityName || fixedActivityDisplayName(x,getSubject)})) : [];
+     const cellPLC = viewMode!=='room' ? teacherPLCSlots
        .filter(x=>x.teacherId===entityId&&x.day===day&&x.periodId===periodId) : [];
      if (cellSch.length === 0 && cellFix.length === 0 && cellGroups.length===0 && cellPLC.length===0) return null;
      const isConflict = cellSch.length + cellFix.length + cellGroups.length + cellPLC.length > 1;
 
      return (
-       <div className={`p-1.5 h-full w-full rounded-xl flex flex-col items-center justify-center text-xs text-center border-l-4 shadow-sm relative group ${isConflict ? 'bg-rose-50 border-rose-500' : 'bg-white border-[#d4af37]'}`}>
+       <div className={`p-1.5 h-full w-full rounded-xl flex flex-col items-center justify-center text-xs text-center border-l-4 shadow-sm relative group ${isConflict ? 'bg-rose-50 border-rose-500' : viewMode === 'compare' ? (entityId === compareTeacherA ? 'bg-blue-50 border-blue-500' : 'bg-orange-50 border-orange-500') : 'bg-white border-[#d4af37]'}`}>
          {isConflict && <div className="absolute -top-2 -right-2 text-rose-500 bg-rose-100 rounded-full p-0.5 shadow-sm"><AlertCircle size={14}/></div>}
          {cellFix.map((f, idx) => (
            <div key={f.id} className={idx > 0 || cellSch.length > 0 ? "mt-2 pt-2 border-t w-full relative" : "w-full relative"}>
@@ -4098,12 +4133,63 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
      );
   };
 
+  const renderCompareTeacherLane = (day, period, teacherId, label, palette) => {
+    const busy = teacherSlotBusy(teacherId, day, period.id);
+    const isDrop = !!draggedScheduleId && dropFeedback?.entityId===teacherId &&
+      dropFeedback.day===day && String(dropFeedback.periodId)===String(period.id);
+    const dropColor = isDrop ? (dropFeedback.status==='allowed' ? 'ring-4 ring-emerald-500 bg-emerald-100' :
+      dropFeedback.status==='confirm' ? 'ring-4 ring-amber-500 bg-amber-100' : 'ring-4 ring-rose-500 bg-rose-100') : '';
+    const baseColor = palette==='a' ? 'border-blue-300 bg-blue-50 hover:bg-blue-100' : 'border-orange-300 bg-orange-50 hover:bg-orange-100';
+    return <div key={teacherId} title={`${getTeacher(teacherId).name} · วัน${day} ${period.name}`}
+      className={`min-h-[62px] rounded-lg border p-1.5 transition-colors ${baseColor} ${dropColor} ${!busy && !isScheduling && !editingRows ? 'cursor-pointer' : ''}`}
+      onDragOver={e=>{
+        const sourceId=dragSourceIdRef.current;
+        if (!sourceId) return;
+        e.preventDefault();e.stopPropagation();
+        const status=updateDropFeedback(sourceId,teacherId,day,period.id);
+        e.dataTransfer.dropEffect=status==='blocked'?'none':'move';
+      }}
+      onDrop={e=>{
+        e.preventDefault();e.stopPropagation();
+        const sourceId=dragSourceIdRef.current || e.dataTransfer.getData('text/plain');
+        const feedback=sourceId ? previewDrop(sourceId,teacherId,day,period.id) : {status:'blocked',message:'ไม่พบคาบต้นทาง'};
+        clearDragVisuals();
+        if(feedback.status==='blocked') return showToast('ย้ายไม่ได้: '+feedback.message,'error');
+        moveScheduleByDrag(sourceId,day,period.id);
+      }}
+      onClick={!busy ? ()=>openCompareAdd(day,period.id,teacherId) : undefined}>
+      <div className={`flex items-center gap-1 px-1 pb-1 text-[10px] font-bold ${palette==='a'?'text-blue-800':'text-orange-800'}`}>
+        <span className={`w-2 h-2 rounded-full ${palette==='a'?'bg-blue-600':'bg-orange-500'}`}/>
+        {label} · {getShortTeacherName(getTeacher(teacherId).name)}
+      </div>
+      {busy ? getCellContent(day,period.id,teacherId) : <div className={`min-h-[26px] flex items-center justify-center gap-1 text-xs ${palette==='a'?'text-blue-600':'text-orange-600'}`}>
+        <Plus size={13}/> ว่าง — คลิกเพิ่มคาบ
+      </div>}
+      {isDrop && <div className={`text-[10px] text-center font-semibold ${dropFeedback.status==='blocked'?'text-rose-800':dropFeedback.status==='allowed'?'text-emerald-800':'text-amber-800'}`}>
+        {dropFeedback.status==='blocked'?'✕ วางไม่ได้':'✓ วางได้'}
+      </div>}
+    </div>;
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in">
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
-          <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId(''); setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">ตารางเรียน (รายห้อง)</option><option value="teacher">ตารางสอน (รายครู)</option></select>
-          <select value={selectedId} onChange={e => {setSelectedId(e.target.value);setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option><option value={ALL_TIMETABLE_VIEW_ID}>{viewMode === 'room' ? `ทุกห้องเรียน (${classrooms.length} ห้อง)` : `ครูทั้งหมด (${teachers.length} คน)`}</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers}/>}</select>
+          <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId(''); setHoveredSlot(null);setCompareAddTarget(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">ตารางเรียน (รายห้อง)</option><option value="teacher">ตารางสอน (รายครู)</option><option value="compare">เปรียบเทียบตารางสอนครู (2 คน)</option></select>
+          {viewMode === 'compare' ? <div className="flex flex-wrap items-center gap-2">
+            <label className="text-sm font-semibold text-blue-800">ครู A
+              <select aria-label="ครู A สำหรับเปรียบเทียบ" value={compareTeacherA} onChange={e=>{setCompareTeacherA(e.target.value);if(e.target.value===compareTeacherB)setCompareTeacherB('');clearDragVisuals();}}
+                className="block mt-1 p-3 border border-blue-300 rounded-xl min-w-[220px] bg-blue-50 text-slate-900">
+                <option value="">-- เลือกครู A --</option><TeacherOptionsByArea teachers={teachers.filter(t=>t.id!==compareTeacherB)}/>
+              </select>
+            </label>
+            <label className="text-sm font-semibold text-orange-800">ครู B
+              <select aria-label="ครู B สำหรับเปรียบเทียบ" value={compareTeacherB} onChange={e=>{setCompareTeacherB(e.target.value);if(e.target.value===compareTeacherA)setCompareTeacherA('');clearDragVisuals();}}
+                className="block mt-1 p-3 border border-orange-300 rounded-xl min-w-[220px] bg-orange-50 text-slate-900">
+                <option value="">-- เลือกครู B --</option><TeacherOptionsByArea teachers={teachers.filter(t=>t.id!==compareTeacherA)}/>
+              </select>
+            </label>
+          </div> : <select value={selectedId} onChange={e => {setSelectedId(e.target.value);setHoveredSlot(null);clearDragVisuals();}} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium"><option value="">-- เลือกเพื่อแสดงตาราง --</option><option value={ALL_TIMETABLE_VIEW_ID}>{viewMode === 'room' ? `ทุกห้องเรียน (${classrooms.length} ห้อง)` : `ครูทั้งหมด (${teachers.length} คน)`}</option>{viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers}/>}</select>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button type="button" onClick={() => { setClearRoomId(''); setClearModalOpen(true); }} disabled={isScheduling || editingRows || !rulesReady || !schedules.length} className="flex items-center gap-2 px-4 py-3 border border-rose-200 bg-white text-rose-700 rounded-xl font-bold hover:bg-rose-50 disabled:opacity-50"><Trash2 size={17}/> ล้างคาบไม่ล็อก</button>
@@ -4115,7 +4201,8 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
       <div className="text-xs text-slate-600">กำลังแก้ไข: <strong>ฉบับร่าง</strong> · {publishedLoading?'กำลังตรวจฉบับประกาศ...':publishedError||(
         publishedSnapshot ? `มีฉบับประกาศใช้แล้ว (${new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH')})` : 'ยังไม่เคยประกาศใช้')}
         {publishedSnapshot&&<span className="ml-2 text-amber-700">การแก้ร่างไม่เปลี่ยนฉบับประกาศ</span>}</div>
-      {!selectedId && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-12 text-slate-600">เลือกห้องเรียน ครู หรือเลือกทั้งหมดเพื่อดูตารางและจัดคาบด้วยมือ</div>}
+      {viewMode !== 'compare' && !selectedId && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-12 text-slate-600">เลือกห้องเรียน ครู หรือเลือกทั้งหมดเพื่อดูตารางและจัดคาบด้วยมือ</div>}
+      {viewMode === 'compare' && !compareReady && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-10 text-slate-600">เลือกครู A และครู B ที่ต่างกันเพื่อแสดงตารางสอนรวมในตารางเดียว</div>}
       {draggedScheduleId && <div role="status" aria-live="polite" className={`fixed bottom-4 right-4 z-50 max-w-[min(92vw,520px)] pointer-events-none rounded-xl border-2 px-4 py-3 shadow-lg text-sm font-semibold ${
         dropFeedback?.status==='blocked' ? 'bg-rose-50 text-rose-900 border-rose-500' :
         dropFeedback?.status==='confirm' ? 'bg-amber-50 text-amber-900 border-amber-500' :
@@ -4125,6 +4212,55 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
         กำลังลาก: {getSubject(schedules.find(s=>s.id===draggedScheduleId)?.subjectId).name || 'รายวิชา'}
         {dropFeedback ? ` → ${viewMode === 'room' ? getClassroom(dropFeedback.entityId).name : getTeacher(dropFeedback.entityId).name} วัน${dropFeedback.day} ${getPeriodDisplayName(periods,dropFeedback.periodId)} : ${dropFeedback.message}` : ' — เลื่อนไปยังช่องปลายทางเพื่อดูสถานะ'}
       </div>}
+      {compareReady && <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 space-y-4" aria-label="เปรียบเทียบตารางสอนครู">
+        <div className="flex flex-wrap gap-3 justify-between items-center">
+          <div>
+            <h3 className="font-bold text-lg text-[#081a39]">เปรียบเทียบตารางสอนครู</h3>
+            <p className="text-sm text-slate-600">แต่ละวันและคาบแสดงครูทั้งสองคนในช่องเดียวกัน · ลากจากกล่องของครูที่ต้องการย้ายได้โดยตรง</p>
+          </div>
+          <div className="flex gap-3 text-xs font-semibold flex-wrap">
+            <span className="text-blue-800"><span className="inline-block w-3 h-3 bg-blue-600 rounded-sm mr-1"/>ครู A {getTeacher(compareTeacherA).name}</span>
+            <span className="text-orange-800"><span className="inline-block w-3 h-3 bg-orange-500 rounded-sm mr-1"/>ครู B {getTeacher(compareTeacherB).name}</span>
+            <span className="text-purple-800"><span className="inline-block w-3 h-3 bg-purple-500 rounded-sm mr-1"/>สอนพร้อมกัน (ไม่ใช่คาบชนผิดปกติ)</span>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-center text-sm">
+          <div className="p-3 rounded-xl bg-blue-50 text-blue-900"><strong className="block text-xl">{comparisonCounts.a}</strong>คาบที่ครู A มีรายการ</div>
+          <div className="p-3 rounded-xl bg-orange-50 text-orange-900"><strong className="block text-xl">{comparisonCounts.b}</strong>คาบที่ครู B มีรายการ</div>
+          <div className="p-3 rounded-xl bg-purple-50 text-purple-900"><strong className="block text-xl">{comparisonCounts.both}</strong>ช่วงที่สอนพร้อมกัน</div>
+          <div className="p-3 rounded-xl bg-slate-100 text-slate-800"><strong className="block text-xl">{comparisonCounts.free}</strong>ช่วงที่ว่างทั้งคู่</div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse min-w-[1100px] table-fixed">
+            <thead className="bg-[#081a39] text-white border-b-4 border-[#d4af37]"><tr>
+              <th className="p-3 w-28 text-center">วัน/เวลา</th>
+              {periods.map(p=><th key={p.id} className="p-2 text-center border-l border-[#122b5e] text-sm">
+                <div className="font-bold">{p.name}</div><div className="text-[#d4af37] text-xs font-normal">{p.start}-{p.end}</div>
+              </th>)}
+            </tr></thead>
+            <tbody>{DAYS.map(day=><tr key={day} className="border-b border-slate-200">
+              <td className="p-3 text-center font-bold bg-slate-50 border-r">{day}</td>
+              {periods.map(p=>{
+                const busyA=teacherSlotBusy(compareTeacherA,day,p.id);
+                const busyB=teacherSlotBusy(compareTeacherB,day,p.id);
+                const freeCount=Number(!busyA)+Number(!busyB);
+                return <td key={`${day}-${p.id}`} className={`p-1 align-top border-r border-b border-slate-200 ${busyA&&busyB?'bg-purple-50':'bg-white'}`}>
+                  {p.isBreak ? <div className="text-slate-500 text-sm text-center font-semibold py-7">พักเที่ยง</div> : <div className="space-y-1.5">
+                    {renderCompareTeacherLane(day,p,compareTeacherA,'A','a')}
+                    {renderCompareTeacherLane(day,p,compareTeacherB,'B','b')}
+                    {freeCount>0 && <button type="button" onClick={()=>openCompareAdd(day,p.id)}
+                      disabled={isScheduling||editingRows||!rulesReady}
+                      className="w-full rounded-lg border border-dashed border-slate-300 hover:border-blue-400 hover:bg-blue-50 py-1.5 text-[11px] text-slate-600 font-semibold disabled:opacity-50">
+                      <Plus size={12} className="inline"/> เพิ่มคาบ{freeCount===2?' (เลือกครู A/B)':''}
+                    </button>}
+                  </div>}
+                </td>;
+              })}
+            </tr>)}</tbody>
+          </table>
+        </div>
+        <p className="text-xs text-slate-600">สีม่วงหมายถึงครูทั้งสองมีรายการในเวลาเดียวกัน ไม่ใช่การชนกันของครูคนเดียว · คาบที่ล็อก 🔒 ยังลากย้ายด้วยมือได้และจะคงล็อกหลังย้าย · การเพิ่มคาบยังต้องมีภาระสอนและไม่ชนครู ห้อง หรือ PLC</p>
+      </section>}
       <div className="space-y-6">
         {displayedEntities.map(entity => (
           <section key={`${viewMode}-${entity.id}-${selectedId===ALL_TIMETABLE_VIEW_ID?'all':'single'}`} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4" aria-label={`${viewMode==='room'?'ตารางเรียน':'ตารางสอน'} ${entity.name}`}>
@@ -4238,17 +4374,30 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
           <p className="text-xs text-slate-500">ไม่ย้ายคาบล็อก · รักษาข้อบังคับ Auto · ยังไม่เปลี่ยนตารางจนกว่าจะยืนยัน · บันทึกประวัติก่อนเปลี่ยน</p>
         </div>}
       </Modal>
+      <Modal isOpen={!!compareAddTarget} onClose={()=>setCompareAddTarget(null)} title="เลือกครูสำหรับเพิ่มคาบ">
+        {compareAddTarget && <div className="space-y-4">
+          <p className="text-sm text-slate-600">วัน{compareAddTarget.day} · {getPeriodDisplayName(periods,compareAddTarget.periodId)} · เลือกครูที่ต้องการเพิ่มคาบ</p>
+          {compareAddTarget.teacherIds.map(id=><button key={id} type="button" onClick={()=>{
+            const {day,periodId}=compareAddTarget;
+            setCompareAddTarget(null);
+            handleCellClick(day,periodId,id);
+          }} className={`w-full text-left border-2 rounded-xl p-4 font-semibold hover:shadow-md ${id===compareTeacherA?'border-blue-300 bg-blue-50 text-blue-900':'border-orange-300 bg-orange-50 text-orange-900'}`}>
+            {id===compareTeacherA?'ครู A':'ครู B'} — {getTeacher(id).name}
+          </button>)}
+          <button type="button" onClick={()=>setCompareAddTarget(null)} className="w-full p-3 rounded-xl bg-slate-100 text-slate-700 font-semibold">ยกเลิก</button>
+        </div>}
+      </Modal>
       <Modal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} title="เพิ่มตารางสอน (รายคาบ)">
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">วัน</label><input value={addForm.day} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div><div><label className="block text-sm font-bold mb-1">คาบที่</label><input value={periods.find(p=>p.id===addForm.periodId)?.name} disabled className="w-full p-3 border rounded-xl bg-slate-100" /></div></div>
-          <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm(prev => ({ ...prev, teacherId: e.target.value, subjectId: '' }))} disabled={viewMode === 'teacher'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option><TeacherOptionsByArea teachers={availableRoomTeachers}/></select>{viewMode==='room' && addForm.classroomId && <p className="text-xs text-slate-500 mt-1">ครูที่มีภาระสอนห้องนี้ {availableRoomTeachers.length} คน</p>}</div>
+          <div><label className="block text-sm font-bold mb-1">ครูผู้สอน</label><select value={addForm.teacherId} onChange={e => setAddForm(prev => ({ ...prev, teacherId: e.target.value, subjectId: '' }))} disabled={viewMode === 'teacher' || viewMode === 'compare'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">-- เลือกครูผู้สอน --</option><TeacherOptionsByArea teachers={availableRoomTeachers}/></select>{viewMode==='room' && addForm.classroomId && <p className="text-xs text-slate-500 mt-1">ครูที่มีภาระสอนห้องนี้ {availableRoomTeachers.length} คน</p>}</div>
           <div><label className="block text-sm font-bold mb-1">รายวิชา</label><select value={addForm.subjectId} onChange={e => setAddForm({...addForm, subjectId: e.target.value})} disabled={!addForm.teacherId || selectableManualSubjects.length === 0} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100"><option value="">{!addForm.teacherId ? '-- กรุณาเลือกครูผู้สอนก่อน --' : availableManualSubjects.length === 0 ? '-- ไม่พบรายวิชาในภาระสอน --' : selectableManualSubjects.length === 0 ? '-- รายวิชาของครู/ห้องนี้จัดครบแล้ว --' : '-- เลือกรายวิชา --'}</option>{availableManualSubjects.map(s => <option key={s.id} value={s.id} disabled={!!s.isComplete}>{s.optionLabel}</option>)}</select>{addForm.teacherId && availableManualSubjects.length === 0 && <p role="status" className="text-sm text-amber-700 mt-2">{addForm.classroomId ? 'ไม่พบภาระสอนสำหรับครูและห้องเรียนนี้' : 'ไม่พบภาระสอนสำหรับครูคนนี้'} กรุณาตรวจสอบเมนูภาระสอน</p>}{addForm.teacherId && addForm.classroomId && availableManualSubjects.length > 0 && selectableManualSubjects.length === 0 && <p role="status" className="text-sm text-emerald-700 mt-2">รายวิชาในภาระสอนของครูและห้องนี้จัดครบทุกคาบแล้ว</p>}</div>
           <div><label className="block text-sm font-bold mb-1">ห้องเรียน</label>
             <select value={addForm.classroomId} onChange={e => handleManualRoomChange(e.target.value)} disabled={viewMode === 'room'} className="w-full p-3 border rounded-xl bg-slate-50 disabled:bg-slate-100">
               <option value="">{addForm.teacherId && addForm.subjectId && manualRoomOptions.length === 0 ? '-- ไม่พบห้องที่มีภาระสอนรายวิชานี้ --' : '-- เลือกห้องเรียน --'}</option>
               {manualRoomOptions.map(room => <option key={room.id} value={room.id}>{room.optionLabel}</option>)}
             </select>
-            {viewMode === 'teacher' && addForm.teacherId && addForm.subjectId && <p role="status" className="text-xs text-slate-600 mt-2">แสดงเฉพาะ {manualRoomOptions.length} ห้องที่มีภาระสอนของครูในรายวิชานี้ โดยคงรายวิชาเดิมเมื่อเปลี่ยนห้องที่สอนได้</p>}
+            {viewMode !== 'room' && addForm.teacherId && addForm.subjectId && <p role="status" className="text-xs text-slate-600 mt-2">แสดงเฉพาะ {manualRoomOptions.length} ห้องที่มีภาระสอนของครูในรายวิชานี้ โดยคงรายวิชาเดิมเมื่อเปลี่ยนห้องที่สอนได้</p>}
             {addForm.teacherId && addForm.subjectId && manualRoomOptions.length === 0 && <p role="status" className="text-sm text-amber-700 mt-2">ไม่พบห้องเรียนที่มีภาระสอนรายวิชานี้ กรุณาตรวจสอบข้อมูลภาระสอน</p>}
             {addForm.teacherId && addForm.subjectId && addForm.classroomId && selectedManualRoom?.isComplete && <p role="status" className="text-sm text-amber-700 mt-2">ห้อง {selectedManualRoom.name} จัดรายวิชานี้ครบตามภาระสอนแล้ว ไม่สามารถเพิ่มคาบได้อีก</p>}
             {addForm.teacherId && addForm.subjectId && addForm.classroomId && !selectedManualRoom && <p role="status" className="text-sm text-rose-700 mt-2">ห้องนี้ไม่มีภาระสอนสำหรับครูและรายวิชาที่เลือก กรุณาเลือกห้องหรือรายวิชาใหม่</p>}
