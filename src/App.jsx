@@ -3739,7 +3739,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
   const [compareTeacherA, setCompareTeacherA] = useState('');
   const [compareTeacherB, setCompareTeacherB] = useState('');
   const [compareAddTarget, setCompareAddTarget] = useState(null);
-  const [compareFocus, setCompareFocus] = useState('all'); // all | both | free; emphasis only, never hides lessons
+  const [compareFocus, setCompareFocus] = useState('all'); // Emphasis only; never hides timetable entries or changes editing rules.
   const [hoveredSlot, setHoveredSlot] = useState(null);
   const [draggedScheduleId, setDraggedScheduleId] = useState('');
   const [dropFeedback, setDropFeedback] = useState(null);
@@ -3754,13 +3754,6 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
     teacherActivitySlots.some(a => a.teacherId === teacherId && a.day === day && String(a.periodId) === String(periodId)) ||
     teacherPLCSlots.some(p => p.teacherId === teacherId && p.day === day && String(p.periodId) === String(periodId))
   );
-  // Real collision: a single teacher has multiple independent entries in one period.
-  // Two *different* teachers teaching simultaneously is normal, not a collision.
-  const teacherSlotConflict = (teacherId, day, periodId) => {
-    const matches = row => row.teacherId===teacherId && row.day===day && String(row.periodId)===String(periodId);
-    return schedules.filter(matches).length + fixedSchedules.filter(matches).length +
-      teacherActivitySlots.filter(matches).length + teacherPLCSlots.filter(matches).length > 1;
-  };
   const compareReady = viewMode === 'compare' && !!compareTeacherA && !!compareTeacherB && compareTeacherA !== compareTeacherB &&
     teachers.some(t=>t.id===compareTeacherA) && teachers.some(t=>t.id===compareTeacherB);
   const comparisonCounts = useMemo(() => {
@@ -4141,28 +4134,22 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
      );
   };
 
-  // Show a teacher card only when teaching; a free slot stays visually blank.
-  // Drag/drop handlers are attached to the whole comparison cell below, so dropping
-  // into blank space or into a cell occupied only by the other teacher still works.
+  // In comparison mode only occupied teacher lanes are rendered. Empty space belongs
+  // to the shared cell, so there are no distracting "empty" cards or duplicated add buttons.
   const renderCompareTeacherLane = (day, period, teacherId, label, palette) => {
     if (!teacherSlotBusy(teacherId, day, period.id)) return null;
-    const isBlue = palette==='a';
+    const color = palette === 'a'
+      ? 'border-blue-300 bg-blue-50 text-blue-900'
+      : 'border-orange-300 bg-orange-50 text-orange-900';
     return <div key={teacherId}
-      title={`${getTeacher(teacherId).name} · วัน${day} ${period.name}`}
-      className={`rounded-lg border-l-4 p-1.5 ${isBlue?'border-blue-600 bg-blue-50':'border-orange-500 bg-orange-50'}`}>
-      <div className={`px-1 pb-1 flex items-center gap-1 text-[10px] font-bold ${isBlue?'text-blue-800':'text-orange-900'}`}>
-        <span className={`inline-block w-2 h-2 rounded-full ${isBlue?'bg-blue-600':'bg-orange-500'}`}/>
+      aria-label={`คาบของครู ${getTeacher(teacherId).name} วัน${day} ${period.name}`}
+      className={`rounded-lg border-l-4 p-1.5 shadow-sm ${color}`}>
+      <div className="mb-1 flex items-center gap-1 px-1 text-[10px] font-bold">
+        <span className={`h-2 w-2 shrink-0 rounded-full ${palette === 'a' ? 'bg-blue-600' : 'bg-orange-500'}`}/>
         ครู {label} · {getShortTeacherName(getTeacher(teacherId).name)}
       </div>
-      {getCellContent(day,period.id,teacherId)}
+      {getCellContent(day, period.id, teacherId)}
     </div>;
-  };
-  // A drop in comparison view must always operate on the teacher who owns the
-  // dragged schedule, never on the other teacher sharing the same timetable cell.
-  const comparisonDragSourceTeacher = () => {
-    const id=dragSourceIdRef.current;
-    const item=id && schedules.find(s=>s.id===id);
-    return item && [compareTeacherA,compareTeacherB].includes(item.teacherId) ? item.teacherId : '';
   };
 
   return (
@@ -4210,22 +4197,27 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
         <div className="flex flex-wrap gap-3 justify-between items-center">
           <div>
             <h3 className="font-bold text-lg text-[#081a39]">เปรียบเทียบตารางสอนครู</h3>
-            <p className="text-sm text-slate-600">แสดงเฉพาะคาบที่มีสอน · ช่องว่างจะปรากฏปุ่มเพิ่มเมื่อชี้เมาส์ · ลากย้ายจากกล่องครูที่ต้องการได้</p>
+            <p className="text-sm text-slate-600">ช่องว่างไม่แสดงข้อความ · คาบที่สอนพร้อมกันมีขอบม่วงและแสดงกล่องครู A/B แยกสี · ลากกล่องของครูเพื่อย้ายคาบได้</p>
           </div>
           <div className="flex gap-3 text-xs font-semibold flex-wrap">
             <span className="text-blue-800"><span className="inline-block w-3 h-3 bg-blue-600 rounded-sm mr-1"/>ครู A {getTeacher(compareTeacherA).name}</span>
             <span className="text-orange-800"><span className="inline-block w-3 h-3 bg-orange-500 rounded-sm mr-1"/>ครู B {getTeacher(compareTeacherB).name}</span>
-            <span className="text-purple-800"><span className="inline-block w-3 h-3 bg-purple-500 rounded-sm mr-1"/>สอนตรงกัน (ไม่ใช่คาบชนผิดปกติ)</span>
+            <span className="text-purple-800"><span className="inline-block w-3 h-3 border-2 border-purple-500 rounded-sm mr-1"/>สอนตรงกัน (ไม่ใช่คาบชนผิดปกติ)</span>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="เน้นช่วงเวลาของตารางเปรียบเทียบ">
-          <span className="text-xs text-slate-600 font-semibold mr-1">เน้นช่วงเวลา:</span>
-          {[{id:'all',text:'แสดงทุกคาบ'},{id:'both',text:'สอนตรงกัน'},{id:'free',text:'ว่างพร้อมกัน'}].map(option=><button
-            key={option.id} type="button" aria-pressed={compareFocus===option.id}
-            onClick={()=>setCompareFocus(option.id)}
-            className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${compareFocus===option.id?'bg-[#081a39] text-white border-[#081a39]':'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'}`}>
-            {option.text}
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-2 text-sm">
+          <span className="mr-1 font-semibold text-slate-700">เน้นช่วงเวลา:</span>
+          {[
+            ['all','ทุกคาบ'],
+            ['both','ครูทั้งสองสอนพร้อมกัน'],
+            ['free','ครูทั้งสองว่างพร้อมกัน']
+          ].map(([key,label])=><button key={key} type="button"
+            aria-pressed={compareFocus === key}
+            onClick={()=>setCompareFocus(key)}
+            className={`rounded-lg border px-3 py-1.5 font-semibold transition-colors ${compareFocus===key?'border-blue-700 bg-[#081a39] text-white':'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'}`}>
+            {label}
           </button>)}
+          <span className="text-xs text-slate-500">เน้นสีเท่านั้น ยังเห็นและแก้ไขได้ทุกคาบ</span>
         </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-center text-sm">
           <div className="p-3 rounded-xl bg-blue-50 text-blue-900"><strong className="block text-xl">{comparisonCounts.a}</strong>คาบที่ครู A มีรายการ</div>
@@ -4246,54 +4238,62 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
               {periods.map(p=>{
                 const busyA=teacherSlotBusy(compareTeacherA,day,p.id);
                 const busyB=teacherSlotBusy(compareTeacherB,day,p.id);
-                const freeCount=Number(!busyA)+Number(!busyB);
-                const bothBusy=busyA&&busyB;
+                const both=busyA&&busyB;
                 const bothFree=!busyA&&!busyB;
-                const realConflict=teacherSlotConflict(compareTeacherA,day,p.id)||teacherSlotConflict(compareTeacherB,day,p.id);
-                const emphasis=compareFocus==='both' ? bothBusy : compareFocus==='free' ? bothFree : true;
-                const sourceTeacher=comparisonDragSourceTeacher();
-                const isDrop=!!draggedScheduleId && !!sourceTeacher &&
-                  dropFeedback?.entityId===sourceTeacher && dropFeedback.day===day && String(dropFeedback.periodId)===String(p.id);
-                const dropState=isDrop?(dropFeedback.status==='allowed'?'ring-4 ring-emerald-500 bg-emerald-50':
-                  dropFeedback.status==='confirm'?'ring-4 ring-amber-500 bg-amber-50':'ring-4 ring-rose-500 bg-rose-50'):'';
-                const compareBorder=realConflict?'border-2 border-rose-500':bothBusy?'border-2 border-purple-500':
-                  (compareFocus==='free'&&bothFree?'border-2 border-emerald-400':'border border-slate-200');
-                return <td key={`${day}-${p.id}`} title={bothFree?'ครูทั้งสองว่าง · ชี้เมาส์เพื่อเพิ่มคาบ':undefined}
-                  className={`p-1.5 align-top border-r border-b border-slate-200 bg-white ${p.isBreak?'':'group/compare'}`}
+                const canAdd=!busyA||!busyB;
+                const dimOther = (compareFocus==='both'&&!both)||(compareFocus==='free'&&!bothFree);
+                const isDrop=!!draggedScheduleId && dropFeedback?.day===day &&
+                  String(dropFeedback.periodId)===String(p.id) &&
+                  [compareTeacherA,compareTeacherB].includes(dropFeedback.entityId);
+                const dropColor=isDrop ? (
+                  dropFeedback.status==='allowed' ? 'ring-4 ring-inset ring-emerald-500 bg-emerald-100' :
+                  dropFeedback.status==='confirm' ? 'ring-4 ring-inset ring-amber-500 bg-amber-100' :
+                  'ring-4 ring-inset ring-rose-500 bg-rose-100'
+                ) : '';
+                return <td key={`${day}-${p.id}`}
+                  className={`group relative border-r border-b border-slate-200 p-1 align-top transition-colors
+                    ${both?'border-2 border-purple-500 bg-white':compareFocus==='free'&&bothFree?'bg-emerald-50 ring-2 ring-inset ring-emerald-200':'bg-white'}
+                    ${dimOther?'opacity-50':''} ${dropColor}`}
                   onDragOver={e=>{
-                    const id=dragSourceIdRef.current, teacherId=comparisonDragSourceTeacher();
-                    if(!id)return;
+                    if(p.isBreak) return;
+                    const sourceId=dragSourceIdRef.current;
+                    if(!sourceId) return;
                     e.preventDefault();e.stopPropagation();
-                    if(!teacherId){e.dataTransfer.dropEffect='none';return;}
-                    const status=updateDropFeedback(id,teacherId,day,p.id);
+                    const source=schedules.find(item=>item.id===sourceId);
+                    if(!source || ![compareTeacherA,compareTeacherB].includes(source.teacherId)){
+                      e.dataTransfer.dropEffect='none';return;
+                    }
+                    const status=updateDropFeedback(sourceId,source.teacherId,day,p.id);
                     e.dataTransfer.dropEffect=status==='blocked'?'none':'move';
                   }}
                   onDrop={e=>{
-                    const id=dragSourceIdRef.current || e.dataTransfer.getData('text/plain');
-                    if(!id)return;
+                    if(p.isBreak) return;
                     e.preventDefault();e.stopPropagation();
-                    const source=schedules.find(s=>s.id===id);
-                    const teacherId=source?.teacherId;
-                    const result=teacherId && [compareTeacherA,compareTeacherB].includes(teacherId) ?
-                      previewDrop(id,teacherId,day,p.id):{status:'blocked',message:'ย้ายได้เฉพาะคาบของครูสองคนที่กำลังเปรียบเทียบ'};
+                    const sourceId=dragSourceIdRef.current || e.dataTransfer.getData('text/plain');
+                    const source=schedules.find(item=>item.id===sourceId);
+                    const feedback=source && [compareTeacherA,compareTeacherB].includes(source.teacherId)
+                      ? previewDrop(sourceId,source.teacherId,day,p.id)
+                      : {status:'blocked',message:'ย้ายได้เฉพาะคาบของครู A หรือครู B'};
                     clearDragVisuals();
-                    if(result.status==='blocked')return showToast('ย้ายไม่ได้: '+result.message,'error');
-                    moveScheduleByDrag(id,day,p.id);
+                    if(feedback.status==='blocked') return showToast('ย้ายไม่ได้: '+feedback.message,'error');
+                    moveScheduleByDrag(sourceId,day,p.id);
                   }}>
-                  {p.isBreak ? <div className="text-slate-500 text-sm text-center font-semibold py-7">พักเที่ยง</div> :
-                    <div className={`min-h-[94px] flex flex-col gap-1.5 rounded-lg p-1.5 transition-all ${compareBorder} ${dropState} ${emphasis?'':'opacity-45 hover:opacity-100 focus-within:opacity-100'}`}>
-                      {realConflict ? <div className="bg-rose-600 text-white text-[10px] font-bold text-center rounded py-1" title="ครูคนเดียวมีรายการซ้อนในคาบนี้">⚠ ตรวจสอบคาบชน</div> :
-                        bothBusy ? <div className="bg-purple-600 text-white text-[10px] font-bold text-center rounded py-1">สอนตรงกัน · A + B</div> : null}
-                      {renderCompareTeacherLane(day,p,compareTeacherA,'A','a')}
-                      {renderCompareTeacherLane(day,p,compareTeacherB,'B','b')}
-                      {freeCount>0 && <button type="button" onClick={()=>openCompareAdd(day,p.id)}
-                        title={freeCount===2?'เพิ่มคาบให้ครู A หรือ B':'เพิ่มคาบให้ครูที่ว่าง'}
-                        aria-label={`เพิ่มคาบวัน${day} ${p.name} ${freeCount===2?'เลือกครู A หรือ B':'ให้ครูที่ว่าง'}`}
+                  {p.isBreak ? <div className="py-7 text-center text-sm font-semibold text-slate-500">พักเที่ยง</div> :
+                    <div className={`flex h-full flex-col gap-1.5 ${both?'rounded-md p-0.5':''}`}>
+                      {both && <div className="rounded bg-purple-600 px-1 py-0.5 text-center text-[10px] font-bold text-white">
+                        สอนตรงกัน
+                      </div>}
+                      {busyA && renderCompareTeacherLane(day,p,compareTeacherA,'A','a')}
+                      {busyB && renderCompareTeacherLane(day,p,compareTeacherB,'B','b')}
+                      {canAdd && <button type="button"
+                        title="เพิ่มคาบให้ครูที่ว่างในช่วงนี้"
+                        aria-label={`เพิ่มคาบ วัน${day} ${p.name} ${bothFree?'เลือกครู A หรือ B':'ให้ครูที่ว่าง'}`}
+                        onClick={()=>openCompareAdd(day,p.id)}
                         disabled={isScheduling||editingRows||!rulesReady}
-                        className={`w-full flex-1 min-h-[28px] rounded-lg border border-transparent hover:border-dashed hover:border-slate-300 hover:bg-blue-50 focus-visible:border-blue-400 focus-visible:bg-blue-50 flex items-center justify-center text-xs text-blue-700 disabled:cursor-not-allowed disabled:opacity-30 ${bothFree?'min-h-[74px]':''}`}>
-                        <span className="opacity-0 group-hover/compare:opacity-100 focus:opacity-100 flex items-center gap-1 transition-opacity"><Plus size={13}/> เพิ่มคาบ</span>
+                        className={`flex w-full items-center justify-center rounded-md border border-dashed border-transparent text-xs text-blue-700 opacity-0 transition-opacity hover:border-blue-300 hover:bg-blue-50 hover:opacity-100 focus:border-blue-300 focus:bg-blue-50 focus:opacity-100 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-0 ${bothFree?'min-h-[86px]':'min-h-[25px]'}`}>
+                        <Plus size={14} aria-hidden="true"/> <span>เพิ่มคาบ</span>
                       </button>}
-                      {isDrop && <div className={`text-[10px] text-center font-bold ${dropFeedback.status==='blocked'?'text-rose-800':dropFeedback.status==='allowed'?'text-emerald-800':'text-amber-800'}`}>
+                      {isDrop && <div className={`rounded px-1 py-0.5 text-center text-[10px] font-semibold ${dropFeedback.status==='blocked'?'text-rose-800':dropFeedback.status==='allowed'?'text-emerald-800':'text-amber-800'}`}>
                         {dropFeedback.status==='blocked'?'✕ วางไม่ได้':'✓ วางได้'}
                       </div>}
                     </div>}
@@ -4302,7 +4302,7 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
             </tr>)}</tbody>
           </table>
         </div>
-        <p className="text-xs text-slate-600">ขอบม่วงหมายถึงครูทั้งสองสอนตรงกัน (ไม่ใช่คาบชนผิดปกติ) · สีแดงใช้เตือนเมื่อครูคนเดียวมีรายการซ้อน · ช่องว่างชี้เมาส์เพื่อเพิ่มคาบ · คาบล็อก 🔒 ยังลากด้วยมือได้ · คงการตรวจครู ห้อง และ PLC ชนตามเดิม</p>
+        <p className="text-xs text-slate-600">ขอบม่วงหมายถึงครูทั้งสองมีสอนในเวลาเดียวกัน ไม่ใช่ตารางชนผิดปกติ · เลื่อนเมาส์ไปช่องว่างเพื่อเพิ่มคาบ · ลากกล่องของครูที่ต้องการย้ายได้แม้มี 🔒 โดยยังคงล็อก · ระบบตรวจครู ห้อง และ PLC ชนตามเดิม</p>
       </section>}
       <div className="space-y-6">
         {displayedEntities.map(entity => (
@@ -4819,6 +4819,26 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
   );
 };
 
+// Count occupied teaching periods exactly as shown in the printed timetable.
+// A period is counted once, even when several records appear in the same cell.
+// Student timetables include fixed/development activities; teacher timetables
+// include only activities assigned to that teacher. PLC and lunch are excluded.
+const countPrintedTimetablePeriods = ({ mode, targetId, periods, schedules, fixedSchedules, activityGroups }) => {
+  const activityTeacherSlots = mode === 'teacher'
+    ? activityTeacherEntries(activityGroups, fixedSchedules) : [];
+  return DAYS.reduce((total, day) => total + periods.reduce((dayTotal, period) => {
+    if (period.isBreak) return dayTotal;
+    const matchesSlot = row => row.day === day && row.periodId === period.id;
+    const hasScheduledLesson = schedules.some(row => matchesSlot(row) &&
+      (mode === 'room' ? row.classroomId === targetId : row.teacherId === targetId));
+    const hasFixedActivity = fixedSchedules.some(row => matchesSlot(row) &&
+      (mode === 'room' ? fixedAppliesToClassroom(row, targetId) : row.teacherId === targetId));
+    const hasTeacherActivity = mode === 'teacher' && activityTeacherSlots.some(row =>
+      matchesSlot(row) && row.teacherId === targetId);
+    return dayTotal + (hasScheduledLesson || hasFixedActivity || hasTeacherActivity ? 1 : 0);
+  }, 0), 0);
+};
+
 const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   classrooms:draftClassrooms, teachers:draftTeachers, periods:draftPeriods,
   schoolSettings:draftSettings, plcSessions:draftPLC, publishedSnapshot, publishedLoading, publishedError,
@@ -4901,6 +4921,9 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
           ))}
         </tbody>
       </table>
+      <div className="print-total-periods text-right font-semibold">
+        รวมคาบ{mode === 'room' ? 'เรียน' : 'สอน'}ทั้งหมด {countPrintedTimetablePeriods({ mode, targetId:id, periods, schedules, fixedSchedules, activityGroups })} คาบ/สัปดาห์
+      </div>
       <div className="flex justify-between px-28 mt-24 text-sm font-medium print-signatures">
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.deputyName || '')})</p><p className="mt-1">รองผู้อำนวยการ</p></div>
         <div className="text-center"><p>ลงชื่อ........................................................</p><p className="mt-3">({String(schoolSettings?.directorName || '')})</p><p className="mt-1">ผู้อำนวยการโรงเรียน</p></div>
@@ -6625,6 +6648,15 @@ export default function App() {
         }
         #print-area .print-table td div {
           max-width: 100% !important; overflow-wrap: anywhere !important;
+        }
+        /* Place the one-line total in the existing gap above signatures.
+           Zero layout height preserves the current A4 pagination and signature position. */
+        #print-area .print-total-periods {
+          position: relative !important; top: 3mm !important;
+          height: 0 !important; margin: 0 !important; padding: 0 !important;
+          text-align: right !important; font-size: 10.5pt !important;
+          line-height: 5mm !important; font-weight: 600 !important;
+          white-space: nowrap !important;
         }
         #print-area .print-signatures {
           display: flex !important; justify-content: space-between !important;
