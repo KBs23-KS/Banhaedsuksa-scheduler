@@ -1127,6 +1127,51 @@ const calculateScheduleHealth = (schedules, loads, unavail, cUnavail, fixed, tea
   return health;
 };
 
+// Publication is an explicit user decision. Health Check still reports ALL problems,
+// but its pedagogical warnings must not block the creation of a frozen publication.
+// Keep this audit small enough for Firestore version manifests and the pointer doc.
+const buildPublicationReview = (health = {}) => {
+  const categories = [];
+  const examples = [];
+  const add = (label, count, details = []) => {
+    const amount = Number(count) || 0;
+    if (amount <= 0) return;
+    categories.push({ label, count: amount });
+    if (examples.length >= 24) return;
+    (Array.isArray(details) ? details : []).slice(0, 2).forEach(item => {
+      if (examples.length < 24) examples.push(`${label}: ${String(item).slice(0, 200)}`);
+    });
+  };
+  if (health.status === 'empty') add('ยังไม่มีภาระสอนรายวิชาหรือกิจกรรมที่กำหนดในระบบ', 1);
+  add('คาบตามภาระที่ยังจัดไม่ครบ', health.missing,
+    (health.missingLoads || []).map(l => `วิชา ${l.subjectId || '-'} ห้อง ${l.classroomId || '-'} ขาด ${l.missing || 0} คาบ`));
+  add('คาบที่จัดเกินภาระ', health.overScheduled, health.overloads);
+  [
+    ['ครูสอนหรือทำกิจกรรมซ้อนเวลา', 'teacherConflicts'],
+    ['ห้องเรียนมีรายการซ้อนเวลา', 'roomConflicts'],
+    ['ครูถูกจัดในเวลาไม่สะดวก', 'unavailConflicts'],
+    ['ห้องถูกจัดในเวลาที่ไม่ว่าง', 'cUnavailConflicts'],
+    ['มีคาบอยู่ในช่วงพัก', 'breakConflicts'],
+    ['วิชาคาบคู่ไม่เป็นไปตามเงื่อนไข', 'blockConflicts'],
+    ['ภาระสอนครูเกินข้อบังคับ', 'teacherLimitConflicts'],
+    ['ขัดกับกฎกำหนดเอง', 'customRuleConflicts'],
+    ['จำนวนคาบรายวิชาต่อวันไม่ผ่านเกณฑ์', 'subjectDailyConflicts'],
+    ['ข้อมูลอ้างอิงไม่ครบหรือไม่ถูกต้อง', 'orphans'],
+    ['PLC มีข้อขัดแย้งหรือยังตั้งค่าไม่ถูกต้อง', 'plcConflicts'],
+    ['กิจกรรมล็อกมีข้อขัดแย้ง', 'fixedConflicts'],
+    ['ครูมีภาระ 5 คาบในวันเดียว', 'teacherFivePeriodWarnings'],
+    ['กิจกรรมทำให้เกิดคาบติดกันมาก', 'teacherActivityConsecutiveWarnings'],
+    ['มีคาบสอนด้วยมือ 3 คาบติดกัน', 'teacherManualConsecutiveWarnings'],
+  ].forEach(([label, key]) => add(label, health[key]?.length || 0, health[key]));
+  if (!categories.length && health.status === 'error')
+    add('พบข้อผิดพลาดจากการตรวจสอบตาราง', 1);
+  return {
+    reviewedAt: Date.now(), status: String(health.status || 'unknown'),
+    warningCount: categories.reduce((total, x) => total + x.count, 0),
+    categories, examples,
+  };
+};
+
 // ข้อบังคับครู: นับคาบที่ครูมีสอน/กิจกรรมล็อกจริงรวมกัน และไม่นับคาบพักเป็นคาบติดกัน
 const teacherDayKey = (teacherId, day) => JSON.stringify([teacherId, day]);
 const registerTeacherPeriod = (maps, item, isActivity = isTeacherActivityDuty(item)) => {
@@ -4254,7 +4299,8 @@ const ScheduleView = ({ activityGroups, schedules, teachingLoads, classrooms, te
       </div>
       <div className="text-xs text-slate-600">กำลังแก้ไข: <strong>ฉบับร่าง</strong> · {publishedLoading?'กำลังตรวจฉบับประกาศ...':publishedError||(
         publishedSnapshot ? `มีฉบับประกาศใช้แล้ว (${new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH')})` : 'ยังไม่เคยประกาศใช้')}
-        {publishedSnapshot&&<span className="ml-2 text-amber-700">การแก้ร่างไม่เปลี่ยนฉบับประกาศ</span>}</div>
+        {publishedSnapshot&&<span className="ml-2 text-amber-700">การแก้ร่างไม่เปลี่ยนฉบับประกาศ</span>}
+        {publishedSnapshot?.publicationReview?.warningCount>0&&<span className="ml-2 font-semibold text-amber-800">· ฉบับประกาศมีคำเตือน {publishedSnapshot.publicationReview.warningCount} รายการ/คาบ (ดูเมนูรายงาน)</span>}</div>
       {viewMode !== 'compare' && !selectedId && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-12 text-slate-600">เลือกห้องเรียน ครู หรือเลือกทั้งหมดเพื่อดูตารางและจัดคาบด้วยมือ</div>}
       {viewMode === 'compare' && !compareReady && <div className="bg-white border border-dashed border-slate-300 text-center rounded-2xl p-10 text-slate-600">เลือกครู A และครู B ที่ต่างกันเพื่อแสดงตารางสอนรวมในตารางเดียว</div>}
       {draggedScheduleId && <div role="status" aria-live="polite" className={`fixed bottom-4 right-4 z-50 max-w-[min(92vw,520px)] pointer-events-none rounded-xl border-2 px-4 py-3 shadow-lg text-sm font-semibold ${
@@ -4783,6 +4829,11 @@ const ReportsView = ({ health:draftHealth, teachers:draftTeachers, subjects:draf
           {publishedSnapshot&&<option value="published">ฉบับประกาศใช้</option>}
         </select><span className={`text-xs font-semibold px-2 py-1 rounded-full ${showingPublished?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}`}>{showingPublished?'ประกาศใช้แล้ว':'ฉบับร่าง'}</span><span className="text-xs text-slate-500">{showingPublished?`ประกาศเมื่อ ${new Date(publishedSnapshot.publishedAt).toLocaleString('th-TH')} · ตารางที่ประกาศแล้วไม่เปลี่ยนเมื่อแก้ฉบับร่าง`:'ตารางฉบับร่างที่กำลังแก้ไข'}</span>
       </div>}
+      {showingPublished && publishedSnapshot?.publicationReview?.warningCount>0 &&
+        <div className="rounded-xl border border-amber-200 bg-amber-50 text-amber-900 p-3 text-sm">
+          <strong>หมายเหตุฉบับประกาศ:</strong> ผู้ใช้ยืนยันประกาศทั้งที่มีคำเตือน {publishedSnapshot.publicationReview.warningCount} รายการ/คาบ
+          <div className="mt-1 text-xs">{(publishedSnapshot.publicationReview.categories||[]).map(x=>`${x.label} ${x.count}`).join(' · ')}</div>
+        </div>}
       {activeSubTab === 'health' && (
         <div className="grid grid-cols-2 gap-6">
           <div className="bg-white rounded-2xl shadow-sm border border-rose-100 p-6">
@@ -5014,7 +5065,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId('');}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">พิมพ์ตารางเรียน (รายห้อง)</option><option value="teacher">พิมพ์ตารางสอน (รายครู)</option></select>
         <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium">
           <option value="">-- เลือกเพื่อดูตัวอย่างพิมพ์ --</option><option value="ALL_PRINT" className="font-bold text-[#081a39]">-- พิมพ์ทั้งหมด --</option>
-          {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : sortTeachersByArea(teachers).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers} />}
         </select>
         <select value={printMode} onChange={e=>{setPrintMode(e.target.value);setSelectedId('');}} className="border rounded-xl p-3 font-bold">
           <option value="draft">พิมพ์ฉบับร่าง</option>{publishedSnapshot&&<option value="published">พิมพ์ฉบับประกาศใช้</option>}
@@ -5030,6 +5081,8 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
       {publishedLoading&&<p className="no-print mb-4 text-xs text-blue-800 bg-blue-50 p-3 rounded-lg">กำลังตรวจสอบฉบับประกาศใช้ กรุณารอสักครู่ก่อนพิมพ์</p>}
       {publishedError&&<p className="no-print mb-4 text-xs text-rose-800 bg-rose-50 p-3 rounded-lg">{publishedError} · โปรดตรวจสอบสถานะก่อนเลือกพิมพ์</p>}
       {showingPublished&&!references&&<p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">หมายเหตุ: ฉบับประกาศเก่าไม่มีข้อมูลอ้างอิง ณ วันที่ประกาศ ชื่อครู/วิชาอาจแสดงตามข้อมูลปัจจุบัน</p>}
+      {showingPublished&&publishedSnapshot?.publicationReview?.warningCount>0&&
+        <p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">ฉบับนี้ประกาศใช้โดยยอมรับคำเตือน {publishedSnapshot.publicationReview.warningCount} รายการ/คาบ (ตรวจรายละเอียดที่เมนูรายงาน) ข้อความนี้ไม่พิมพ์บนเอกสาร</p>}
       <div id="print-area">{selectedId === 'ALL_PRINT' ? (viewMode === 'room' ? classrooms : sortTeachersByArea(teachers)).map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />) : (selectedId && <PrintPage id={selectedId} mode={viewMode} />)}</div>
     </div>
   );
@@ -5871,7 +5924,7 @@ export default function App() {
         if(!version.includesActivityGroups) throw new Error('ฉบับประกาศไม่มีข้อมูลกิจกรรมกลุ่มครบ');
         if(alive&&requestId===requestSerial)setPublishedSnapshot({termKey,versionId:meta.versionId,publishedAt:meta.publishedAt,
           schedules:version.schedules,fixedSchedules:version.fixedSchedules,activityGroups:version.activityGroups,
-          referenceData:version.referenceData});
+          referenceData:version.referenceData,publicationReview:version.publicationReview || meta.publicationReview || null});
         if(alive&&requestId===requestSerial)setPublishedError('');
       }catch(error){console.error('Cannot load published timetable',error);
         if(alive&&requestId===requestSerial){setPublishedSnapshot(null);setPublishedError('โหลดตารางฉบับประกาศไม่ได้ กรุณาตรวจประวัติและการเชื่อมต่อ');}}
@@ -5898,7 +5951,7 @@ export default function App() {
       }
     } catch(error) { console.error('Prune schedule versions failed; old history retained',error); }
   };
-  const saveScheduleVersion = async (reason = 'manual_snapshot', scheduleItems = schedules, fixedItems = fixedSchedules, explicitTermKey = null, groupItems = activityGroups, referenceData = null, plcItems = plcSessions) => {
+  const saveScheduleVersion = async (reason = 'manual_snapshot', scheduleItems = schedules, fixedItems = fixedSchedules, explicitTermKey = null, groupItems = activityGroups, referenceData = null, plcItems = plcSessions, publicationReview = null) => {
     if (!user) return null;
     const termKey=explicitTermKey || getTermKey(schoolSettings);
     if (!/^\d{4}-[12]$/.test(termKey)) return null;
@@ -5925,7 +5978,8 @@ export default function App() {
         reason:String(reason || 'manual_snapshot'),scheduleCount:regular.length,fixedScheduleCount:fixed.length,
         activityGroupCount:groups.length,plcCount:plcs.length,chunkCount:chunks.length,scheduleFingerprint:fingerprintScheduleRows(regular),
         fixedFingerprint:fingerprintScheduleRows(fixed),activityGroupFingerprint:fingerprintScheduleRows(groups),plcFingerprint:fingerprintScheduleRows(plcs),
-        referencePartCount:referenceParts.length,referenceFingerprint:referenceData?snapshotTextHash(referenceText):null });
+        referencePartCount:referenceParts.length,referenceFingerprint:referenceData?snapshotTextHash(referenceText):null,
+        ...(reason === 'published' && publicationReview ? {publicationReview} : {}) });
     } catch(error) {
       console.error('Save schedule version failed; no ready manifest created',error);
       for(const part of saved) try { await deleteDoc(part); } catch(cleanupError) { console.error('Orphan history chunk',cleanupError); }
@@ -6501,62 +6555,84 @@ export default function App() {
   const classroomLookup = useMemo(() => new Map(classrooms.map(c => [c.id, c])), [classrooms]);
   // Block an entire school day in one atomic batch; never partially lock a room.
   const publishDraftSchedule = () => {
-    if(!rulesReady)return showToast('กรุณารอโหลดข้อมูลภาคเรียนให้ครบก่อนประกาศตาราง','error');
-    const termKey=getTermKey(schoolSettings);
-    const todayStatus=calculateScheduleHealth(schedules,teachingLoads,unavailabilities,classroomUnavailabilities,
+    if (!rulesReady) return showToast('กรุณารอโหลดข้อมูลภาคเรียนให้ครบก่อนประกาศตาราง', 'error');
+    if (isScheduling) return showToast('กำลังจัดตาราง กรุณาดำเนินการให้เสร็จก่อนประกาศ', 'error');
+    const termKey = getTermKey(schoolSettings);
+    const todayStatus = calculateScheduleHealth(schedules,teachingLoads,unavailabilities,classroomUnavailabilities,
       fixedSchedules,teachers,subjects,classrooms,periods,customRules,activityGroups,plcSessions);
-    if(todayStatus.status==='error'||todayStatus.status==='empty'||todayStatus.missing>0||todayStatus.overScheduled>0)
-      return showToast('ยังมีข้อขัดแย้งหรือภาระสอนที่จัดไม่ครบ ไม่สามารถประกาศใช้ได้','error');
-    const days5=findTeacherFifthPeriodDays(buildTeacherOccupancy(schedules,fixedSchedules,activityGroups),periods,teachers,subjects);
-    setConfirmData({type:'restore',title:'ประกาศใช้ตารางจากฉบับร่าง',confirmText:'ยืนยันประกาศใช้',
-      message:`เผยแพร่ตารางฉบับร่างของภาคเรียน ${termKey} เป็นฉบับประกาศใช้แยกต่างหาก
-หลังจากนี้แก้ร่างต่อได้โดยไม่กระทบฉบับประกาศ${days5.length?`
-ข้อยกเว้น 5 คาบ: ${days5.map(x=>x.teacherName+' วัน'+x.day).join(', ')}`:''}`,
-      action:async()=>{
-        setConfirmData(prev=>({...prev,isLoading:true}));
-        try{
-          const path=`school_data/${appId}/terms/${termKey}`;
-          // Stage 23: PLC is part of the exact published timetable, not only a client-side check.
-          const [ss,fs,gs,ps]=await Promise.all(['schedules','fixedSchedules','activityGroups','plcSessions'].map(col=>
+    const review = buildPublicationReview(todayStatus);
+    // Warnings are advisory, never a reason to reject the publication.
+    // All approval decisions must be confirmed, including an empty timetable.
+    const detailItems = review.categories.map(c => `${c.label}: ${c.count} ${c.label.includes('คาบ') ? 'คาบ/รายการ' : 'รายการ'}`);
+    const sampleItems = review.examples.slice(0, 12);
+    setConfirmData({
+      type: 'restore', title: 'ตรวจสอบก่อนประกาศใช้ตาราง', confirmText: 'ยืนยันประกาศใช้',
+      message: `ต้องการประกาศใช้ตารางฉบับร่างของภาคเรียน ${termKey} ใช่หรือไม่?\n\nฉบับประกาศใช้จะแยกจากฉบับร่าง และสามารถแก้ไขฉบับร่างต่อได้ตามปกติ\n\n${review.warningCount ? `พบคำเตือนรวม ${review.warningCount} รายการ/คาบใน ${review.categories.length} หมวด แต่คุณยังเลือกประกาศใช้ได้` : 'ไม่พบคำเตือนจากการตรวจสอบตาราง'}`,
+      detailTitle: `คำเตือนก่อนประกาศใช้ (${review.categories.length} หมวด)`,
+      detailItems: [...detailItems,...(sampleItems.length ? ['ตัวอย่างรายละเอียด:',...sampleItems] : [])],
+      detailNote: review.warningCount
+        ? 'คำเตือนทั้งหมดตรวจสอบเพิ่มเติมได้ที่เมนูรายงาน / ตรวจสอบตาราง การยืนยันครั้งนี้หมายถึงยอมรับตารางตามสภาพปัจจุบัน แม้จะมีคาบขาดหรือข้อขัดแย้ง'
+        : 'เมื่อประกาศใช้แล้ว ตารางฉบับประกาศจะไม่เปลี่ยนตามการแก้ไขฉบับร่าง',
+      action: async () => {
+        setConfirmData(prev => ({...prev,isLoading:true}));
+        try {
+          if (getTermKey(schoolSettings) !== termKey) throw new Error('ภาคเรียนเปลี่ยน กรุณาตรวจตารางและประกาศใหม่');
+          const path = `school_data/${appId}/terms/${termKey}`;
+          // Read the complete draft and PLC straight from the server. Any stale data
+          // or editing from another device aborts rather than publishing the wrong copy.
+          const [ss,fs,gs,ps] = await Promise.all(['schedules','fixedSchedules','activityGroups','plcSessions'].map(col =>
             getDocsFromServer(collection(db,`${path}/${col}`))));
-          const fromServer=[ss,fs,gs,ps].map(snapshot=>snapshot.docs.map(x=>({...x.data(),id:x.id})));
-          if(getTermKey(schoolSettings)!==termKey||
-            fingerprintScheduleRows(fromServer[0])!==fingerprintScheduleRows(schedules)||
-            fingerprintScheduleRows(fromServer[1])!==fingerprintScheduleRows(fixedSchedules)||
-            fingerprintScheduleRows(fromServer[2])!==fingerprintScheduleRows(activityGroups)||
-            fingerprintScheduleRows(fromServer[3])!==fingerprintScheduleRows(plcSessions))
+          const fromServer = [ss,fs,gs,ps].map(snapshot => snapshot.docs.map(x => ({...x.data(),id:x.id})));
+          if (getTermKey(schoolSettings) !== termKey ||
+            fingerprintScheduleRows(fromServer[0]) !== fingerprintScheduleRows(schedules) ||
+            fingerprintScheduleRows(fromServer[1]) !== fingerprintScheduleRows(fixedSchedules) ||
+            fingerprintScheduleRows(fromServer[2]) !== fingerprintScheduleRows(activityGroups) ||
+            fingerprintScheduleRows(fromServer[3]) !== fingerprintScheduleRows(plcSessions))
             throw new Error('ข้อมูลเปลี่ยนจากเครื่องอื่น กรุณาตรวจตารางและประกาศใหม่');
-          const masterBase=`school_data/${appId}`;
-          const refNames=['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules'];
-          const refs=await Promise.all(refNames.map(name=>getDocsFromServer(collection(db,
-            ['teachers','subjects','classrooms','periods'].includes(name)?`${masterBase}/${name}`:`${path}/${name}`))));
-          const frozen=Object.fromEntries(refNames.map((name,i)=>[name,refs[i].docs.map(d=>({...d.data(),id:d.id}))]));
-          if(!frozen.periods.length)frozen.periods=DEFAULT_PERIODS;
-          // The publication reference includes the same PLC reservations as its history snapshot.
-          frozen.plcSessions=fromServer[3];
-          frozen.schoolSettings={...schoolSettings};
-          // The displayed catalog must match the catalog used to approve this publication.
-          for(const name of ['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules','plcSessions']) {
-            const local={teachers,subjects,classrooms,periods,teachingLoads,unavailabilities,
+          const masterBase = `school_data/${appId}`;
+          const refNames = ['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules'];
+          const refs = await Promise.all(refNames.map(name => getDocsFromServer(collection(db,
+            ['teachers','subjects','classrooms','periods'].includes(name) ? `${masterBase}/${name}` : `${path}/${name}`))));
+          const frozen = Object.fromEntries(refNames.map((name,i) => [name,refs[i].docs.map(d => ({...d.data(),id:d.id}))]));
+          if (!frozen.periods.length) frozen.periods = DEFAULT_PERIODS;
+          frozen.plcSessions = fromServer[3];
+          frozen.schoolSettings = {...schoolSettings};
+          for (const name of ['teachers','subjects','classrooms','periods','teachingLoads','unavailabilities','classroomUnavailabilities','scheduleRules','plcSessions']) {
+            const local = {teachers,subjects,classrooms,periods,teachingLoads,unavailabilities,
               classroomUnavailabilities,scheduleRules:customRules,plcSessions}[name];
-            if(fingerprintScheduleRows(frozen[name])!==fingerprintScheduleRows(local))
+            if (fingerprintScheduleRows(frozen[name]) !== fingerprintScheduleRows(local))
               throw new Error('ข้อมูลพื้นฐานหรือเงื่อนไขเปลี่ยนขณะประกาศ กรุณาตรวจข้อมูลใหม่');
           }
-          // Validate the frozen publication with the frozen PLC and all its teaching references.
-          const publishHealth=calculateScheduleHealth(fromServer[0],frozen.teachingLoads,
+          // Recheck warnings using the exact frozen version and save this audit with
+          // the publication. Hard conflicts, missing periods, PLC issues etc. do NOT
+          // block a user-confirmed announcement.
+          const publishHealth = calculateScheduleHealth(fromServer[0],frozen.teachingLoads,
             frozen.unavailabilities,frozen.classroomUnavailabilities,fromServer[1],
             frozen.teachers,frozen.subjects,frozen.classrooms,frozen.periods,
             frozen.scheduleRules,fromServer[2],frozen.plcSessions);
-          if(publishHealth.status==='error'||publishHealth.status==='empty'||publishHealth.missing>0||publishHealth.overScheduled>0)
-            throw new Error('ตารางหรือ PLC มีข้อขัดแย้ง กรุณาตรวจและจัดใหม่ก่อนประกาศ');
-          const versionId=await saveScheduleVersion('published',fromServer[0],fromServer[1],termKey,fromServer[2],frozen,frozen.plcSessions);
-          if(!versionId)throw new Error('สร้างฉบับประกาศไม่สำเร็จ');
-          await setDoc(doc(db,`${path}/config/publishedTimetable`),{
-            versionId,publishedAt:Date.now(),termKey});
-          showToast('ประกาศใช้ตารางสำเร็จ (ตารางฉบับร่างยังแก้ได้)');
+          const publicationReview = buildPublicationReview(publishHealth);
+          const versionId = await saveScheduleVersion('published',fromServer[0],fromServer[1],termKey,
+            fromServer[2],frozen,frozen.plcSessions,publicationReview);
+          if (!versionId) throw new Error('สร้างฉบับประกาศไม่สำเร็จ');
+          // Protect against overwriting another administrator's newer publication.
+          const pointerRef = doc(db,`${path}/config/publishedTimetable`);
+          const expectedVersion = publishedSnapshot?.versionId || null;
+          await runTransaction(db,async tx => {
+            const current = await tx.get(pointerRef);
+            const currentVersion = current.exists() ? current.data().versionId || null : null;
+            if (currentVersion !== expectedVersion)
+              throw new Error('มีการประกาศฉบับใหม่จากเครื่องอื่นระหว่างดำเนินการ กรุณาตรวจสอบอีกครั้ง');
+            tx.set(pointerRef,{versionId,publishedAt:Date.now(),termKey,publicationReview});
+          });
+          showToast(`ประกาศใช้ตารางสำเร็จ${publicationReview.warningCount ? ` (มีคำเตือน ${publicationReview.warningCount} รายการ/คาบ)` : ''} · ฉบับร่างยังแก้ไขได้`);
           setConfirmData(null);
-        }catch(error){console.error(error);showToast('ประกาศไม่สำเร็จ: '+error.message,'error');setConfirmData(null);}
-      }});
+        } catch(error) {
+          console.error(error);
+          showToast('ประกาศไม่สำเร็จ: '+error.message,'error');
+          setConfirmData(null);
+        }
+      },
+    });
   };
 
   const blockClassroomDays = async (roomIds,day,reason='') => {
