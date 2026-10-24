@@ -5041,7 +5041,7 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         {mode==='teacher' && <p className="text-base">{teacherAreaLabel(getTeacher(id))}</p>}
       </div>
       <table className="w-full text-left border-collapse border-2 border-black mb-12 print-table table-fixed">
-        <thead><tr><th className="border-2 border-black p-3 text-center text-sm w-24 font-bold">วัน/เวลา</th>{periods.map(p => <th key={p.id} className={`border-2 border-black p-2 text-center text-xs ${p.isBreak ? 'print-break-column' : ''}`}><div className="font-bold">{p.name}</div><div className="font-normal text-[11px]">{p.start}-{p.end}</div></th>)}</tr></thead>
+        <thead><tr><th className="border-2 border-black p-3 text-center text-sm w-24 font-bold">วัน/เวลา</th>{periods.map(p => <th key={p.id} className="border-2 border-black p-2 text-center text-xs"><div className="font-bold">{p.name}</div><div className="font-normal text-[11px]">{p.start}-{p.end}</div></th>)}</tr></thead>
         <tbody>
           {DAYS.map(day => (
             <tr key={day}><td className="border-2 border-black p-3 font-bold text-center text-sm">{day}</td>{periods.map(p => <td key={`${day}-${p.id}`} className={`border-2 border-black p-1 h-20 align-middle ${p.isBreak ? 'bg-gray-200/50' : ''}`}>{p.isBreak ? <div className="text-center text-sm text-gray-500 font-bold">พักเที่ยง</div> : getCellContent(id, day, p.id, mode)}</td>)}</tr>
@@ -6730,7 +6730,7 @@ export default function App() {
         }
         #print-area .print-header {
           text-align: center !important; margin: 0 0 5mm !important;
-          line-height: 1.25 !important;
+          line-height: 1.3 !important;
         }
         #print-area .print-school-logo {
           display: block !important; width: 25mm !important; height: 25mm !important;
@@ -6738,18 +6738,18 @@ export default function App() {
         }
         #print-area .print-header h1 {
           font-size: 20pt !important; font-weight: 700 !important;
-          line-height: 1.25 !important; margin: 0 0 2mm !important;
+          line-height: 1.3 !important; margin: 0 0 2mm !important;
         }
         #print-area .print-header h2 {
-          font-size: 14pt !important; line-height: 1.25 !important;
+          font-size: 15pt !important; line-height: 1.3 !important;
           margin: 0 0 1mm !important;
         }
         #print-area .print-header h3 {
-          font-size: 14pt !important; line-height: 1.25 !important;
+          font-size: 14pt !important; line-height: 1.3 !important;
           margin: 0 !important;
         }
         #print-area .print-header p {
-          font-size: 13pt !important; line-height: 1.25 !important;
+          font-size: 13pt !important; line-height: 1.3 !important;
           margin: 0 !important;
         }
         #print-area .print-table {
@@ -6765,9 +6765,12 @@ export default function App() {
           overflow-wrap: anywhere !important; word-break: break-word !important;
           white-space: normal !important;
         }
+        /* Restore lunch to the original column width. Preserve font and row sizes;
+           give lesson text a negligible 0.1mm more horizontal room for print pagination. */
+        #print-area .print-table tbody td:not(:first-child) {
+          padding-left: 0.9mm !important; padding-right: 0.9mm !important;
+        }
         #print-area .print-table th:first-child { width: 19mm !important; }
-        /* Make only the lunch-break column slightly narrower than teaching periods. */
-        #print-area .print-table thead th.print-break-column { width: 24mm !important; }
         #print-area .print-table thead th {
           height: 11mm !important; font-size: 9pt !important;
         }
@@ -6814,7 +6817,7 @@ export default function App() {
         }
         #print-area .print-signatures {
           display: flex !important; justify-content: space-between !important;
-          margin: 10mm 0 0 !important; padding: 0 28mm !important;
+          margin: 11mm 0 0 !important; padding: 0 28mm !important;
           font-size: 10.5pt !important; line-height: 1.35 !important;
           break-inside: avoid !important; page-break-inside: avoid !important;
         }
