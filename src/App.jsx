@@ -5053,8 +5053,26 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   // If publication becomes available, print the official copy by default.
   useEffect(()=>{setPrintMode(publishedSnapshot?'published':'draft');},[publishedSnapshot?.versionId]);
   const [selectedId, setSelectedId] = useState('');
+  // Print layout is presentation-only: timetable data, publication version and
+  // the original single-page template remain unchanged.
+  const [pageLayout, setPageLayout] = useState('single');
+  const [batchChoice, setBatchChoice] = useState('all');
+  const [batchIds, setBatchIds] = useState([]);
+  const printCandidates = viewMode === 'room' ? classrooms : sortTeachersByArea(teachers);
+  const tilesPerSheet = pageLayout === 'two' ? 2 : 4;
+  const repeatItem = printCandidates.find(x => String(x.id) === String(selectedId));
+  const itemsToPrint = pageLayout === 'single'
+    ? (selectedId === 'ALL_PRINT' ? printCandidates : printCandidates.filter(x => String(x.id) === String(selectedId)))
+    : (batchChoice === 'all' ? printCandidates : batchChoice === 'repeat'
+      ? (repeatItem ? Array.from({length:tilesPerSheet},()=>repeatItem) : [])
+      : printCandidates.filter(x => batchIds.includes(String(x.id))));
+  const printSheets = pageLayout === 'single' ? [] : Array.from(
+    { length: Math.ceil(itemsToPrint.length / tilesPerSheet) }, (_, i) =>
+      itemsToPrint.slice(i * tilesPerSheet, (i + 1) * tilesPerSheet)
+  );
+  const hasPrintSelection = itemsToPrint.length > 0;
   const handlePrint=()=>{
-    if (!selectedId || publishedLoading) return;
+    if (!hasPrintSelection || publishedLoading) return;
     // A confirmation is mandatory for the Print button when printing a draft.
     if (!showingPublished && !window.confirm('คุณกำลังพิมพ์ตารางฉบับร่าง ซึ่งยังไม่ใช่ตารางทางการของโรงเรียน\n\nต้องการพิมพ์ฉบับร่างต่อหรือไม่?')) return;
     window.print();
@@ -5121,16 +5139,47 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
     <div className="animate-in fade-in bhs-print-view">
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 mb-6 flex flex-wrap items-center gap-4 no-print">
         <div className="p-3 bg-[#081a39] rounded-xl shadow-md"><Printer className="text-[#d4af37]" size={28} /></div>
-        <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId('');}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">พิมพ์ตารางเรียน (รายห้อง)</option><option value="teacher">พิมพ์ตารางสอน (รายครู)</option></select>
-        <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium">
-          <option value="">-- เลือกเพื่อดูตัวอย่างพิมพ์ --</option><option value="ALL_PRINT" className="font-bold text-[#081a39]">-- พิมพ์ทั้งหมด --</option>
-          {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers} />}
+        <select value={viewMode} onChange={e => {setViewMode(e.target.value); setSelectedId(''); setBatchIds([]);}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]"><option value="room">พิมพ์ตารางเรียน (รายห้อง)</option><option value="teacher">พิมพ์ตารางสอน (รายครู)</option></select>
+        <select value={pageLayout} onChange={e => {setPageLayout(e.target.value);setBatchIds([]);}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-bold text-[#081a39]" aria-label="รูปแบบการจัดหน้าพิมพ์">
+          <option value="single">ปกติ — 1 ตาราง/หน้า</option>
+          <option value="two">2 ส่วน — ซ้าย/ขวา (หมุนตาราง)</option>
+          <option value="four">4 ส่วน — 2×2</option>
         </select>
+        {pageLayout === 'single' ? (
+          <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="p-3 border border-slate-200 rounded-xl min-w-[250px] bg-slate-50 font-medium">
+            <option value="">-- เลือกเพื่อดูตัวอย่างพิมพ์ --</option><option value="ALL_PRINT" className="font-bold text-[#081a39]">-- พิมพ์ทั้งหมด --</option>
+            {viewMode === 'room' ? classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers} />}
+          </select>
+        ) : (
+          <select value={batchChoice} onChange={e => {setBatchChoice(e.target.value);setBatchIds([]);}} className="p-3 border border-slate-200 rounded-xl bg-slate-50 font-medium" aria-label="เลือกรายการสำหรับพิมพ์หลายส่วน">
+            <option value="all">พิมพ์ทั้งหมด ({printCandidates.length} {viewMode === 'room' ? 'ห้อง' : 'คน'})</option>
+            <option value="custom">เลือกเฉพาะ{viewMode === 'room' ? 'ห้องเรียน' : 'ครู'}</option>
+            <option value="repeat">พิมพ์ตารางเดียวซ้ำ {tilesPerSheet} ชุด</option>
+          </select>
+        )}
         <select value={printMode} onChange={e=>{setPrintMode(e.target.value);setSelectedId('');}} className="border rounded-xl p-3 font-bold">
           <option value="draft">พิมพ์ฉบับร่าง</option>{publishedSnapshot&&<option value="published">พิมพ์ฉบับประกาศใช้</option>}
         </select>
-        <button onClick={handlePrint} disabled={!selectedId||publishedLoading} className="px-8 py-3 bg-[#081a39] text-white rounded-xl shadow-md font-bold disabled:opacity-50 ml-auto hover:bg-[#122b5e]">พิมพ์เอกสาร</button>
+        <button onClick={handlePrint} disabled={!hasPrintSelection||publishedLoading} className="px-8 py-3 bg-[#081a39] text-white rounded-xl shadow-md font-bold disabled:opacity-50 ml-auto hover:bg-[#122b5e]">พิมพ์เอกสาร</button>
       </div>
+      {pageLayout !== 'single' && <div className="no-print mb-4 rounded-xl bg-white border border-slate-200 p-4 text-sm text-slate-700">
+        <div className="font-bold mb-2">{pageLayout === 'two' ? '2 ตารางต่อ A4 แนวนอน — ซ้าย/ขวา' : '4 ตารางต่อ A4 แนวนอน — 2×2'} · เลือกแล้ว {itemsToPrint.length} รายการ · {printSheets.length} แผ่น</div>
+        {pageLayout === 'two' && <p className="text-xs text-slate-500 mb-2">ตารางแต่ละส่วนหมุน 90° เพื่อให้อักษรใหญ่กว่าแบบย่อตรง ๆ และอ่านได้เมื่อหมุนกระดาษ</p>}
+        {batchChoice === 'repeat' && <select value={selectedId} onChange={e=>setSelectedId(e.target.value)} className="mb-2 block p-2 rounded-lg border border-slate-200 bg-slate-50 w-full max-w-lg">
+          <option value="">-- เลือกตารางสำหรับทำซ้ำ --</option>
+          {viewMode === 'room' ? classrooms.map(c=><option key={c.id} value={c.id}>{c.name}</option>) : <TeacherOptionsByArea teachers={teachers} />}
+        </select>}
+        {batchChoice === 'custom' && <>
+          <div className="flex gap-2 mb-2"><button type="button" onClick={() => setBatchIds(printCandidates.map(x => String(x.id)))} className="px-3 py-1 rounded bg-blue-50 text-blue-800 border border-blue-200">เลือกทั้งหมด</button><button type="button" onClick={() => setBatchIds([])} className="px-3 py-1 rounded bg-slate-50 text-slate-700 border border-slate-200">ล้างที่เลือก</button></div>
+          <div className="max-h-44 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-1 border border-slate-200 rounded-lg p-2">
+            {printCandidates.map((item,index) => <div key={item.id}>
+              {viewMode === 'teacher' && (index===0 || item.subjectArea!==printCandidates[index-1]?.subjectArea) && <div className="font-bold text-xs mt-2 mb-1 text-slate-500">{teacherAreaLabel(item)}</div>}
+              <label className="flex items-center gap-2 p-1.5 hover:bg-blue-50 rounded cursor-pointer"><input type="checkbox" checked={batchIds.includes(String(item.id))} onChange={e=>setBatchIds(prev=>e.target.checked?[...prev,String(item.id)]:prev.filter(x=>x!==String(item.id)))} />{item.name}</label>
+            </div>)}
+          </div>
+        </>}
+        <p className="text-xs text-slate-500 mt-2">ตารางที่เลือกจะเรียงตามห้องเรียนหรือกลุ่มสาระ/ชื่อครู และแบ่งหน้าละ {tilesPerSheet} ตารางโดยอัตโนมัติ</p>
+      </div>}
       <div className="no-print flex flex-wrap items-center gap-3 mb-4 rounded-xl border border-slate-200 bg-white p-3 text-sm">
         <span className={`font-bold rounded-full px-3 py-1 ${showingPublished?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}`}>
           {showingPublished?'ฉบับประกาศใช้แล้ว':'ฉบับร่าง (ยังไม่ประกาศ)'}
@@ -5142,7 +5191,15 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
       {showingPublished&&!references&&<p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">หมายเหตุ: ฉบับประกาศเก่าไม่มีข้อมูลอ้างอิง ณ วันที่ประกาศ ชื่อครู/วิชาอาจแสดงตามข้อมูลปัจจุบัน</p>}
       {showingPublished&&publishedSnapshot?.publicationReview?.warningCount>0&&
         <p className="no-print mb-4 text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">ฉบับนี้ประกาศใช้โดยยอมรับคำเตือน {publishedSnapshot.publicationReview.warningCount} รายการ/คาบ (ตรวจรายละเอียดที่เมนูรายงาน) ข้อความนี้ไม่พิมพ์บนเอกสาร</p>}
-      <div id="print-area">{selectedId === 'ALL_PRINT' ? (viewMode === 'room' ? classrooms : sortTeachersByArea(teachers)).map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />) : (selectedId && <PrintPage id={selectedId} mode={viewMode} />)}</div>
+      <div id="print-area" className={pageLayout === 'single' ? 'print-layout-single' : `print-layout-${pageLayout}`}>
+        {pageLayout === 'single' ? itemsToPrint.map(item => <PrintPage key={item.id} id={item.id} mode={viewMode} />)
+          : printSheets.map((sheet, sheetIndex) => <div className={`print-sheet print-sheet-${pageLayout}`} key={`sheet-${sheetIndex}`}>
+              {sheet.map((item,tileIndex) => <div className="print-tile" key={`${sheetIndex}-${tileIndex}-${item.id}`} >
+                <div className="print-tile-content"><PrintPage id={item.id} mode={viewMode} /></div>
+              </div>)}
+              {Array.from({length:tilesPerSheet-sheet.length},(_,i)=><div key={`empty-${i}`} className="print-tile print-tile-empty" />)}
+            </div>)}
+      </div>
     </div>
   );
 };
@@ -6889,6 +6946,47 @@ export default function App() {
         }
         #print-area .print-signatures p + p { margin-top: 3mm !important; }
         #print-area .print-signatures p + p + p { margin-top: 1mm !important; }
+        /* Compact sheets share the same full-size timetable content and only
+           transform it for preview/printing. One-table printing is unchanged. */
+        #print-area .print-sheet {
+          box-sizing: border-box !important; width: 281mm !important;
+          height: 194mm !important; padding: 0 !important; margin: 0 auto 8mm !important;
+          display: grid !important; overflow: hidden !important;
+          border: 1px solid #cbd5e1; background: white;
+        }
+        #print-area .print-sheet-four {
+          grid-template-columns: repeat(2, 139mm) !important;
+          grid-template-rows: repeat(2, 95.5mm) !important;
+          gap: 3mm !important;
+        }
+        #print-area .print-sheet-two {
+          grid-template-columns: repeat(2, 139mm) !important;
+          grid-template-rows: 194mm !important;
+          gap: 3mm !important;
+        }
+        #print-area .print-tile { position: relative !important; min-width: 0 !important;
+          min-height: 0 !important; overflow: hidden !important; box-sizing: border-box !important;
+          outline: 1px dashed #e2e8f0; outline-offset: -1px;
+        }
+        #print-area .print-tile-content { position: absolute !important;
+          box-sizing: border-box !important; width: 281mm !important; top: 1mm; left: 2mm;
+          transform-origin: top left !important;
+        }
+        #print-area .print-sheet-four .print-tile-content {
+          transform: scale(0.475) !important;
+        }
+        #print-area .print-sheet-two .print-tile-content {
+          left: 5mm; top: 4mm;
+          /* Original 281×194mm landscape page becomes a 128×185mm vertical tile. */
+          transform: translateX(128.04mm) rotate(90deg) scale(0.66) !important;
+        }
+        #print-area .print-tile .print-page {
+          width: 281mm !important; min-width: 281mm !important;
+          min-height: 194mm !important; max-width: none !important;
+          margin: 0 !important; padding: 0 !important;
+          border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+          break-after: auto !important; page-break-after: auto !important;
+        }
         @media print {
           html, body, #root {
             width: 100% !important; height: auto !important; overflow: visible !important;
@@ -6918,6 +7016,21 @@ export default function App() {
           }
           #print-area .print-table th, #print-area .print-table td {
             -webkit-print-color-adjust: exact; print-color-adjust: exact;
+          }
+          #print-area .print-sheet {
+            margin: 0 !important; border: 0 !important;
+            box-shadow: none !important; outline: none !important;
+            break-after: page !important; page-break-after: always !important;
+            break-inside: avoid !important; page-break-inside: avoid !important;
+          }
+          #print-area .print-sheet:last-child {
+            break-after: auto !important; page-break-after: auto !important;
+          }
+          #print-area .print-tile { outline: none !important; }
+          #print-area .print-tile .print-page {
+            width: 281mm !important; min-width: 281mm !important;
+            min-height: 194mm !important; margin: 0 !important;
+            break-after: auto !important; page-break-after: auto !important;
           }
         }
       `}</style>
