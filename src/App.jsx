@@ -6972,8 +6972,19 @@ export default function App() {
           box-sizing: border-box !important; width: 281mm !important; top: 1mm; left: 2mm;
           transform-origin: top left !important;
         }
+        /* Four-up pages must be *laid out* at the compact size, not merely
+           painted smaller with transform:scale(). Chrome print pagination can
+           fragment transformed full-size tables across the physical sheet,
+           leaving only the first weekday visible in the lower two tiles.
+           zoom changes layout dimensions as well as painted dimensions. */
+        #print-area .print-sheet-four .print-tile {
+          padding: 2mm 0 0 4mm !important;
+        }
         #print-area .print-sheet-four .print-tile-content {
-          transform: scale(0.475) !important;
+          position: static !important;
+          left: auto !important; top: auto !important;
+          transform: none !important;
+          zoom: 0.465 !important;
         }
         #print-area .print-sheet-two .print-tile-content {
           left: 5mm; top: 4mm;
@@ -7027,6 +7038,10 @@ export default function App() {
             break-after: auto !important; page-break-after: auto !important;
           }
           #print-area .print-tile { outline: none !important; }
+          #print-area .print-sheet-four .print-tile-content {
+            position: static !important; transform: none !important;
+            zoom: 0.465 !important;
+          }
           #print-area .print-tile .print-page {
             width: 281mm !important; min-width: 281mm !important;
             min-height: 194mm !important; margin: 0 !important;
