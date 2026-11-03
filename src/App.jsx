@@ -2517,7 +2517,6 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
           </div>
           <div className="border border-slate-200 rounded-xl p-4 space-y-3">
             <h3 className="font-bold text-[#081a39]">ภาพลายเซ็นสำหรับพิมพ์เอกสาร (ไม่ต้องใช้รหัสผ่าน)</h3>
-            <p className="text-xs text-amber-900 bg-amber-50 p-3 rounded-lg">ข้อควรระวัง: ระบบนี้ยังใช้ Firebase Anonymous Auth และยังไม่มีสิทธิ์ผู้ดูแลที่ตรวจสอบจากเซิร์ฟเวอร์ ภาพลายเซ็นที่บันทึกโดยไม่ใช้รหัสผ่านจะไม่ถูกเข้ารหัส ผู้ที่มีสิทธิ์อ่านเอกสาร Firebase นี้ตาม Firestore Rules อาจคัดลอกภาพไปใช้ได้ โปรดใช้เมื่อได้รับอนุญาตจากเจ้าของลายเซ็น และควรเพิ่มระบบสิทธิ์ก่อนใช้งานจริงในวงกว้าง</p>
             <p className="text-xs text-slate-500">ถ้าเคยอัปโหลดภาพแบบมีรหัสผ่านไว้แล้ว ต้องเลือกภาพ PNG ใหม่และบันทึกทับอีกครั้ง (ไม่สามารถปลดล็อกข้อมูลเดิมได้โดยไม่ใช้รหัสผ่าน)</p>
             {Object.entries(PRINT_SIGNATURE_ROLES).map(([role,label])=><div key={role} className="flex flex-wrap gap-2 items-center border rounded-xl p-3">
               <div className="flex-1 min-w-[170px]"><p className="font-bold text-sm">ลายเซ็น{label}</p><p className="text-xs text-slate-500">{signatureExists[role]==='ready'?'บันทึกแล้ว · พิมพ์ได้ทันที':signatureExists[role]==='legacy'?'ภาพเดิมเข้ารหัส · กรุณาอัปโหลด PNG ใหม่':'ยังไม่มีภาพที่บันทึกไว้'}</p></div>
