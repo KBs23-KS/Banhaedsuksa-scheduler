@@ -2287,41 +2287,21 @@ const Dashboard = ({ schoolSettings, teachers, activeSubjects, classrooms, teach
   );
 };
 
-// Printed signatures live in a separate encrypted Firestore document, never in
-// the public school settings, term snapshots, print templates or JSON backups.
-// The current app uses anonymous Firebase Auth: a passphrase protects image
-// confidentiality, NOT permission to overwrite data. Server-enforced roles
-// would require a separate Authentication/Firestore Rules migration.
+// Printed signatures are stored separately from school settings and backups.
+// WARNING: Firebase Anonymous Auth has no server-verified administrator role.
+// With no passphrase, anyone allowed to read the document by Firestore Rules can
+// read the original signature PNG. Do not mistake client-side UI for access control.
 const PRINT_SIGNATURE_ROLES = Object.freeze({ deputy:'รองผู้อำนวยการ', director:'ผู้อำนวยการ' });
 const printSignatureRef = (firestore, schoolAppId) => doc(firestore, `school_data/${schoolAppId}/config/printSignatures`);
-const signatureBytesToB64 = bytes => {
-  let result='';
-  for(let i=0;i<bytes.length;i+=8192) result+=String.fromCharCode(...bytes.subarray(i,i+8192));
-  return btoa(result);
+const plainPrintSignatureEntry = png => {
+  if(!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(png) || png.length>300000)
+    throw new Error('ข้อมูลภาพลายเซ็น PNG ไม่ถูกต้องหรือใหญ่เกินไป');
+  return {v:2, png};
 };
-const signatureB64ToBytes = base64 => Uint8Array.from(atob(base64), char=>char.charCodeAt(0));
-const signatureCryptoKey = async (passphrase, salt) => {
-  if(!globalThis.crypto?.subtle) throw new Error('ต้องเปิดเว็บผ่าน HTTPS เพื่อเข้ารหัสภาพลายเซ็น');
-  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(passphrase),'PBKDF2',false,['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:210000,hash:'SHA-256'},key,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
-};
-const encryptPrintSignature = async (pngDataUrl, passphrase) => {
-  if(!/^data:image\/png;base64,/.test(pngDataUrl) || pngDataUrl.length>300000) throw new Error('รูปภาพลายเซ็นไม่ถูกต้องหรือมีขนาดใหญ่เกินไป');
-  const salt=crypto.getRandomValues(new Uint8Array(16));
-  const iv=crypto.getRandomValues(new Uint8Array(12));
-  const key=await signatureCryptoKey(passphrase,salt);
-  const cipher=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(pngDataUrl));
-  return { v:1, salt:signatureBytesToB64(salt), iv:signatureBytesToB64(iv), cipher:signatureBytesToB64(new Uint8Array(cipher)) };
-};
-const decryptPrintSignature = async (entry, passphrase) => {
-  if(entry?.v!==1 || !entry?.salt || !entry?.iv || !entry?.cipher) throw new Error('ข้อมูลลายเซ็นไม่ถูกต้อง');
-  try {
-    const key=await signatureCryptoKey(passphrase,signatureB64ToBytes(entry.salt));
-    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:signatureB64ToBytes(entry.iv)},key,signatureB64ToBytes(entry.cipher));
-    const png=new TextDecoder().decode(plain);
-    if(!/^data:image\/png;base64,/.test(png) || png.length>300000) throw new Error('INVALID_IMAGE');
-    return png;
-  } catch(err) {throw new Error('รหัสผ่านลายเซ็นไม่ถูกต้อง หรือข้อมูลลายเซ็นเสียหาย');}
+const readPlainPrintSignature = entry => {
+  if(entry?.v===1) throw new Error('ลายเซ็นเดิมยังเข้ารหัสด้วยรหัสผ่าน กรุณาอัปโหลดภาพ PNG ใหม่ในตั้งค่าระบบเพื่อใช้งานแบบไม่ต้องใส่รหัสผ่าน');
+  if(entry?.v!==2) throw new Error('ยังไม่มีภาพลายเซ็นในรูปแบบใหม่ กรุณาอัปโหลดภาพ PNG ในตั้งค่าระบบ');
+  return plainPrintSignatureEntry(entry.png).png;
 };
 const preparePrintSignaturePng = async file => {
   if(file?.type!=='image/png' || file.size>2*1024*1024) throw new Error('กรุณาเลือก PNG พื้นหลังโปร่งใส ขนาดไม่เกิน 2 MB');
@@ -2397,15 +2377,14 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
     finally {setLogoBusy(false);}
   };
   const [signaturePending,setSignaturePending]=useState({deputy:'',director:''});
-  const [signaturePassword,setSignaturePassword]=useState('');
   const [signatureBusy,setSignatureBusy]=useState(false);
-  const [signatureExists,setSignatureExists]=useState({deputy:false,director:false});
+  const [signatureExists,setSignatureExists]=useState({deputy:'none',director:'none'});
   const signatureFileRefs={ deputy:useRef(null),director:useRef(null) };
   useEffect(()=>{
     if(!user) return;
     let active=true;
     getDocFromServer(printSignatureRef(db,appId)).then(snap=>{
-      if(active) setSignatureExists({deputy:!!snap.data()?.deputy,director:!!snap.data()?.director});
+      if(active) setSignatureExists({deputy:snap.data()?.deputy?.v===2?'ready':snap.data()?.deputy?'legacy':'none',director:snap.data()?.director?.v===2?'ready':snap.data()?.director?'legacy':'none'});
     }).catch(()=>{ if(active) showToast('ไม่สามารถอ่านสถานะภาพลายเซ็นจาก Firebase ได้','error'); });
     return ()=>{active=false;};
   },[db,appId,user]);
@@ -2415,42 +2394,34 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
     try {
       const png=await preparePrintSignaturePng(file);
       setSignaturePending(prev=>({...prev,[role]:png}));
-      showToast(`เลือกภาพลายเซ็น${PRINT_SIGNATURE_ROLES[role]}แล้ว กรุณาใส่รหัสผ่านและกดบันทึกภาพลายเซ็น`);
+      showToast(`เลือกภาพลายเซ็น${PRINT_SIGNATURE_ROLES[role]}แล้ว กรุณากดบันทึกภาพลายเซ็น`);
     } catch(e){showToast(e.message||'อ่านลายเซ็นไม่สำเร็จ','error');}
   };
   const saveSignature = async role => {
     if(signatureBusy||!user)return;
     if(!signaturePending[role])return showToast('กรุณาเลือกภาพ PNG ก่อน','error');
-    if(signaturePassword.length<8)return showToast('กรุณาตั้งรหัสผ่านภาพลายเซ็นอย่างน้อย 8 ตัวอักษร','error');
-    if(!window.confirm(`บันทึกลายเซ็น${PRINT_SIGNATURE_ROLES[role]}ลง Firebase แบบเข้ารหัส?\nต้องใช้รหัสผ่านนี้เมื่อพิมพ์แบบมีลายเซ็น และไม่สามารถกู้คืนรหัสผ่านได้`))return;
+    if(!window.confirm(`บันทึกภาพลายเซ็น${PRINT_SIGNATURE_ROLES[role]}โดยไม่ใช้รหัสผ่าน?\n\nสำคัญ: ระบบนี้ยังใช้ Firebase Anonymous Auth ผู้ที่ได้รับอนุญาตให้อ่านข้อมูลใน Firebase อาจเข้าถึงภาพลายเซ็นจริงได้ กรุณาใช้เมื่อได้รับอนุญาตจากเจ้าของลายเซ็นเท่านั้น`))return;
     setSignatureBusy(true);
     try {
-      const ref=printSignatureRef(db,appId);
-      const previous=await getDocFromServer(ref);
-      if(previous.data()?.[role]) await decryptPrintSignature(previous.data()[role],signaturePassword);
-      const encrypted=await encryptPrintSignature(signaturePending[role],signaturePassword);
-      await setDoc(ref,{[role]:encrypted},{merge:true});
+      const entry=plainPrintSignatureEntry(signaturePending[role]);
+      await setDoc(printSignatureRef(db,appId),{[role]:entry},{merge:true});
       setSignaturePending(prev=>({...prev,[role]:''}));
-      setSignatureExists(prev=>({...prev,[role]:true}));
-      setSignaturePassword('');
-      showToast(`บันทึกลายเซ็น${PRINT_SIGNATURE_ROLES[role]}แบบเข้ารหัสสำเร็จ`);
-    }catch(e){showToast(e.message||'บันทึกลายเซ็นไม่สำเร็จ ตรวจสิทธิ์ Firebase','error');}
+      setSignatureExists(prev=>({...prev,[role]:'ready'}));
+      showToast(`บันทึกลายเซ็น${PRINT_SIGNATURE_ROLES[role]}แล้ว สามารถเลือกพิมพ์ได้โดยไม่ต้องใส่รหัสผ่าน`);
+    }catch(e){showToast(e.message||'บันทึกลายเซ็นไม่สำเร็จ กรุณาตรวจสิทธิ์ Firebase','error');}
     finally{setSignatureBusy(false);}
   };
   const deleteSignature = async role => {
     if(signatureBusy||!user)return;
-    if(!signaturePassword)return showToast('กรุณากรอกรหัสผ่านลายเซ็นเพื่อยืนยันการลบ','error');
     if(!window.confirm(`ต้องการลบภาพลายเซ็น${PRINT_SIGNATURE_ROLES[role]}ออกจาก Firebase จริงหรือไม่?`))return;
     setSignatureBusy(true);
     try {
       const ref=printSignatureRef(db,appId);
       const existing=await getDocFromServer(ref);
       if(!existing.data()?.[role]) throw new Error('ไม่พบภาพลายเซ็นนี้');
-      await decryptPrintSignature(existing.data()[role],signaturePassword);
       await updateDoc(ref,{[role]:deleteField()});
-      setSignatureExists(prev=>({...prev,[role]:false}));
+      setSignatureExists(prev=>({...prev,[role]:'none'}));
       setSignaturePending(prev=>({...prev,[role]:''}));
-      setSignaturePassword('');
       showToast(`ลบลายเซ็น${PRINT_SIGNATURE_ROLES[role]}แล้ว`);
     }catch(e){showToast(e.message||'ลบลายเซ็นไม่สำเร็จ','error');}
     finally{setSignatureBusy(false);}
@@ -2545,18 +2516,16 @@ const SettingsView = ({ schoolSettings, db, user, appId, showToast, getTermKey, 
             <p className="text-xs text-slate-500">แสดงตราขนาดเล็กกึ่งกลางเหนือชื่อโรงเรียนในเอกสารทุกชุด · เก็บในตั้งค่าระบบเดิม · กดบันทึกการตั้งค่าหลังเพิ่ม/ลบรูป</p>
           </div>
           <div className="border border-slate-200 rounded-xl p-4 space-y-3">
-            <h3 className="font-bold text-[#081a39]">ภาพลายเซ็นสำหรับพิมพ์เอกสาร (จัดเก็บแบบเข้ารหัส)</h3>
-            <p className="text-xs text-amber-800 bg-amber-50 p-3 rounded-lg">ระบบนี้ใช้ Firebase Anonymous Auth จึงยังไม่มีสิทธิ์ผู้ดูแลที่ตรวจสอบได้จากเซิร์ฟเวอร์ ภาพลายเซ็นจะถูกเข้ารหัสด้วยรหัสผ่านก่อนบันทึก และจะไม่แสดงในเอกสารจนกว่าจะปลดล็อก แต่การจำกัดสิทธิ์ผู้ที่แก้ไขไฟล์จริง ๆ ต้องเพิ่มระบบสิทธิ์และ Firestore Rules ภายหลัง กรุณาใช้งานเมื่อได้รับอนุญาตจากเจ้าของลายเซ็น</p>
-            <label className="block text-sm font-medium">รหัสผ่านภาพลายเซ็น (อย่างน้อย 8 ตัวอักษร ใช้รหัสเดียวกันสำหรับทั้งสองท่าน)</label>
-            <input type="password" autoComplete="new-password" value={signaturePassword} onChange={e=>setSignaturePassword(e.target.value)} className="w-full p-3 border rounded-xl" placeholder="กรอกเฉพาะเมื่อบันทึกหรือถอนภาพลายเซ็น" />
-            <p className="text-xs text-slate-500">รหัสผ่านไม่ได้เก็บใน Firebase ถ้าลืมจะเปิดภาพเดิมไม่ได้ กรุณาเก็บรหัสไว้ในที่ปลอดภัย ไม่ใช่รหัสผ่านเข้าสู่ระบบ</p>
+            <h3 className="font-bold text-[#081a39]">ภาพลายเซ็นสำหรับพิมพ์เอกสาร (ไม่ต้องใช้รหัสผ่าน)</h3>
+            <p className="text-xs text-amber-900 bg-amber-50 p-3 rounded-lg">ข้อควรระวัง: ระบบนี้ยังใช้ Firebase Anonymous Auth และยังไม่มีสิทธิ์ผู้ดูแลที่ตรวจสอบจากเซิร์ฟเวอร์ ภาพลายเซ็นที่บันทึกโดยไม่ใช้รหัสผ่านจะไม่ถูกเข้ารหัส ผู้ที่มีสิทธิ์อ่านเอกสาร Firebase นี้ตาม Firestore Rules อาจคัดลอกภาพไปใช้ได้ โปรดใช้เมื่อได้รับอนุญาตจากเจ้าของลายเซ็น และควรเพิ่มระบบสิทธิ์ก่อนใช้งานจริงในวงกว้าง</p>
+            <p className="text-xs text-slate-500">ถ้าเคยอัปโหลดภาพแบบมีรหัสผ่านไว้แล้ว ต้องเลือกภาพ PNG ใหม่และบันทึกทับอีกครั้ง (ไม่สามารถปลดล็อกข้อมูลเดิมได้โดยไม่ใช้รหัสผ่าน)</p>
             {Object.entries(PRINT_SIGNATURE_ROLES).map(([role,label])=><div key={role} className="flex flex-wrap gap-2 items-center border rounded-xl p-3">
-              <div className="flex-1 min-w-[170px]"><p className="font-bold text-sm">ลายเซ็น{label}</p><p className="text-xs text-slate-500">{signatureExists[role]?'บันทึกแบบเข้ารหัสแล้ว':'ยังไม่มีภาพที่บันทึกไว้'}</p></div>
+              <div className="flex-1 min-w-[170px]"><p className="font-bold text-sm">ลายเซ็น{label}</p><p className="text-xs text-slate-500">{signatureExists[role]==='ready'?'บันทึกแล้ว · พิมพ์ได้ทันที':signatureExists[role]==='legacy'?'ภาพเดิมเข้ารหัส · กรุณาอัปโหลด PNG ใหม่':'ยังไม่มีภาพที่บันทึกไว้'}</p></div>
               {signaturePending[role]&&<img src={signaturePending[role]} alt={`ตัวอย่างลายเซ็น${label}ที่ยังไม่บันทึก`} className="w-28 h-12 object-contain"/>}
               <button type="button" disabled={signatureBusy} onClick={()=>signatureFileRefs[role].current?.click()} className="px-3 py-2 border rounded-lg text-sm disabled:opacity-50">เลือก PNG</button>
               <input ref={signatureFileRefs[role]} type="file" accept="image/png" className="hidden" onChange={e=>handleSignatureFile(role,e)}/>
               <button type="button" disabled={signatureBusy||!signaturePending[role]} onClick={()=>saveSignature(role)} className="px-3 py-2 bg-[#081a39] text-white rounded-lg text-sm disabled:opacity-40">บันทึกภาพ</button>
-              {signatureExists[role]&&<button type="button" disabled={signatureBusy} onClick={()=>deleteSignature(role)} className="px-3 py-2 border border-rose-200 text-rose-700 rounded-lg text-sm disabled:opacity-50">ลบภาพ</button>}
+              {signatureExists[role]!=='none'&&<button type="button" disabled={signatureBusy} onClick={()=>deleteSignature(role)} className="px-3 py-2 border border-rose-200 text-rose-700 rounded-lg text-sm disabled:opacity-50">ลบภาพ</button>}
             </div>)}
             <p className="text-xs text-slate-500">ภาพลายเซ็นเก็บแยกจากการตั้งค่าทั่วไป ไม่รวมในไฟล์ Backup JSON แบบเดิม และไม่เพิ่มความสูงหน้าพิมพ์</p>
           </div>
@@ -5217,41 +5186,49 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
   );
   const hasPrintSelection = itemsToPrint.length > 0;
   const [printSignatureMode,setPrintSignatureMode]=useState('none');
-  const [printSignaturePassword,setPrintSignaturePassword]=useState('');
   const [printSignatureBusy,setPrintSignatureBusy]=useState(false);
-  // Decrypted images exist in memory only in this mounted print view.
+  // Keep the images in this print view only; nothing is exposed in the
+  // preview unless the user explicitly selects a signed print mode.
   const [unlockedPrintSignatures,setUnlockedPrintSignatures]=useState({});
   const signatureRolesSelected=printSignatureMode==='both'?['deputy','director']:
     printSignatureMode==='none'?[]:[printSignatureMode];
   const signaturesReady=signatureRolesSelected.every(role=>!!unlockedPrintSignatures[role]);
   const changePrintSignatureMode = mode => {
-    setPrintSignatureMode(mode);
     setUnlockedPrintSignatures({});
-    setPrintSignaturePassword('');
+    setPrintSignatureMode(mode);
   };
-  const unlockPrintSignatures = async () => {
-    if(printSignatureBusy||!user)return;
-    if(!signatureRolesSelected.length)return;
-    if(!printSignaturePassword)return showToast('กรุณาใส่รหัสผ่านภาพลายเซ็นก่อน','error');
+  useEffect(()=>{
+    let active=true;
+    if(printSignatureMode==='none'){
+      setUnlockedPrintSignatures({});
+      setPrintSignatureBusy(false);
+      return ()=>{active=false;};
+    }
+    if(!user){
+      setUnlockedPrintSignatures({});
+      setPrintSignatureBusy(false);
+      return ()=>{active=false;};
+    }
     setPrintSignatureBusy(true);
     setUnlockedPrintSignatures({});
-    try {
-      const snap=await getDocFromServer(printSignatureRef(db,appId));
+    const roles=printSignatureMode==='both'?['deputy','director']:[printSignatureMode];
+    getDocFromServer(printSignatureRef(db,appId)).then(snap=>{
+      if(!active)return;
       if(!snap.exists())throw new Error('ยังไม่ได้อัปโหลดภาพลายเซ็นในหน้าตั้งค่าระบบ');
       const images={};
-      for(const role of signatureRolesSelected){
-        if(!snap.data()[role]) throw new Error(`ยังไม่มีภาพลายเซ็น${PRINT_SIGNATURE_ROLES[role]} กรุณาอัปโหลดในหน้าตั้งค่าระบบ`);
-        images[role]=await decryptPrintSignature(snap.data()[role],printSignaturePassword);
+      for(const role of roles){
+        if(!snap.data()[role])throw new Error(`ยังไม่มีภาพลายเซ็น${PRINT_SIGNATURE_ROLES[role]} กรุณาอัปโหลดในหน้าตั้งค่าระบบ`);
+        images[role]=readPlainPrintSignature(snap.data()[role]);
       }
       setUnlockedPrintSignatures(images);
-      setPrintSignaturePassword('');
-      showToast('ปลดล็อกภาพลายเซ็นแล้ว ตรวจตัวอย่างก่อนพิมพ์ได้เลย');
-    }catch(e){showToast(e.message||'ไม่สามารถอ่านภาพลายเซ็นจาก Firebase ได้','error');}
-    finally{setPrintSignatureBusy(false);}
-  };
+    }).catch(e=>{
+      if(active){setUnlockedPrintSignatures({});showToast(e.message||'ไม่สามารถอ่านภาพลายเซ็นจาก Firebase ได้','error');}
+    }).finally(()=>{if(active)setPrintSignatureBusy(false);});
+    return ()=>{active=false;};
+  },[printSignatureMode,db,appId,user]);
   const handlePrint=()=>{
     if (!hasPrintSelection || publishedLoading) return;
-    if(!signaturesReady)return showToast('กรุณาปลดล็อกภาพลายเซ็นที่เลือกก่อนพิมพ์ หรือเปลี่ยนเป็นไม่มีภาพลายเซ็น','error');
+    if(!signaturesReady || printSignatureBusy)return showToast('ยังโหลดภาพลายเซ็นไม่สำเร็จ กรุณาตรวจว่ามีภาพที่อัปโหลดไว้แล้ว หรือเลือกพิมพ์แบบไม่มีภาพลายเซ็น','error');
     // A confirmation is mandatory for the Print button when printing a draft.
     if (!showingPublished && !window.confirm('คุณกำลังพิมพ์ตารางฉบับร่าง ซึ่งยังไม่ใช่ตารางทางการของโรงเรียน\n\nต้องการพิมพ์ฉบับร่างต่อหรือไม่?')) return;
     window.print();
@@ -5347,12 +5324,9 @@ const PrintView = ({ activityGroups:draftGroups, schedules:draftSchedules,
         </select>
         <button onClick={handlePrint} disabled={!hasPrintSelection||publishedLoading||printSignatureBusy||!signaturesReady} className="px-8 py-3 bg-[#081a39] text-white rounded-xl shadow-md font-bold disabled:opacity-50 ml-auto hover:bg-[#122b5e]">พิมพ์เอกสาร</button>
       </div>
-      {printSignatureMode!=='none'&&<div className="no-print mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4 flex flex-wrap items-end gap-3">
-        <div className="flex-1 min-w-[240px]"><label className="block font-bold text-sm text-amber-950 mb-1">รหัสผ่านเพื่อเปิดภาพลายเซ็น</label>
-          <input type="password" autoComplete="off" className="p-2.5 border rounded-lg w-full bg-white" value={printSignaturePassword} onChange={e=>setPrintSignaturePassword(e.target.value)} placeholder="รหัสผ่านที่ตั้งไว้ตอนอัปโหลด" /></div>
-        <button type="button" disabled={printSignatureBusy||!printSignaturePassword} onClick={unlockPrintSignatures} className="bg-[#081a39] text-white font-bold rounded-lg p-3 disabled:opacity-50">{printSignatureBusy?'กำลังตรวจสอบ...':'ปลดล็อกภาพลายเซ็น'}</button>
-        <span className={`text-xs font-bold ${signaturesReady?'text-emerald-800':'text-amber-800'}`}>{signaturesReady?'พร้อมพิมพ์พร้อมลายเซ็น':'ยังไม่ได้ปลดล็อก — ไม่สามารถพิมพ์พร้อมภาพลายเซ็นได้'}</span>
-        <p className="text-xs text-amber-900 w-full">เลือกภาพลายเซ็นจากที่อัปโหลดไว้ในตั้งค่าระบบ ภาพจะปรากฏในตัวอย่างด้านล่างทันทีหลังปลดล็อก ไม่เปลี่ยนตารางหรือข้อมูลภาคเรียน</p>
+      {printSignatureMode!=='none'&&<div className="no-print mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+        {printSignatureBusy?'กำลังโหลดภาพลายเซ็นจาก Firebase...':signaturesReady?'พร้อมพิมพ์พร้อมภาพลายเซ็น ไม่ต้องใส่รหัสผ่าน':'ยังไม่พบภาพลายเซ็นพร้อมใช้งาน กรุณาอัปโหลด PNG ใหม่ในตั้งค่าระบบ'}
+        <p className="text-xs mt-1">เอกสารที่มีภาพลายเซ็นสามารถถูกคัดลอกหรือนำไปใช้ต่อได้ โปรดพิมพ์เฉพาะเมื่อได้รับอนุญาตจากเจ้าของลายเซ็น</p>
       </div>}
       {pageLayout !== 'single' && <div className="no-print mb-4 rounded-xl bg-white border border-slate-200 p-4 text-sm text-slate-700">
         <div className="font-bold mb-2">{pageLayout === 'two' ? '2 ตารางต่อ A4 แนวนอน — ซ้าย/ขวา' : '4 ตารางต่อ A4 แนวนอน — 2×2'} · เลือกแล้ว {itemsToPrint.length} รายการ · {printSheets.length} แผ่น</div>
